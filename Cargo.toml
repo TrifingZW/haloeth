@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["agent"]
+
+[workspace.package]
+version = "0.1.0"
+authors = ["TrifingZW <email@gmail.com>"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package]
+name = "haloeth"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit = "0.7.0"
+
+[dev-dependencies]
+gpui-kit = { version = "0.7.0", features = ["test-support"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+split-debuginfo = "off"
+debug-assertions = false
+overflow-checks = false
+incremental = false
+rpath = false
