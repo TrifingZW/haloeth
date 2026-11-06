@@ -92,12 +92,13 @@ impl Composer {
 impl Render for Composer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex().id("composer").test_support().w_full().flex_shrink_0().child(
-            // 缓冲区与应用同一平面；下边界由底部栏的上边框承担，避免两条细线叠粗
+            // 缓冲区与应用同一平面；上边界由全局 2px 边框给出，
+            // 下边界由底部栏的上边框承担，避免两条线叠粗
             div()
                 .id("buffer")
                 .test_support()
                 .w_full()
-                .border_t_1()
+                .border_t_2()
                 .border_color(cx.theme().border)
                 .child(
                     Editor::new(&self.buffer).h(BUFFER_HEIGHT).appearance(false).bordered(false),

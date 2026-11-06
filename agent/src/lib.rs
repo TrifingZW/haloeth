@@ -1,14 +1,15 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Haloeth 的代理内核：消息表示、工具契约、模型抽象与编排循环。
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod agent;
+pub mod default_tools;
+pub mod error;
+pub mod memory;
+pub mod message;
+pub mod metrics;
+pub mod model;
+pub mod openai;
+pub mod prompt;
+pub mod text;
+pub mod tool;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use agent::{Agent, Event, Interrupt, RunResult, RunState};

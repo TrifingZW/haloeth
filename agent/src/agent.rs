@@ -1,0 +1,798 @@
+//! 编排循环：驱动「动作—观测」循环直至产出最终答案。
+//!
+//! 循环骨架固定，行为差异由构造配置决定：最大步数、计划间隔与附加指令。
+//! 计划步骤默认关闭，设置间隔后在第 1 步及之后每间隔步生成一次。
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use serde_json::{Map, Value};
+
+use crate::error::AgentError;
+use crate::memory::{
+    ActionStep, FinalAnswerStep, Memory, PlanningStep, Step, TaskStep, ToolOutcome,
+};
+use crate::message::{ContentBlock, Message, StreamDelta};
+use crate::metrics::{Timing, TokenUsage};
+use crate::model::{GenerateRequest, Model, ToolChoice};
+use crate::prompt;
+use crate::tool::{FunctionTool, InputSpec, InputType, Tool, ToolSet, ToolSpec};
+
+/// 最终答案工具的名称。
+pub const FINAL_ANSWER: &str = "final_answer";
+
+/// 默认最大步数。
+pub const DEFAULT_MAX_STEPS: u32 = 20;
+
+/// 运行期事件。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// 模型输出的文本增量。
+    Delta(String),
+    /// 一个步骤完成并入记忆。
+    Step(Step),
+}
+
+/// 运行结束状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    /// 由最终答案工具正常结束。
+    Success,
+    /// 步数耗尽，输出为兜底答案。
+    MaxSteps,
+    /// 被调用方请求停止，输出为空值。
+    Cancelled,
+}
+
+/// 一次运行的结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunResult {
+    /// 最终答案。
+    pub output: Value,
+    /// 结束状态。
+    pub state: RunState,
+    /// 本次运行的 **Token** 用量；记忆在运行前已清空时等于会话累计量。
+    pub usage: TokenUsage,
+    /// 总耗时。
+    pub timing: Timing,
+}
+
+/// 中断标记：由调用方持有，用于请求停止运行。
+///
+/// 标记在每次运行开始时清除，因此同一个标记可跨多次运行复用。
+/// 中断在步骤边界生效：正在进行的模型调用与工具调用会先执行完毕。
+#[derive(Clone, Default)]
+pub struct Interrupt {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Interrupt {
+    /// 请求停止运行。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// 是否已请求停止。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// 清除标记。
+    fn reset(&self) {
+        self.cancelled.store(false, Ordering::Relaxed);
+    }
+}
+
+/// 代理：以工具调用为动作空间的编排循环。
+pub struct Agent<M> {
+    model: M,
+    tools: ToolSet,
+    memory: Memory,
+    max_steps: u32,
+    planning_interval: Option<u32>,
+    instructions: Option<String>,
+    interrupt: Interrupt,
+}
+
+impl<M: Model> Agent<M> {
+    /// 以模型与工具集构造代理；工具集缺失最终答案工具时自动注入。
+    pub fn new(model: M, mut tools: ToolSet) -> Result<Self, AgentError> {
+        if tools.get(FINAL_ANSWER).is_none() {
+            tools.insert(final_answer_tool())?;
+        }
+        let system_prompt = prompt::system_prompt(&tools, None);
+        Ok(Self {
+            model,
+            tools,
+            memory: Memory::new(system_prompt),
+            max_steps: DEFAULT_MAX_STEPS,
+            planning_interval: None,
+            instructions: None,
+            interrupt: Interrupt::default(),
+        })
+    }
+
+    /// 设置最大步数。
+    pub fn with_max_steps(mut self, max_steps: u32) -> Self {
+        self.max_steps = max_steps;
+        self
+    }
+
+    /// 设置计划间隔；零与 [`None`] 均表示不生成计划。
+    pub fn with_planning_interval(mut self, interval: Option<u32>) -> Self {
+        self.planning_interval = interval.filter(|interval| *interval > 0);
+        self
+    }
+
+    /// 设置附加指令，追加到系统提示末尾。
+    pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
+        self.refresh_system_prompt();
+        self
+    }
+
+    /// 返回记忆。
+    pub fn memory(&self) -> &Memory {
+        &self.memory
+    }
+
+    /// 返回工具集。
+    pub fn tools(&self) -> &ToolSet {
+        &self.tools
+    }
+
+    /// 返回模型标识。
+    pub fn model_id(&self) -> &str {
+        self.model.model_id()
+    }
+
+    /// 返回模型。
+    pub fn model(&self) -> &M {
+        &self.model
+    }
+
+    /// 返回模型的可变引用，用于调整模型配置。
+    pub fn model_mut(&mut self) -> &mut M {
+        &mut self.model
+    }
+
+    /// 返回中断标记的副本，供调用方在运行期间请求停止。
+    pub fn interrupt(&self) -> Interrupt {
+        self.interrupt.clone()
+    }
+
+    /// 清空会话步骤，保留系统提示。
+    pub fn reset(&mut self) {
+        self.memory.reset();
+    }
+
+    /// 运行一次任务。
+    ///
+    /// `on_event` 在运行过程中接收文本增量与完成的步骤，运行结束后返回结果。
+    pub async fn run<F>(
+        &mut self,
+        task: impl Into<TaskStep>,
+        mut on_event: F,
+    ) -> Result<RunResult, AgentError>
+    where
+        F: FnMut(Event) + Send,
+    {
+        self.refresh_system_prompt();
+        self.interrupt.reset();
+        let mut timing = Timing::start();
+
+        let task = task.into();
+        let task_text = task.task.clone();
+        self.register(Step::Task(task), &mut on_event);
+
+        let mut answer = None;
+        let mut cancelled = false;
+        let mut number = 1;
+        while number <= self.max_steps {
+            if self.interrupt.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            if self.should_plan(number) {
+                let step = self.planning_step(&task_text, number, &mut on_event).await?;
+                self.register(Step::Planning(step), &mut on_event);
+            }
+
+            let step = self.action_step(number, &mut on_event).await?;
+            let finished = step.is_final_answer;
+            let output = step.output.clone();
+            self.register(Step::Action(step), &mut on_event);
+            if finished {
+                answer = output;
+                break;
+            }
+            number += 1;
+        }
+
+        let state = match (answer.is_some(), cancelled) {
+            (true, _) => RunState::Success,
+            (false, true) => RunState::Cancelled,
+            (false, false) => RunState::MaxSteps,
+        };
+        let output = match answer {
+            Some(output) => output,
+            None if cancelled => Value::Null,
+            None => {
+                let step = self.fallback_step(&task_text, &mut on_event).await?;
+                let output = step.output.clone().unwrap_or(Value::Null);
+                self.register(Step::Action(step), &mut on_event);
+                output
+            }
+        };
+
+        timing.finish();
+        self.register(
+            Step::FinalAnswer(FinalAnswerStep {
+                output: output.clone(),
+            }),
+            &mut on_event,
+        );
+
+        Ok(RunResult {
+            output,
+            state,
+            usage: self.memory.usage(),
+            timing,
+        })
+    }
+
+    /// 判断当前步号是否应生成计划。
+    fn should_plan(&self, number: u32) -> bool {
+        self.planning_interval
+            .is_some_and(|interval| number == 1 || (number - 1).is_multiple_of(interval))
+    }
+
+    /// 用当前工具集与指令刷新系统提示。
+    fn refresh_system_prompt(&mut self) {
+        self.memory.system_prompt =
+            prompt::system_prompt(&self.tools, self.instructions.as_deref());
+    }
+
+    /// 将步骤写入记忆并派发事件。
+    fn register<F: FnMut(Event)>(&mut self, step: Step, on_event: &mut F) {
+        self.memory.push(step.clone());
+        on_event(Event::Step(step));
+    }
+
+    /// 执行一次动作步骤。
+    ///
+    /// 无工具调用、或最终答案工具与其他调用同时出现时，记录可恢复错误并返回，
+    /// 由下一轮的上下文把错误回灌给模型。
+    async fn action_step<F>(
+        &mut self,
+        number: u32,
+        on_event: &mut F,
+    ) -> Result<ActionStep, AgentError>
+    where
+        F: FnMut(Event) + Send,
+    {
+        let timing = Timing::start();
+        let request = GenerateRequest::new(self.memory.context())
+            .tools(self.tools.schemas())
+            .tool_choice(ToolChoice::Required);
+        let message = self
+            .model
+            .generate(request, |delta| forward(on_event, delta))
+            .await
+            .map_err(AgentError::Generation)?;
+
+        let calls = message.tool_calls.clone();
+        let has_final_answer = calls.iter().any(|call| call.name == FINAL_ANSWER);
+        let mut step = ActionStep {
+            number,
+            timing,
+            model_output: Some(message),
+            outcomes: Vec::new(),
+            error: None,
+            output: None,
+            is_final_answer: false,
+        };
+
+        if calls.is_empty() {
+            step.error = Some(AgentError::Parsing {
+                reason: "the model replied without calling any tool".into(),
+            });
+            step.timing.finish();
+            return Ok(step);
+        }
+        if has_final_answer && calls.len() > 1 {
+            step.error = Some(AgentError::Parsing {
+                reason: format!("'{FINAL_ANSWER}' must be the only tool call of its step"),
+            });
+            step.timing.finish();
+            return Ok(step);
+        }
+
+        for call in calls {
+            let is_final_answer = call.name == FINAL_ANSWER;
+            let result = self.tools.call(&call.name, &call.arguments).await;
+            if is_final_answer && let Ok(value) = &result {
+                step.output = Some(value.clone());
+                step.is_final_answer = true;
+            }
+            step.outcomes.push(ToolOutcome {
+                call,
+                result,
+            });
+        }
+
+        step.timing.finish();
+        Ok(step)
+    }
+
+    /// 生成一次计划步骤。
+    async fn planning_step<F>(
+        &mut self,
+        task: &str,
+        number: u32,
+        on_event: &mut F,
+    ) -> Result<PlanningStep, AgentError>
+    where
+        F: FnMut(Event) + Send,
+    {
+        let mut timing = Timing::start();
+        let messages = if number == 1 {
+            vec![Message::user(prompt::initial_plan(task, &self.tools))]
+        } else {
+            let mut messages = vec![Message::system(prompt::plan_update_preamble(task))];
+            messages.extend(self.memory.summary());
+            let remaining = self.max_steps.saturating_sub(number);
+            messages.push(Message::user(prompt::plan_update_request(&self.tools, remaining)));
+            messages
+        };
+        let request = GenerateRequest::new(messages)
+            .tool_choice(ToolChoice::None)
+            .stop_sequences(vec![prompt::PLAN_STOP_SEQUENCE.to_owned()]);
+
+        let message = self
+            .model
+            .generate(request, |delta| forward(on_event, delta))
+            .await
+            .map_err(AgentError::Generation)?;
+        timing.finish();
+
+        Ok(PlanningStep {
+            plan: message_text(&message),
+            timing,
+            usage: message.usage,
+        })
+    }
+
+    /// 步数耗尽后请求一次兜底答案，结果记录为带最大步数错误标签的动作步骤。
+    async fn fallback_step<F>(
+        &mut self,
+        task: &str,
+        on_event: &mut F,
+    ) -> Result<ActionStep, AgentError>
+    where
+        F: FnMut(Event) + Send,
+    {
+        let mut timing = Timing::start();
+        let mut messages = vec![Message::system(prompt::final_answer_preamble())];
+        messages.extend(self.memory.history());
+        messages.push(Message::user(prompt::final_answer_request(task)));
+        let request = GenerateRequest::new(messages).tool_choice(ToolChoice::None);
+
+        let message = self
+            .model
+            .generate(request, |delta| forward(on_event, delta))
+            .await
+            .map_err(AgentError::Generation)?;
+        timing.finish();
+
+        Ok(ActionStep {
+            number: self.max_steps + 1,
+            timing,
+            output: Some(Value::String(message_text(&message))),
+            model_output: Some(message),
+            outcomes: Vec::new(),
+            error: Some(AgentError::MaxSteps),
+            is_final_answer: true,
+        })
+    }
+}
+
+/// 构造最终答案工具，原样返回参数中的答案。
+fn final_answer_tool() -> impl Tool + 'static {
+    let spec = ToolSpec::new(
+        FINAL_ANSWER,
+        "Provides the final answer to the task. It must be the only tool call of its step.",
+        InputType::Any,
+    )
+    .input("answer", InputSpec::new(InputType::Any, "The final answer to the task."));
+    FunctionTool::new(spec, |arguments: &Map<String, Value>| {
+        Ok(arguments.get("answer").cloned().unwrap_or(Value::Null))
+    })
+}
+
+/// 转发文本增量。
+fn forward<F: FnMut(Event)>(on_event: &mut F, delta: StreamDelta) {
+    if let Some(text) = delta.content {
+        on_event(Event::Delta(text));
+    }
+}
+
+/// 提取消息中的文本内容。
+fn message_text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.as_str()),
+            ContentBlock::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::error::{ModelError, ToolError};
+    use crate::message::Role;
+    use crate::tool::{FunctionTool, InputSpec, InputType, ToolSpec};
+
+    /// 按脚本依次返回回复的模型，并记录收到的请求。
+    struct ScriptedModel {
+        replies: Mutex<Vec<Result<Message, ModelError>>>,
+        requests: Mutex<Vec<GenerateRequest>>,
+        /// 非空时在每次生成后请求中断，用于验证取消路径
+        interrupt: Option<Interrupt>,
+    }
+
+    impl ScriptedModel {
+        fn new(replies: Vec<Message>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into_iter().map(Ok).collect()),
+                requests: Mutex::new(Vec::new()),
+                interrupt: None,
+            }
+        }
+
+        fn failing(error: ModelError) -> Self {
+            Self {
+                replies: Mutex::new(vec![Err(error)]),
+                requests: Mutex::new(Vec::new()),
+                interrupt: None,
+            }
+        }
+
+        fn requests(&self) -> Vec<GenerateRequest> {
+            self.requests.lock().expect("lock should not be poisoned").clone()
+        }
+    }
+
+    impl Model for ScriptedModel {
+        fn model_id(&self) -> &str {
+            "scripted"
+        }
+
+        fn generate<F>(
+            &self,
+            request: GenerateRequest,
+            mut on_delta: F,
+        ) -> impl std::future::Future<Output = Result<Message, ModelError>> + Send
+        where
+            F: FnMut(StreamDelta) + Send,
+        {
+            async move {
+                self.requests.lock().expect("lock should not be poisoned").push(request);
+                let reply = self.replies.lock().expect("lock should not be poisoned").remove(0);
+                if let Some(interrupt) = &self.interrupt {
+                    interrupt.cancel();
+                }
+                if let Ok(message) = &reply {
+                    let text = message_text(message);
+                    if !text.is_empty() {
+                        on_delta(StreamDelta {
+                            content: Some(text),
+                            ..Default::default()
+                        });
+                    }
+                }
+                reply
+            }
+        }
+    }
+
+    fn call(name: &str, arguments: Value) -> crate::message::ToolCall {
+        crate::message::ToolCall {
+            id: format!("call_{name}"),
+            name: name.to_owned(),
+            arguments,
+        }
+    }
+
+    fn echo_tool() -> FunctionTool<fn(&Map<String, Value>) -> Result<Value, ToolError>> {
+        fn echo(arguments: &Map<String, Value>) -> Result<Value, ToolError> {
+            Ok(arguments.get("text").cloned().unwrap_or(Value::Null))
+        }
+        FunctionTool::new(
+            ToolSpec::new("echo", "Echoes the given text.", InputType::String)
+                .input("text", InputSpec::new(InputType::String, "Text to echo.")),
+            echo,
+        )
+    }
+
+    fn tools() -> ToolSet {
+        let mut tools = ToolSet::new();
+        tools.insert(echo_tool()).expect("insertion should succeed");
+        tools
+    }
+
+    fn assistant_calling(name: &str, arguments: Value) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Vec::new(),
+            tool_calls: vec![call(name, arguments)],
+            tool_call_id: None,
+            usage: None,
+        }
+    }
+
+    fn final_answer(value: Value) -> Message {
+        assistant_calling(FINAL_ANSWER, json!({ "answer": value }))
+    }
+
+    #[tokio::test]
+    async fn run_executes_tools_and_returns_the_final_answer() {
+        let model = ScriptedModel::new(vec![
+            assistant_calling("echo", json!({ "text": "hello" })),
+            final_answer(json!("hello")),
+        ]);
+        let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
+        let mut events = Vec::new();
+
+        let result =
+            agent.run("Echo hello.", |event| events.push(event)).await.expect("run should succeed");
+
+        assert_eq!(result.output, json!("hello"));
+        assert_eq!(result.state, RunState::Success);
+        assert_eq!(agent.memory().steps.len(), 4);
+        let steps: Vec<&Step> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Step(step) => Some(step),
+                Event::Delta(_) => None,
+            })
+            .collect();
+        assert_eq!(steps.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn requests_carry_the_system_prompt_and_tool_schemas() {
+        let model = ScriptedModel::new(vec![final_answer(json!(1))]);
+        let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
+
+        agent.run("Answer.", |_| {}).await.expect("run should succeed");
+
+        let requests = agent.model().requests();
+        let first = &requests[0];
+        assert_eq!(first.messages[0].role, Role::System);
+        let names: Vec<&str> = first.tools.iter().map(|tool| tool.function.name.as_str()).collect();
+        assert_eq!(names, ["echo", FINAL_ANSWER]);
+        assert_eq!(first.tool_choice, ToolChoice::Required);
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_is_recovered_from() {
+        let model = ScriptedModel::new(vec![
+            assistant_calling("missing", json!({})),
+            final_answer(json!("done")),
+        ]);
+        let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
+
+        let result = agent.run("Use a missing tool.", |_| {}).await.expect("run should succeed");
+
+        assert_eq!(result.state, RunState::Success);
+        let Step::Action(first) = &agent.memory().steps[1] else {
+            panic!("expected an action step");
+        };
+        assert!(matches!(
+            &first.outcomes[0].result,
+            Err(crate::error::ToolError::UnknownTool { .. })
+        ));
+
+        let second_request = &agent.model().requests()[1];
+        let observation = crate::message::normalize(&second_request.messages)
+            .into_iter()
+            .find(|message| message.role == crate::message::wire::WireRole::Tool)
+            .expect("the failure should be sent back as a tool message");
+        assert!(observation.content.is_some());
+    }
+
+    #[tokio::test]
+    async fn missing_tool_call_is_reported_as_a_parsing_error() {
+        let model = ScriptedModel::new(vec![
+            Message::assistant("I have no tools."),
+            final_answer(json!("ok")),
+        ]);
+        let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
+
+        let result = agent.run("Answer.", |_| {}).await.expect("run should succeed");
+
+        assert_eq!(result.state, RunState::Success);
+        let Step::Action(first) = &agent.memory().steps[1] else {
+            panic!("expected an action step");
+        };
+        assert!(matches!(first.error, Some(AgentError::Parsing { .. })));
+    }
+
+    #[tokio::test]
+    async fn final_answer_alongside_other_calls_is_rejected() {
+        let model = ScriptedModel::new(vec![
+            Message {
+                role: Role::Assistant,
+                content: Vec::new(),
+                tool_calls: vec![
+                    call("echo", json!({ "text": "x" })),
+                    call(FINAL_ANSWER, json!({ "answer": 1 })),
+                ],
+                tool_call_id: None,
+                usage: None,
+            },
+            final_answer(json!(1)),
+        ]);
+        let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
+
+        let result = agent.run("Answer.", |_| {}).await.expect("run should succeed");
+
+        assert_eq!(result.state, RunState::Success);
+        let Step::Action(first) = &agent.memory().steps[1] else {
+            panic!("expected an action step");
+        };
+        assert!(matches!(first.error, Some(AgentError::Parsing { .. })));
+        assert!(first.outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn max_steps_produces_a_fallback_answer() {
+        let model = ScriptedModel::new(vec![
+            assistant_calling("echo", json!({ "text": "once" })),
+            Message::assistant("Final answer from memory."),
+        ]);
+        let mut agent =
+            Agent::new(model, tools()).expect("agent should be constructed").with_max_steps(1);
+        let mut events = Vec::new();
+
+        let result =
+            agent.run("Answer.", |event| events.push(event)).await.expect("run should succeed");
+
+        assert_eq!(result.state, RunState::MaxSteps);
+        assert_eq!(result.output, json!("Final answer from memory."));
+        assert!(events.contains(&Event::Delta("Final answer from memory.".into())));
+        let Step::Action(last) = &agent.memory().steps[2] else {
+            panic!("expected an action step");
+        };
+        assert_eq!(last.error, Some(AgentError::MaxSteps));
+        assert!(last.is_final_answer);
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_the_run_without_a_fallback_call() {
+        let model = ScriptedModel::new(vec![assistant_calling("echo", json!({ "text": "one" }))]);
+        let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
+        let interrupt = agent.interrupt();
+        agent.model_mut().interrupt = Some(interrupt);
+
+        let result = agent.run("Answer.", |_| {}).await.expect("run should succeed");
+
+        assert_eq!(result.state, RunState::Cancelled);
+        assert_eq!(result.output, Value::Null);
+        // 取消不触发兜底调用：仅第一次生成发生
+        assert_eq!(agent.model().requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_flag_resets_for_the_next_run() {
+        let model = ScriptedModel::new(vec![
+            assistant_calling("echo", json!({ "text": "one" })),
+            final_answer(json!("done")),
+        ]);
+        let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
+        let interrupt = agent.interrupt();
+        agent.model_mut().interrupt = Some(interrupt.clone());
+
+        let cancelled = agent.run("First.", |_| {}).await.expect("run should succeed");
+        assert_eq!(cancelled.state, RunState::Cancelled);
+
+        // 移除模型的取消行为并预置一个陈旧标记：运行开始时应被清除
+        agent.model_mut().interrupt = None;
+        interrupt.cancel();
+        let result = agent.run("Second.", |_| {}).await.expect("run should succeed");
+
+        assert_eq!(result.state, RunState::Success);
+        assert_eq!(result.output, json!("done"));
+    }
+
+    #[tokio::test]
+    async fn generation_failure_aborts_the_run() {
+        let model = ScriptedModel::failing(ModelError::Transport {
+            reason: "offline".into(),
+        });
+        let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
+
+        let error = agent.run("Answer.", |_| {}).await.expect_err("run should fail");
+
+        assert!(matches!(error, AgentError::Generation(_)));
+        assert!(error.is_fatal());
+    }
+
+    #[tokio::test]
+    async fn planning_runs_at_the_configured_interval() {
+        let model = ScriptedModel::new(vec![
+            Message::assistant("Initial plan <end_plan>"),
+            assistant_calling("echo", json!({ "text": "one" })),
+            assistant_calling("echo", json!({ "text": "two" })),
+            Message::assistant("Updated plan <end_plan>"),
+            assistant_calling("echo", json!({ "text": "three" })),
+            final_answer(json!("done")),
+        ]);
+        let mut agent = Agent::new(model, tools())
+            .expect("agent should be constructed")
+            .with_planning_interval(Some(2))
+            .with_max_steps(5);
+
+        let result = agent.run("Plan twice.", |_| {}).await.expect("run should succeed");
+
+        assert_eq!(result.state, RunState::Success);
+        let planning: Vec<&PlanningStep> = agent
+            .memory()
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Planning(planning) => Some(planning),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(planning.len(), 2);
+        assert_eq!(planning[0].plan, "Initial plan <end_plan>");
+        assert_eq!(planning[1].plan, "Updated plan <end_plan>");
+
+        let requests = agent.model().requests();
+        let update = &requests[3];
+        assert_eq!(update.stop_sequences, vec![prompt::PLAN_STOP_SEQUENCE.to_owned()]);
+        assert_eq!(update.messages[0].role, Role::System);
+        assert!(update.tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn planning_can_be_disabled() {
+        let model = ScriptedModel::new(vec![final_answer(json!(1))]);
+        let mut agent = Agent::new(model, tools())
+            .expect("agent should be constructed")
+            .with_planning_interval(Some(0));
+
+        agent.run("Answer.", |_| {}).await.expect("run should succeed");
+
+        assert!(agent.memory().steps.iter().all(|step| !matches!(step, Step::Planning(_))));
+    }
+
+    #[tokio::test]
+    async fn final_answer_tool_is_injected_only_when_absent() {
+        let mut tools = tools();
+        tools
+            .insert(FunctionTool::new(
+                ToolSpec::new(FINAL_ANSWER, "Custom final answer tool.", InputType::Any)
+                    .input("answer", InputSpec::new(InputType::Any, "The answer.")),
+                |arguments: &Map<String, Value>| {
+                    Ok(arguments.get("answer").cloned().unwrap_or(Value::Null))
+                },
+            ))
+            .expect("insertion should succeed");
+        let model = ScriptedModel::new(vec![final_answer(json!("custom"))]);
+        let agent = Agent::new(model, tools).expect("agent should be constructed");
+
+        let spec = agent.tools().get(FINAL_ANSWER).expect("tool should exist").spec();
+        assert_eq!(spec.description, "Custom final answer tool.");
+    }
+}
