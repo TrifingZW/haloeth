@@ -20,7 +20,8 @@ const RETRY_HINT: &str = "Now let's retry: take care not to repeat previous erro
 const PLAN_CONTINUATION: &str = "Now proceed and carry out this plan.";
 
 /// 记忆中的一个步骤。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum Step {
     /// 任务。
     Task(TaskStep),
@@ -54,7 +55,7 @@ impl Step {
 }
 
 /// 任务步骤。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TaskStep {
     /// 任务文本。
     pub task: String,
@@ -90,7 +91,7 @@ impl TaskStep {
 }
 
 /// 一次动作步骤。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ActionStep {
     /// 步号。
     pub number: u32,
@@ -146,7 +147,7 @@ impl ActionStep {
 }
 
 /// 一次工具调用的执行结果。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolOutcome {
     /// 被执行的调用。
     pub call: ToolCall,
@@ -155,7 +156,7 @@ pub struct ToolOutcome {
 }
 
 /// 计划步骤。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlanningStep {
     /// 计划正文。
     pub plan: String,
@@ -177,7 +178,7 @@ impl PlanningStep {
 }
 
 /// 最终答案步骤。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FinalAnswerStep {
     /// 输出值。
     pub output: Value,
@@ -191,7 +192,7 @@ impl FinalAnswerStep {
 }
 
 /// 会话记忆：系统提示与全部步骤。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Memory {
     /// 系统提示。
     pub system_prompt: String,
@@ -261,8 +262,18 @@ fn render_value(value: &Value) -> String {
 }
 
 /// 渲染失败的工具调用为观测文本。
+///
+/// 已拒绝与已取消是终态：不附重试提示，避免模型把用户拒绝当成临时故障反复尝试。
 fn render_failure(error: &ToolError) -> String {
-    format!("Error: {error}\n{RETRY_HINT}")
+    match error {
+        ToolError::Denied {
+            ..
+        }
+        | ToolError::Cancelled {
+            ..
+        } => format!("Error: {error}"),
+        _ => format!("Error: {error}\n{RETRY_HINT}"),
+    }
 }
 
 #[cfg(test)]

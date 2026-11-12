@@ -3,8 +3,10 @@
 use std::ops::Add;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 /// 一次生成的 **Token** 用量。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// 输入 **Token** 数。
     pub input_tokens: u32,
@@ -36,6 +38,8 @@ impl Add for TokenUsage {
 }
 
 /// 一段过程的时间信息。
+///
+/// 持久化时只保存耗时：`Instant` 没有跨进程的可移植表示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
     started: Instant,
@@ -48,6 +52,15 @@ impl Timing {
         Self {
             started: Instant::now(),
             finished: None,
+        }
+    }
+
+    /// 以已知耗时构造一段已结束的计时，用于从持久化状态恢复。
+    pub fn from_duration(duration: Duration) -> Self {
+        let finished = Instant::now();
+        Self {
+            started: finished - duration,
+            finished: Some(finished),
         }
     }
 
@@ -71,6 +84,19 @@ impl Timing {
     /// 返回从开始到当前（或结束）的耗时。
     pub fn elapsed(self) -> Duration {
         self.finished.unwrap_or_else(Instant::now).saturating_duration_since(self.started)
+    }
+}
+
+impl Serialize for Timing {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u64(self.elapsed().as_millis() as u64)
+    }
+}
+
+impl<'de> Deserialize<'de> for Timing {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let millis = u64::deserialize(deserializer)?;
+        Ok(Self::from_duration(Duration::from_millis(millis)))
     }
 }
 

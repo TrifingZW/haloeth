@@ -5,18 +5,22 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
-use crate::error::AgentError;
+use crate::approval::{AllowAll, ApprovalGate, ApprovalRequest};
+use crate::error::{AgentError, ToolError};
 use crate::memory::{
     ActionStep, FinalAnswerStep, Memory, PlanningStep, Step, TaskStep, ToolOutcome,
 };
-use crate::message::{ContentBlock, Message, StreamDelta};
+use crate::message::{ContentBlock, Message, StreamDelta, ToolCall};
 use crate::metrics::{Timing, TokenUsage};
 use crate::model::{GenerateRequest, Model, ToolChoice};
 use crate::prompt;
-use crate::tool::{FunctionTool, InputSpec, InputType, Tool, ToolSet, ToolSpec};
+use crate::tool::{
+    ApprovalRequirement, FunctionTool, InputSpec, InputType, Tool, ToolSet, ToolSpec,
+};
 
 /// 最终答案工具的名称。
 pub const FINAL_ANSWER: &str = "final_answer";
@@ -31,6 +35,68 @@ pub enum Event {
     Delta(String),
     /// 一个步骤完成并入记忆。
     Step(Step),
+    /// 运行过程中的细粒度活动，供界面实时展示。
+    Activity(Activity),
+}
+
+/// 运行过程中的细粒度活动。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Activity {
+    /// 开始一次模型调用。
+    Thinking {
+        /// 步号。
+        step: u32,
+    },
+    /// 推理过程增量。
+    ReasoningDelta(String),
+    /// 开始执行一次工具调用。
+    ToolStarted {
+        /// 步号。
+        step: u32,
+        /// 被执行的调用。
+        call: ToolCall,
+    },
+    /// 工具调用结束。
+    ToolFinished {
+        /// 步号。
+        step: u32,
+        /// 调用标识符。
+        call_id: String,
+        /// 是否成功。
+        ok: bool,
+        /// 输出或错误的短摘要。
+        preview: String,
+        /// 耗时毫秒数。
+        elapsed_ms: u64,
+    },
+    /// 请求人工审批。
+    ApprovalRequested(ApprovalRequest),
+    /// 审批完成。
+    ApprovalResolved {
+        /// 审批标识符。
+        id: String,
+        /// 决策。
+        decision: crate::approval::ApprovalDecision,
+        /// 原因。
+        reason: String,
+    },
+    /// 加载了一个 Skill。
+    SkillLoaded {
+        /// Skill 名称。
+        name: String,
+    },
+    /// 开始生成计划。
+    PlanStarted {
+        /// 步号。
+        step: u32,
+    },
+    /// 计划生成完成。
+    PlanFinished {
+        /// 步号。
+        step: u32,
+        /// 计划正文。
+        plan: String,
+    },
 }
 
 /// 运行结束状态。
@@ -91,7 +157,9 @@ pub struct Agent<M> {
     max_steps: u32,
     planning_interval: Option<u32>,
     instructions: Option<String>,
+    skills: Vec<crate::skill::Skill>,
     interrupt: Interrupt,
+    gate: Arc<dyn ApprovalGate>,
 }
 
 impl<M: Model> Agent<M> {
@@ -108,8 +176,21 @@ impl<M: Model> Agent<M> {
             max_steps: DEFAULT_MAX_STEPS,
             planning_interval: None,
             instructions: None,
+            skills: Vec::new(),
             interrupt: Interrupt::default(),
+            gate: Arc::new(AllowAll),
         })
+    }
+
+    /// 设置审核门；不设置时全部放行。
+    pub fn with_approval_gate(mut self, gate: Arc<dyn ApprovalGate>) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    /// 运行结束：释放审核门持有的事件发送端。
+    pub fn close_events(&mut self) {
+        self.gate.close();
     }
 
     /// 设置最大步数。
@@ -121,6 +202,13 @@ impl<M: Model> Agent<M> {
     /// 设置计划间隔；零与 [`None`] 均表示不生成计划。
     pub fn with_planning_interval(mut self, interval: Option<u32>) -> Self {
         self.planning_interval = interval.filter(|interval| *interval > 0);
+        self
+    }
+
+    /// 设置已启用的 Skill；系统提示会列出它们的元数据。
+    pub fn with_skills(mut self, skills: Vec<crate::skill::Skill>) -> Self {
+        self.skills = skills;
+        self.refresh_system_prompt();
         self
     }
 
@@ -164,6 +252,31 @@ impl<M: Model> Agent<M> {
     /// 清空会话步骤，保留系统提示。
     pub fn reset(&mut self) {
         self.memory.reset();
+    }
+
+    /// 返回已完成的步骤，供会话持久化。
+    pub fn steps(&self) -> &[Step] {
+        &self.memory.steps
+    }
+
+    /// 取出已完成的步骤；代理随后从空上下文开始。
+    pub fn take_steps(&mut self) -> Vec<Step> {
+        std::mem::take(&mut self.memory.steps)
+    }
+
+    /// 以既有步骤恢复上下文；系统提示在下次运行时按当前工具重建。
+    pub fn restore_steps(&mut self, steps: Vec<Step>) {
+        self.memory.steps = steps;
+    }
+
+    /// 导出上下文快照，供前端持久化。
+    pub fn snapshot(&self) -> crate::persist::ContextSnapshot {
+        self.memory.snapshot()
+    }
+
+    /// 从快照恢复上下文；系统提示保持不变。
+    pub fn restore_context(&mut self, snapshot: crate::persist::ContextSnapshot) {
+        self.memory.restore(snapshot);
     }
 
     /// 运行一次任务。
@@ -249,8 +362,11 @@ impl<M: Model> Agent<M> {
 
     /// 用当前工具集与指令刷新系统提示。
     fn refresh_system_prompt(&mut self) {
-        self.memory.system_prompt =
-            prompt::system_prompt(&self.tools, self.instructions.as_deref());
+        self.memory.system_prompt = prompt::system_prompt_with_skills(
+            &self.tools,
+            self.instructions.as_deref(),
+            &self.skills,
+        );
     }
 
     /// 将步骤写入记忆并派发事件。
@@ -272,14 +388,15 @@ impl<M: Model> Agent<M> {
         F: FnMut(Event) + Send,
     {
         let timing = Timing::start();
+        on_event(Event::Activity(Activity::Thinking {
+            step: number,
+        }));
         let request = GenerateRequest::new(self.memory.context())
             .tools(self.tools.schemas())
             .tool_choice(ToolChoice::Required);
-        let message = self
-            .model
-            .generate(request, |delta| forward(on_event, delta))
-            .await
-            .map_err(AgentError::Generation)?;
+        let mut sink = |delta: StreamDelta| forward(on_event, delta);
+        let message =
+            self.model.generate(request, &mut sink).await.map_err(AgentError::Generation)?;
 
         let calls = message.tool_calls.clone();
         let has_final_answer = calls.iter().any(|call| call.name == FINAL_ANSWER);
@@ -310,7 +427,7 @@ impl<M: Model> Agent<M> {
 
         for call in calls {
             let is_final_answer = call.name == FINAL_ANSWER;
-            let result = self.tools.call(&call.name, &call.arguments).await;
+            let result = self.execute_call(number, &call, on_event).await;
             if is_final_answer && let Ok(value) = &result {
                 step.output = Some(value.clone());
                 step.is_final_answer = true;
@@ -325,6 +442,67 @@ impl<M: Model> Agent<M> {
         Ok(step)
     }
 
+    /// 执行一次工具调用：查找 → 校验 → 审核 → 执行，并在两侧派发活动事件。
+    async fn execute_call<F>(
+        &self,
+        number: u32,
+        call: &ToolCall,
+        on_event: &mut F,
+    ) -> Result<Value, ToolError>
+    where
+        F: FnMut(Event) + Send,
+    {
+        let Some(tool) = self.tools.get(&call.name) else {
+            return Err(ToolError::UnknownTool {
+                name: call.name.clone(),
+            });
+        };
+        let spec = tool.spec();
+        // 参数不合法时不产生审批请求。
+        let resolved = spec.resolve(&call.arguments)?;
+
+        on_event(Event::Activity(Activity::ToolStarted {
+            step: number,
+            call: call.clone(),
+        }));
+        let started = Instant::now();
+
+        let decision = if spec.approval == ApprovalRequirement::Policy {
+            self.gate.decide(spec, call).await
+        } else {
+            crate::approval::ApprovalDecision::AllowOnce
+        };
+
+        let result = if decision == crate::approval::ApprovalDecision::Deny {
+            if self.interrupt.is_cancelled() {
+                Err(ToolError::Cancelled {
+                    name: call.name.clone(),
+                })
+            } else {
+                Err(ToolError::Denied {
+                    name: call.name.clone(),
+                    reason: "the approval policy rejected this call".to_owned(),
+                })
+            }
+        } else {
+            tool.invoke(&resolved).await
+        };
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let preview = match &result {
+            Ok(value) => preview_text(&render_value(value)),
+            Err(error) => preview_text(&error.to_string()),
+        };
+        on_event(Event::Activity(Activity::ToolFinished {
+            step: number,
+            call_id: call.id.clone(),
+            ok: result.is_ok(),
+            preview,
+            elapsed_ms,
+        }));
+        result
+    }
+
     /// 生成一次计划步骤。
     async fn planning_step<F>(
         &mut self,
@@ -336,6 +514,9 @@ impl<M: Model> Agent<M> {
         F: FnMut(Event) + Send,
     {
         let mut timing = Timing::start();
+        on_event(Event::Activity(Activity::PlanStarted {
+            step: number,
+        }));
         let messages = if number == 1 {
             vec![Message::user(prompt::initial_plan(task, &self.tools))]
         } else {
@@ -349,15 +530,18 @@ impl<M: Model> Agent<M> {
             .tool_choice(ToolChoice::None)
             .stop_sequences(vec![prompt::PLAN_STOP_SEQUENCE.to_owned()]);
 
-        let message = self
-            .model
-            .generate(request, |delta| forward(on_event, delta))
-            .await
-            .map_err(AgentError::Generation)?;
+        let mut sink = |delta: StreamDelta| forward(on_event, delta);
+        let message =
+            self.model.generate(request, &mut sink).await.map_err(AgentError::Generation)?;
         timing.finish();
 
+        let plan = message_text(&message);
+        on_event(Event::Activity(Activity::PlanFinished {
+            step: number,
+            plan: plan.clone(),
+        }));
         Ok(PlanningStep {
-            plan: message_text(&message),
+            plan,
             timing,
             usage: message.usage,
         })
@@ -378,11 +562,9 @@ impl<M: Model> Agent<M> {
         messages.push(Message::user(prompt::final_answer_request(task)));
         let request = GenerateRequest::new(messages).tool_choice(ToolChoice::None);
 
-        let message = self
-            .model
-            .generate(request, |delta| forward(on_event, delta))
-            .await
-            .map_err(AgentError::Generation)?;
+        let mut sink = |delta: StreamDelta| forward(on_event, delta);
+        let message =
+            self.model.generate(request, &mut sink).await.map_err(AgentError::Generation)?;
         timing.finish();
 
         Ok(ActionStep {
@@ -404,17 +586,39 @@ fn final_answer_tool() -> impl Tool + 'static {
         "Provides the final answer to the task. It must be the only tool call of its step.",
         InputType::Any,
     )
-    .input("answer", InputSpec::new(InputType::Any, "The final answer to the task."));
+    .input("answer", InputSpec::new(InputType::Any, "The final answer to the task."))
+    .approval(ApprovalRequirement::Never);
     FunctionTool::new(spec, |arguments: &Map<String, Value>| {
         Ok(arguments.get("answer").cloned().unwrap_or(Value::Null))
     })
 }
 
-/// 转发文本增量。
+/// 转发流式增量：文本与推理过程分别派发。
 fn forward<F: FnMut(Event)>(on_event: &mut F, delta: StreamDelta) {
     if let Some(text) = delta.content {
         on_event(Event::Delta(text));
     }
+    if let Some(reasoning) = delta.reasoning {
+        on_event(Event::Activity(Activity::ReasoningDelta(reasoning)));
+    }
+}
+
+/// 把工具输出渲染为观测文本；字符串直接使用，其余使用 **JSON** 文本。
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 活动预览的最大字符数。
+const MAX_PREVIEW: usize = 240;
+
+/// 截断活动预览，保持单行。
+fn preview_text(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default();
+    let compact: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    crate::text::truncate(&compact, MAX_PREVIEW)
 }
 
 /// 提取消息中的文本内容。
@@ -471,36 +675,32 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl Model for ScriptedModel {
         fn model_id(&self) -> &str {
             "scripted"
         }
 
-        fn generate<F>(
+        async fn generate(
             &self,
             request: GenerateRequest,
-            mut on_delta: F,
-        ) -> impl std::future::Future<Output = Result<Message, ModelError>> + Send
-        where
-            F: FnMut(StreamDelta) + Send,
-        {
-            async move {
-                self.requests.lock().expect("lock should not be poisoned").push(request);
-                let reply = self.replies.lock().expect("lock should not be poisoned").remove(0);
-                if let Some(interrupt) = &self.interrupt {
-                    interrupt.cancel();
-                }
-                if let Ok(message) = &reply {
-                    let text = message_text(message);
-                    if !text.is_empty() {
-                        on_delta(StreamDelta {
-                            content: Some(text),
-                            ..Default::default()
-                        });
-                    }
-                }
-                reply
+            on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        ) -> Result<Message, ModelError> {
+            self.requests.lock().expect("lock should not be poisoned").push(request);
+            let reply = self.replies.lock().expect("lock should not be poisoned").remove(0);
+            if let Some(interrupt) = &self.interrupt {
+                interrupt.cancel();
             }
+            if let Ok(message) = &reply {
+                let text = message_text(message);
+                if !text.is_empty() {
+                    on_delta(StreamDelta {
+                        content: Some(text),
+                        ..Default::default()
+                    });
+                }
+            }
+            reply
         }
     }
 
@@ -512,6 +712,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn echo_tool() -> FunctionTool<fn(&Map<String, Value>) -> Result<Value, ToolError>> {
         fn echo(arguments: &Map<String, Value>) -> Result<Value, ToolError> {
             Ok(arguments.get("text").cloned().unwrap_or(Value::Null))
@@ -562,7 +763,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Step(step) => Some(step),
-                Event::Delta(_) => None,
+                Event::Delta(_) | Event::Activity(_) => None,
             })
             .collect();
         assert_eq!(steps.len(), 4);

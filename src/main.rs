@@ -3,14 +3,20 @@
 //! 应用内所有边框统一 2px，一律使用 GPUI 的 `border_2` 系列缩放方法；
 //! 组件自带的 1px 边框在调用处覆盖。
 
+mod access;
 mod composer;
 mod config;
 mod conversation;
 mod models;
 mod session;
+mod session_store;
+mod sessions;
+mod settings;
+mod ui;
 
+use access::AccessForm;
 use composer::{Composer, ComposerEvent};
-use conversation::{ChatRole, Conversation};
+use conversation::{ChatRole, Conversation, ConversationEvent};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     assets::{AllAssets, IconName},
@@ -26,8 +32,15 @@ use gpui_kit::{
 };
 use models::ModelsForm;
 use session::{Session, Status};
+use session_store::{SessionFile, SessionStore};
+use sessions::SessionsForm;
+use settings::{SettingsForm, SettingsTab};
+use ui::{Tone, chip, tinted};
 
-actions!(haloeth, [NewSession, ClearSession, ShowModels, ShowAbout, Quit]);
+actions!(
+    haloeth,
+    [NewSession, ClearSession, ShowSessions, ShowModels, ShowSettings, ShowAbout, Quit]
+);
 
 /// 窗口默认尺寸，竖长矩形，y 轴为长边
 const WINDOW_SIZE: Size<Pixels> = size(px(480.), px(768.));
@@ -40,28 +53,87 @@ struct Haloeth {
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
     session: Entity<Session>,
+    /// 会话目录
+    store: SessionStore,
+    /// 当前会话的文件元数据
+    active: SessionFile,
+    /// 标题栏展示的会话标题
+    title: SharedString,
+    /// 上一次观察到的运行状态，用于在终态触发保存
+    last_status: Status,
     _composer_subscription: Subscription,
+    _conversation_subscription: Subscription,
     _conversation_observation: Subscription,
     _composer_observation: Subscription,
     _session_observation: Subscription,
+    _appearance_subscription: Subscription,
 }
 
 impl Haloeth {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let config = config::Config::load();
+        let store = SessionStore::new(config.sessions_root());
+        Self::new_with_store(window, cx, store, config, true)
+    }
+
+    /// 以指定的会话目录与配置构造；测试用临时目录注入。
+    fn new_with_store(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        store: SessionStore,
+        config: config::Config,
+        persist_config: bool,
+    ) -> Self {
+        // 配色方案：跟随系统时读取窗口外观，系统切换时同步更新。
+        ui::apply_theme(config.ui.theme, Some(window), cx);
         let conversation = cx.new(Conversation::new);
-        let session = cx.new(|_| Session::new(config::Config::load(), conversation.clone()));
+        let session = cx.new(|_| Session::new(config, conversation.clone()));
+        session.update(cx, |session, cx| session.set_config_persistence(persist_config, cx));
         let composer = cx.new(|cx| Composer::new(window, cx));
+
+        // 启动恢复：上次会话 → 最近更新的会话 → 新建。
+        let active = Self::restore_session(&store, cx, &session, &conversation);
+
         let subscription = cx.subscribe(&composer, |this, _composer, event: &ComposerEvent, cx| {
             let ComposerEvent::Submit(text) = event;
             this.conversation.update(cx, |conversation, cx| {
                 conversation.push(ChatRole::User, text.clone(), cx);
             });
             this.session.update(cx, |session, cx| session.submit(text.to_string(), cx));
+            this.save_active(cx);
         });
+        // 审批卡片上的按钮回到会话，由会话把决定交给挂起中的审批
+        let conversation_subscription =
+            cx.subscribe(&conversation, |this, _, event: &ConversationEvent, cx| {
+                let ConversationEvent::ApprovalDecision {
+                    id,
+                    decision,
+                } = event;
+                this.session.update(cx, |session, cx| {
+                    session.resolve_approval(id, *decision, cx);
+                });
+                this.save_active(cx);
+            });
         // 底部栏的消息数、会话状态与发送按钮可用性跟随各自状态变化
         let observation = cx.observe(&conversation, |_, _, cx| cx.notify());
         let composer_observation = cx.observe(&composer, |_, _, cx| cx.notify());
-        let session_observation = cx.observe(&session, |_, _, cx| cx.notify());
+        let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
+            let preference = this.session.read(cx).config().ui.theme;
+            if preference == config::ThemePreference::System {
+                ui::apply_theme(preference, Some(window), cx);
+            }
+        });
+        let session_observation = cx.observe(&session, |this, session, cx| {
+            let status = session.read(cx).status();
+            // 运行进入终态或等待审批时落盘，避免流式增量逐帧写文件。
+            if status != this.last_status {
+                this.last_status = status;
+                if matches!(status, Status::Idle | Status::Failed | Status::AwaitingApproval) {
+                    this.save_active(cx);
+                }
+            }
+            cx.notify();
+        });
 
         // 呼出即输入：窗口就绪后把焦点交给输入缓冲区
         let buffer = composer.read(cx).buffer().clone();
@@ -69,16 +141,115 @@ impl Haloeth {
             buffer.update(cx, |buffer, cx| buffer.focus(window, cx));
         });
 
+        let initial_title = SharedString::from(active.title.clone());
         Self {
             menu_bar: AppMenuBar::new(cx),
             conversation,
             composer,
             session,
+            store,
+            active,
+            title: initial_title,
+            last_status: Status::Idle,
             _composer_subscription: subscription,
+            _conversation_subscription: conversation_subscription,
             _conversation_observation: observation,
             _composer_observation: composer_observation,
             _session_observation: session_observation,
+            _appearance_subscription: appearance_subscription,
         }
+    }
+
+    /// 启动时恢复会话：先尝试上次打开的会话，再退到最近更新的会话，最后新建。
+    fn restore_session(
+        store: &SessionStore,
+        cx: &mut App,
+        session: &Entity<Session>,
+        conversation: &Entity<Conversation>,
+    ) -> SessionFile {
+        let last = session.read(cx).config().storage.last_session.clone();
+        let restored = store
+            .load(&last)
+            .ok()
+            .or_else(|| store.list().first().and_then(|summary| store.load(&summary.id).ok()));
+        let mut file = match restored {
+            Some(file) => file,
+            None => {
+                let (provider, model) = session
+                    .read(cx)
+                    .config()
+                    .selection()
+                    .map(|(provider, model)| (Some(provider.to_owned()), Some(model.to_owned())))
+                    .unwrap_or((None, None));
+                store.create(provider, model).unwrap_or_else(|_| SessionFile::new(None, None))
+            }
+        };
+        file.suggest_title();
+        conversation.update(cx, |conversation, cx| {
+            conversation.restore(file.transcript.clone(), cx);
+        });
+        session.update(cx, |session, cx| {
+            session.load_state(&file, cx);
+            session.remember_session(&file.id, cx);
+        });
+        file
+    }
+
+    /// 保存当前会话：显示记录、执行上下文、授权与当前模型。
+    pub(crate) fn save_active(&mut self, cx: &mut Context<Self>) {
+        let transcript = self.conversation.read(cx).snapshot(cx);
+        let (context, usage, selection, grants, rules, last_session) = {
+            let session = self.session.read(cx);
+            (
+                session.context().clone(),
+                session.usage(),
+                session
+                    .selection()
+                    .map(|(provider, model)| (provider.to_owned(), model.to_owned())),
+                session.grants().to_vec(),
+                session.always_allow().to_vec(),
+                session.config().storage.last_session.clone(),
+            )
+        };
+        self.active.transcript = transcript;
+        self.active.context = context;
+        self.active.usage = usage;
+        self.active.grants = grants;
+        self.active.rules = rules;
+        if let Some((provider, model)) = selection {
+            self.active.provider = Some(provider);
+            self.active.model = Some(model);
+        }
+        self.active.suggest_title();
+        self.title = SharedString::from(self.active.title.clone());
+        if let Err(error) = self.store.save(&mut self.active) {
+            tracing::warn!("保存会话失败：{error}");
+            return;
+        }
+        if last_session != self.active.id {
+            self.session.update(cx, |session, cx| session.remember_session(&self.active.id, cx));
+        }
+    }
+
+    /// 打开一个已有会话；运行中不允许切换。
+    fn open_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.session.read(cx).status().is_busy() || id == self.active.id {
+            return;
+        }
+        self.save_active(cx);
+        let Ok(file) = self.store.load(id) else {
+            return;
+        };
+        self.activate(file, cx);
+    }
+
+    /// 新建一个空会话，并把它设为当前会话。
+    fn create_session(&mut self, cx: &mut Context<Self>) {
+        if self.session.read(cx).status().is_busy() {
+            return;
+        }
+        self.save_active(cx);
+        self.create_blank(cx);
     }
 
     /// 切换当前模型：提供商与模型一同确定
@@ -86,15 +257,186 @@ impl Haloeth {
         self.session.update(cx, |session, cx| session.select_model(provider, model, cx));
     }
 
-    /// 新会话：清空对话记录与代理记忆
+    /// 新会话：保存当前会话，再创建一个空的持久会话
     fn new_session(&mut self, _: &NewSession, _window: &mut Window, cx: &mut Context<Self>) {
-        self.conversation.update(cx, |conversation, cx| conversation.clear(cx));
-        self.session.update(cx, |session, cx| session.reset(cx));
+        self.create_session(cx);
     }
 
-    /// 清空会话：仅清空对话记录，保留代理记忆
+    /// 清空会话：清空对话记录与代理记忆，保留会话标识、授权与模型
     fn clear_session(&mut self, _: &ClearSession, _window: &mut Window, cx: &mut Context<Self>) {
         self.conversation.update(cx, |conversation, cx| conversation.clear(cx));
+        self.session.update(cx, |session, cx| session.clear_context(cx));
+        self.save_active(cx);
+    }
+
+    /// 打开设置对话框，并定位到指定分页。
+    fn open_settings(&mut self, tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) {
+        let config = self.session.read(cx).config().clone();
+        let session = self.session.downgrade();
+        let haloeth = cx.weak_entity();
+        let form = cx.new(|cx| SettingsForm::new(window, &config, session, haloeth, tab, cx));
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog
+                .border_2()
+                .title("设置")
+                .overlay_closable(false)
+                .child(form.clone())
+                .footer(form.update(cx, |form, cx| form.render_footer(cx).into_any_element()))
+        });
+    }
+
+    /// 打开设置对话框（通用分页）。
+    fn show_settings(&mut self, _: &ShowSettings, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(SettingsTab::General, window, cx);
+    }
+
+    /// 打开目录授权对话框。
+    fn show_access(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let session = self.session.downgrade();
+        let haloeth = cx.weak_entity();
+        let form = cx.new(|cx| AccessForm::new(window, session, haloeth, cx));
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.border_2().title("可访问目录").overlay_closable(false).child(form.clone())
+        });
+    }
+
+    /// 修改配置并持久化；用于主界面的快速开关。
+    fn update_config(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut config::Config)) {
+        self.session.update(cx, |session, cx| session.update_config(cx, f));
+    }
+
+    /// 切换审核模式。
+    fn set_approval_mode(&mut self, mode: agent::approval::ApprovalMode, cx: &mut Context<Self>) {
+        self.update_config(cx, |config| config.approval.mode = mode);
+    }
+
+    /// 切换内置工具。
+    fn toggle_tool(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.to_owned();
+        self.update_config(cx, move |config| {
+            if let Some(index) = config.tools.disabled.iter().position(|entry| entry == &name) {
+                config.tools.disabled.remove(index);
+            } else {
+                config.tools.disabled.push(name);
+            }
+        });
+    }
+
+    /// 切换 MCP 服务器。
+    fn toggle_mcp(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.to_owned();
+        self.update_config(cx, move |config| {
+            if let Some(server) = config.mcp_servers.iter_mut().find(|server| server.name == name) {
+                server.enabled = !server.enabled;
+            }
+        });
+    }
+
+    /// 切换 Skill。
+    fn toggle_skill(&mut self, name: &str, cx: &mut Context<Self>) {
+        let discovered: Vec<String> =
+            agent::skill::discover(&self.session.read(cx).config().skill_dirs())
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect();
+        let name = name.to_owned();
+        self.update_config(cx, move |config| {
+            if config.skills.enabled.is_empty() {
+                config.skills.enabled = discovered;
+            }
+            if let Some(index) = config.skills.enabled.iter().position(|entry| entry == &name) {
+                config.skills.enabled.remove(index);
+            } else {
+                config.skills.enabled.push(name);
+            }
+        });
+    }
+
+    /// 打开会话对话框
+    fn show_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let active = self.active.id.clone();
+        let haloeth = cx.weak_entity();
+        let form = cx.new(|cx| SessionsForm::new(window, store, &active, haloeth, cx));
+
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog
+                .border_2()
+                .title("会话")
+                .overlay_closable(false)
+                .child(form.clone())
+                .footer(form.update(cx, |form, cx| form.render_footer(cx).into_any_element()))
+        });
+    }
+
+    /// 当前会话标识符
+    pub(crate) fn active_id(&self) -> &str {
+        &self.active.id
+    }
+
+    /// 应用一个已加载的会话文件。
+    fn activate(&mut self, file: SessionFile, cx: &mut Context<Self>) {
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.restore(file.transcript.clone(), cx);
+        });
+        self.session.update(cx, |session, cx| {
+            session.load_state(&file, cx);
+            session.remember_session(&file.id, cx);
+        });
+        self.title = SharedString::from(file.title.clone());
+        self.active = file;
+    }
+
+    /// 新建空会话但不保存当前会话（删除当前会话时使用）。
+    fn create_blank(&mut self, cx: &mut Context<Self>) {
+        let (provider, model) = self
+            .session
+            .read(cx)
+            .selection()
+            .map(|(provider, model)| (Some(provider.to_owned()), Some(model.to_owned())))
+            .unwrap_or((None, None));
+        let Ok(file) = self.store.create(provider, model) else {
+            return;
+        };
+        self.activate(file, cx);
+    }
+
+    /// 删除会话；删除的是当前会话时切到下一个，没有剩余则新建。
+    pub(crate) fn delete_session(
+        &mut self,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.session.read(cx).status().is_busy() {
+            return Err("运行中不能删除会话".to_owned());
+        }
+        let was_active = id == self.active.id;
+        self.store.delete(id)?;
+        if was_active {
+            match self.store.list().first().map(|summary| summary.id.clone()) {
+                Some(next) => match self.store.load(&next) {
+                    Ok(file) => self.activate(file, cx),
+                    Err(_) => self.create_blank(cx),
+                },
+                None => self.create_blank(cx),
+            }
+        }
+        Ok(())
+    }
+
+    /// 重命名当前会话。
+    pub(crate) fn rename_session(
+        &mut self,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let file = self.store.rename(&self.active.id, title)?;
+        self.active.title = file.title.clone();
+        self.title = SharedString::from(file.title);
+        cx.notify();
+        Ok(())
     }
 
     /// 打开模型对话框：编辑作用于草稿，保存后才生效
@@ -184,6 +526,17 @@ impl Haloeth {
             .child(div().text_sm().font_weight(FontWeight::BOLD).child("Haloeth"))
     }
 
+    /// 当前会话按钮，点击打开会话对话框
+    fn render_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("session")
+            .ghost()
+            .small()
+            .label(self.title.clone())
+            .tooltip("会话")
+            .accessibility_label(format!("当前会话：{}", self.title))
+            .on_click(cx.listener(|this, _, window, cx| this.show_sessions(window, cx)))
+    }
+
     /// 主菜单图标按钮，点击呼出应用主菜单
     fn render_main_menu(&self) -> impl IntoElement {
         Button::new("main-menu")
@@ -195,9 +548,11 @@ impl Haloeth {
             .accessibility_label("主菜单")
             .dropdown_menu(|menu, _, _| {
                 menu.menu_with_icon("新会话", IconName::Plus, Box::new(NewSession))
+                    .menu_with_icon("会话…", IconName::FolderOpen, Box::new(ShowSessions))
                     .menu_with_icon("清空会话", IconName::Eraser, Box::new(ClearSession))
                     .separator()
                     .menu_with_icon("模型…", IconName::BrainCircuit, Box::new(ShowModels))
+                    .menu_with_icon("设置…", IconName::Settings, Box::new(ShowSettings))
                     .menu_with_icon("关于 Haloeth…", IconName::Info, Box::new(ShowAbout))
                     .separator()
                     .menu_with_icon("退出", IconName::LogOut, Box::new(Quit))
@@ -214,6 +569,7 @@ impl Haloeth {
                 .flex_1()
                 .child(self.render_brand(cx))
                 .child(self.render_main_menu())
+                .child(self.render_session_button(cx))
                 .child(self.menu_bar.clone()),
         )
     }
@@ -236,6 +592,7 @@ impl Haloeth {
         let trigger = Button::new("model")
             .ghost()
             .small()
+            .max_w(rems(10.))
             .label(label.clone())
             .tooltip("切换模型")
             .accessibility_label(match &current {
@@ -277,17 +634,249 @@ impl Haloeth {
             .into_any_element()
     }
 
-    /// 底部栏：左侧提交提示，右侧模型、会话状态、**Token** 用量、消息数与发送动作
+    /// 左下角「更多」：快速查看与切换工具、MCP、Skill，并进入对应设置。
+    fn render_more_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let config = self.session.read(cx).config().clone();
+        let tools = agent::tools::builtin_tools(&agent::tools::BuiltinOptions::default());
+        let tool_rows: Vec<(String, bool)> = tools
+            .iter()
+            .map(|tool| {
+                let name = tool.spec().name.clone();
+                let enabled = !config.tools.disabled.iter().any(|entry| entry == &name);
+                (name, enabled)
+            })
+            .collect();
+        let mcp_rows: Vec<(String, bool)> =
+            config.mcp_servers.iter().map(|server| (server.name.clone(), server.enabled)).collect();
+        let skill_rows: Vec<(String, bool)> = agent::skill::discover(&config.skill_dirs())
+            .iter()
+            .map(|skill| {
+                let enabled = config.skills.enabled.is_empty()
+                    || config.skills.enabled.iter().any(|entry| entry == &skill.name);
+                (skill.name.clone(), enabled)
+            })
+            .collect();
+        let tool_summary = format!(
+            "工具 · {} / {} 启用 →",
+            tool_rows.iter().filter(|(_, enabled)| *enabled).count(),
+            tool_rows.len()
+        );
+        let mcp_summary = format!(
+            "MCP · {} / {} 启用 →",
+            mcp_rows.iter().filter(|(_, enabled)| *enabled).count(),
+            mcp_rows.len()
+        );
+        let skill_summary = format!(
+            "Skill · {} / {} 启用 →",
+            skill_rows.iter().filter(|(_, enabled)| *enabled).count(),
+            skill_rows.len()
+        );
+        let haloeth = cx.weak_entity();
+
+        Button::new("more")
+            .ghost()
+            .small()
+            .compact()
+            .label("⋯")
+            .tooltip("快速设置：工具、MCP、Skill 与目录")
+            .accessibility_label("快速设置")
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.scrollable(true);
+
+                menu = menu.item(PopupMenuItem::new(tool_summary.clone()).on_click({
+                    let haloeth = haloeth.clone();
+                    move |_, window, cx| {
+                        haloeth
+                            .update(cx, |this, cx| {
+                                this.open_settings(SettingsTab::Tools, window, cx)
+                            })
+                            .ok();
+                    }
+                }));
+                for (name, enabled) in &tool_rows {
+                    let haloeth = haloeth.clone();
+                    let id = name.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(format!(
+                            "{name}  ·  {}",
+                            if *enabled {
+                                "已启用"
+                            } else {
+                                "已停用"
+                            }
+                        ))
+                        .checked(*enabled)
+                        .on_click(move |_, _, cx| {
+                            haloeth.update(cx, |this, cx| this.toggle_tool(&id, cx)).ok();
+                        }),
+                    );
+                }
+
+                menu = menu.separator();
+                menu = menu.item(PopupMenuItem::new(mcp_summary.clone()).on_click({
+                    let haloeth = haloeth.clone();
+                    move |_, window, cx| {
+                        haloeth
+                            .update(cx, |this, cx| this.open_settings(SettingsTab::Mcp, window, cx))
+                            .ok();
+                    }
+                }));
+                for (name, enabled) in &mcp_rows {
+                    let haloeth = haloeth.clone();
+                    let id = name.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(format!(
+                            "{name}  ·  {}",
+                            if *enabled {
+                                "已启用"
+                            } else {
+                                "已停用"
+                            }
+                        ))
+                        .checked(*enabled)
+                        .on_click(move |_, _, cx| {
+                            haloeth.update(cx, |this, cx| this.toggle_mcp(&id, cx)).ok();
+                        }),
+                    );
+                }
+
+                menu = menu.separator();
+                menu = menu.item(PopupMenuItem::new(skill_summary.clone()).on_click({
+                    let haloeth = haloeth.clone();
+                    move |_, window, cx| {
+                        haloeth
+                            .update(cx, |this, cx| {
+                                this.open_settings(SettingsTab::Skill, window, cx)
+                            })
+                            .ok();
+                    }
+                }));
+                for (name, enabled) in &skill_rows {
+                    let haloeth = haloeth.clone();
+                    let id = name.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(format!(
+                            "{name}  ·  {}",
+                            if *enabled {
+                                "已启用"
+                            } else {
+                                "已停用"
+                            }
+                        ))
+                        .checked(*enabled)
+                        .on_click(move |_, _, cx| {
+                            haloeth.update(cx, |this, cx| this.toggle_skill(&id, cx)).ok();
+                        }),
+                    );
+                }
+
+                menu = menu.separator();
+                menu = menu.item(PopupMenuItem::new("目录授权…").on_click({
+                    let haloeth = haloeth.clone();
+                    move |_, window, cx| {
+                        haloeth.update(cx, |this, cx| this.show_access(window, cx)).ok();
+                    }
+                }));
+                menu.item(PopupMenuItem::new("设置…").on_click({
+                    let haloeth = haloeth.clone();
+                    move |_, window, cx| {
+                        haloeth
+                            .update(cx, |this, cx| {
+                                this.open_settings(SettingsTab::General, window, cx)
+                            })
+                            .ok();
+                    }
+                }))
+            })
+            .into_any_element()
+    }
+
+    /// 审核模式快速切换。
+    fn render_approval_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = self.session.read(cx).config().approval.mode;
+        let tone = approval_tone(mode);
+        let haloeth = cx.weak_entity();
+        let trigger = tinted(Button::new("approval-mode").outline().border_2().xsmall(), tone, cx)
+            .label(mode.label())
+            .tooltip("审核模式：点击切换")
+            .accessibility_label(format!("审核模式：{}", mode.label()));
+        trigger.dropdown_caret(true).dropdown_menu(move |menu, _, _| {
+            let mut menu = menu;
+            for value in [
+                agent::approval::ApprovalMode::Manual,
+                agent::approval::ApprovalMode::Rules,
+                agent::approval::ApprovalMode::Model,
+                agent::approval::ApprovalMode::Off,
+            ] {
+                let haloeth = haloeth.clone();
+                menu =
+                    menu.item(PopupMenuItem::new(value.label()).checked(value == mode).on_click(
+                        move |_, _, cx| {
+                            haloeth.update(cx, |this, cx| this.set_approval_mode(value, cx)).ok();
+                        },
+                    ));
+            }
+            menu
+        })
+    }
+
+    /// 当前会话的目录授权快速查看与入口。
+    fn render_access_chip(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let grants = self.session.read(cx).grants().to_vec();
+        let tone = if grants.is_empty() {
+            Tone::Warning
+        } else {
+            Tone::Success
+        };
+        let label = if grants.is_empty() {
+            "未授权目录".to_owned()
+        } else {
+            format!("{} 个目录", grants.len())
+        };
+        let haloeth = cx.weak_entity();
+        tinted(Button::new("access").outline().border_2().xsmall(), tone, cx)
+            .tooltip("当前会话可访问的目录")
+            .accessibility_label(format!("目录授权：{label}"))
+            .label(label)
+            .dropdown_caret(true)
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu;
+                for grant in &grants {
+                    let access = match grant.access {
+                        agent::tool::Access::Read => "只读",
+                        agent::tool::Access::Write => "读写",
+                    };
+                    menu = menu.item(PopupMenuItem::label(format!(
+                        "{}（{access}）",
+                        grant.path.display()
+                    )));
+                }
+                menu.item(PopupMenuItem::new("管理目录授权…").on_click({
+                    let haloeth = haloeth.clone();
+                    move |_, window, cx| {
+                        haloeth.update(cx, |this, cx| this.show_access(window, cx)).ok();
+                    }
+                }))
+            })
+    }
+
+    /// 底部栏：左侧快速设置，右侧模型、会话状态与发送动作
     fn render_bottom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.session.read(cx).status();
         let message_count = self.conversation.read(cx).message_count();
         let total_tokens = self.session.read(cx).usage().total();
+        let quick = h_flex()
+            .items_center()
+            .gap_1()
+            .child(self.render_more_menu(cx))
+            .child(self.render_approval_chip(cx))
+            .child(self.render_access_chip(cx));
 
         StatusBar::new()
             .border_t_2()
-            .child(status_item("submit-hint", composer::SUBMIT_HINT))
+            .child(quick)
             .right(self.render_model_picker(cx))
-            .right(status_item("session-state", status.label()))
+            .right(chip("session-state", status.label(), status_tone(status), cx))
             .when(total_tokens > 0, |this| {
                 this.right(status_item("token-usage", format_tokens(total_tokens)))
             })
@@ -315,13 +904,34 @@ impl Haloeth {
             .primary()
             .small()
             .icon(IconName::Airplay)
-            .tooltip("发送")
+            .tooltip(composer::SUBMIT_HINT)
             .accessibility_label("发送")
             .disabled(!self.composer.read(cx).is_submittable())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.composer.update(cx, |composer, cx| composer.submit(window, cx));
             }))
             .into_any_element()
+    }
+}
+
+/// 运行状态对应的展示色调。
+fn status_tone(status: Status) -> Tone {
+    match status {
+        Status::Idle => Tone::Neutral,
+        Status::Preparing | Status::Running => Tone::Accent,
+        Status::AwaitingApproval | Status::Cancelling => Tone::Warning,
+        Status::Unconfigured | Status::Unselected => Tone::Warning,
+        Status::Failed => Tone::Danger,
+    }
+}
+
+/// 审核模式对应的展示色调。
+fn approval_tone(mode: agent::approval::ApprovalMode) -> Tone {
+    match mode {
+        agent::approval::ApprovalMode::Manual => Tone::Warning,
+        agent::approval::ApprovalMode::Rules => Tone::Success,
+        agent::approval::ApprovalMode::Model => Tone::Accent,
+        agent::approval::ApprovalMode::Off => Tone::Danger,
     }
 }
 
@@ -348,7 +958,11 @@ impl Render for Haloeth {
             .bg(cx.theme().background)
             .on_action(cx.listener(Self::new_session))
             .on_action(cx.listener(Self::clear_session))
+            .on_action(
+                cx.listener(|this, _: &ShowSessions, window, cx| this.show_sessions(window, cx)),
+            )
             .on_action(cx.listener(Self::show_models))
+            .on_action(cx.listener(Self::show_settings))
             .on_action(cx.listener(Self::show_about))
             .child(self.render_title_bar(cx))
             .child(self.conversation.clone())
@@ -387,6 +1001,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{Haloeth, WINDOW_MIN_SIZE, WINDOW_SIZE, format_tokens};
+    use agent::error::ModelError;
+    use agent::message::{Message, StreamDelta, ToolCall};
+    use agent::model::{GenerateRequest, Model, ModelBuilder};
     use gpui_kit::component::Root;
     use gpui_kit::test::TestAppContextExt as _;
     use gpui_kit::test::TestWindowExt as _;
@@ -394,7 +1011,74 @@ mod tests {
         AnyWindowHandle, AppContext as _, Entity, Pixels, Role, Size, TestAppContext, Window,
         point, px,
     };
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// 按脚本返回回复的模型，用于离线端到端测试。
+    struct ScriptedModel {
+        replies: Mutex<VecDeque<Message>>,
+    }
+
+    impl ScriptedModel {
+        fn new(replies: Vec<Message>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Model for ScriptedModel {
+        fn model_id(&self) -> &str {
+            "scripted"
+        }
+
+        async fn generate(
+            &self,
+            _request: GenerateRequest,
+            _on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        ) -> Result<Message, ModelError> {
+            self.replies.lock().expect("脚本不应被毒化").pop_front().ok_or_else(|| {
+                ModelError::Transport {
+                    reason: "the script ran out of replies".to_owned(),
+                }
+            })
+        }
+    }
+
+    /// 构造一次工具调用回复。
+    fn tool_call(name: &str, arguments: serde_json::Value) -> Message {
+        Message {
+            role: agent::message::Role::Assistant,
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: format!("call_{name}"),
+                name: name.to_owned(),
+                arguments,
+            }],
+            tool_call_id: None,
+            usage: None,
+        }
+    }
+
+    /// 构造最终答案回复。
+    fn final_answer(value: serde_json::Value) -> Message {
+        tool_call("final_answer", serde_json::json!({ "answer": value }))
+    }
+
+    /// 等待状态栏显示指定文本。
+    async fn wait_for_status(cx: &mut TestAppContext, handle: AnyWindowHandle, status: &str) {
+        let status = status.to_owned();
+        cx.wait_for(handle, Duration::from_secs(5), move |window, _| {
+            window
+                .try_find("session-state")
+                .and_then(|element| element.label().map(str::to_owned))
+                .as_deref()
+                == Some(status.as_str())
+        })
+        .await;
+    }
 
     /// 打开真实外壳窗口，返回视图与窗口句柄
     fn open_shell(
@@ -403,22 +1087,25 @@ mod tests {
     ) -> (Entity<Haloeth>, AnyWindowHandle) {
         cx.update(gpui_kit::init);
 
+        let store = crate::session_store::SessionStore::new(
+            std::env::temp_dir().join(format!("haloeth-ui-{}", uuid::Uuid::new_v4())),
+        );
         let mut built = None;
         let handle = cx.open_window(size, |window, cx| {
-            let haloeth = cx.new(|cx| Haloeth::new(window, cx));
+            let haloeth = cx.new(|cx| {
+                Haloeth::new_with_store(
+                    window,
+                    cx,
+                    store.clone(),
+                    crate::config::Config::default(),
+                    false,
+                )
+            });
             built = Some(haloeth.clone());
             Root::new(haloeth, window, cx)
         });
 
         let haloeth = built.expect("the window build closure ran");
-        // 断言不依赖开发者本机的配置文件：测试统一从空配置开始
-        cx.update(|cx| {
-            haloeth.update(cx, |haloeth, cx| {
-                haloeth.session.update(cx, |session, cx| {
-                    session.apply_config(crate::config::Config::default(), cx);
-                });
-            });
-        });
 
         (haloeth, handle.into())
     }
@@ -1151,5 +1838,412 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    /// 手动审核：工具调用先弹审批卡片，允许后执行并给出最终答案
+    #[gpui_kit::test]
+    async fn manual_approval_gates_a_tool_call(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        // 运行在独立的 Tokio 运行时上，允许测试在等待跨线程事件时暂停调度。
+        cx.executor().allow_parking();
+        configure(cx, &haloeth, "local", "secret", &["m"]);
+
+        let replies = vec![
+            tool_call("shell", serde_json::json!({ "command": "echo hi" })),
+            final_answer(serde_json::json!("done")),
+        ];
+        let builder: ModelBuilder = Arc::new(move || Box::new(ScriptedModel::new(replies.clone())));
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    session.set_model_builder(builder, cx);
+                });
+            });
+        });
+
+        cx.update_window(handle, |_, _, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| session.submit("run".to_owned(), cx));
+            });
+        })
+        .unwrap();
+        wait_for_status(cx, handle, "等待确认").await;
+
+        let id = cx
+            .update(|cx| haloeth.read(cx).conversation.read(cx).pending_approval(cx))
+            .expect("a pending approval should be visible");
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(gpui_kit::ElementId::Name(format!("approval-allow:{id}").into()), cx);
+        })
+        .unwrap();
+        wait_for_status(cx, handle, "就绪").await;
+
+        cx.update(|cx| {
+            let conversation = haloeth.read(cx).conversation.read(cx);
+            let label =
+                conversation.last_message_source().expect("the final answer should be visible");
+            assert!(label.contains("最终答案"), "最终答案可见：{label}");
+            assert!(label.contains("done"), "答案内容可见：{label}");
+        });
+    }
+
+    /// 会话自动保存，并能在多个会话之间切换恢复
+    #[gpui_kit::test]
+    async fn sessions_persist_and_switch(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        configure(cx, &haloeth, "local", "secret", &["m"]);
+
+        let builder: ModelBuilder = Arc::new(|| {
+            Box::new(ScriptedModel::new(vec![final_answer(serde_json::json!("done"))]))
+        });
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    session.set_model_builder(builder, cx);
+                });
+            });
+        });
+
+        cx.update_window(handle, |_, _, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.conversation.update(cx, |conversation, cx| {
+                    conversation.push(crate::conversation::ChatRole::User, "第一件事", cx);
+                });
+                haloeth.session.update(cx, |session, cx| session.submit("第一件事".to_owned(), cx));
+            });
+        })
+        .unwrap();
+        wait_for_status(cx, handle, "就绪").await;
+
+        let first = cx.update(|cx| haloeth.read(cx).active_id().to_owned());
+        let saved = cx
+            .update(|cx| haloeth.read(cx).store.load(&first))
+            .expect("the session should be saved");
+        assert!(saved.message_count() >= 2, "用户与最终答案都应落盘");
+        assert_eq!(saved.title, "第一件事", "标题取自第一条用户消息");
+
+        // 新建会话后对话为空
+        cx.update(|cx| haloeth.update(cx, |haloeth, cx| haloeth.create_session(cx)));
+        let second = cx.update(|cx| haloeth.read(cx).active_id().to_owned());
+        assert_ne!(second, first);
+        cx.update(|cx| {
+            assert_eq!(haloeth.read(cx).conversation.read(cx).message_count(), 0);
+        });
+
+        // 切回第一个会话，记录与上下文都恢复
+        cx.update(|cx| haloeth.update(cx, |haloeth, cx| haloeth.open_session(&first, cx)));
+        cx.update(|cx| {
+            let haloeth = haloeth.read(cx);
+            assert_eq!(haloeth.active_id(), first);
+            assert!(haloeth.conversation.read(cx).message_count() >= 2);
+            assert_eq!(haloeth.session.read(cx).context().steps.len(), 3);
+        });
+    }
+
+    /// 会话对话框列出会话并提供删除动作
+    #[gpui_kit::test]
+    async fn sessions_dialog_lists_the_active_session(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let id = cx.update(|cx| haloeth.read(cx).active_id().to_owned());
+
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| haloeth.show_sessions(window, cx));
+        })
+        .unwrap();
+        settle_dialog(cx, handle).await;
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let dialog = window.within("dialog");
+            assert!(dialog.find("sessions-panel").visible());
+            assert!(dialog.find("sessions-new").visible());
+            assert!(
+                dialog
+                    .find(gpui_kit::ElementId::Name(format!("session-delete:{id}").into()))
+                    .visible()
+            );
+        })
+        .unwrap();
+    }
+
+    /// 规则审核：授权目录内的读取自动放行，不弹出审批卡片
+    #[gpui_kit::test]
+    async fn rules_mode_allows_reads_inside_a_granted_directory(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        configure(cx, &haloeth, "local", "secret", &["m"]);
+
+        let dir = std::env::temp_dir().join(format!("haloeth-grant-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("grant dir");
+        let file = dir.join("note.txt");
+        std::fs::write(&file, "hello from the granted directory").expect("fixture");
+
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    let mut config = session.config().clone();
+                    config.approval.mode = agent::approval::ApprovalMode::Rules;
+                    session.apply_config(config, cx);
+                    session.set_grants(
+                        vec![agent::approval::DirectoryGrant::new(&dir, agent::tool::Access::Read)],
+                        cx,
+                    );
+                });
+            });
+        });
+
+        let replies = vec![
+            tool_call("read_file", serde_json::json!({ "path": file.to_string_lossy() })),
+            final_answer(serde_json::json!("read done")),
+        ];
+        let builder: ModelBuilder = Arc::new(move || Box::new(ScriptedModel::new(replies.clone())));
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    session.set_model_builder(builder, cx);
+                });
+            });
+        });
+
+        cx.update_window(handle, |_, _, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.conversation.update(cx, |conversation, cx| {
+                    conversation.push(crate::conversation::ChatRole::User, "读文件", cx);
+                });
+                haloeth.session.update(cx, |session, cx| session.submit("读文件".to_owned(), cx));
+            });
+        })
+        .unwrap();
+        wait_for_status(cx, handle, "就绪").await;
+
+        cx.update(|cx| {
+            let haloeth = haloeth.read(cx);
+            let conversation = haloeth.conversation.read(cx);
+            assert_eq!(
+                conversation.activity_status("call_read_file", cx),
+                Some(crate::conversation::ActivityStatus::Ok),
+                "授权目录内的读取应自动放行并成功"
+            );
+            assert!(
+                conversation.last_message_source().is_some_and(|text| text.contains("read done")),
+                "最终答案应可见"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 底部栏可以直接切换审核模式，并立即反映到配置。
+    #[gpui_kit::test]
+    fn approval_mode_switches_from_the_bottom_bar(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("approval-mode", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let mut menu = window.within(r#"popover:dropdown-menu:Name("approval-mode")"#);
+            // 顺序：手动、规则、模型、关闭。
+            menu.click(gpui_kit::ElementId::Integer(1), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let mode = haloeth.read(cx).session.read(cx).config().approval.mode;
+            assert_eq!(mode, agent::approval::ApprovalMode::Rules);
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find("approval-mode").label(), Some("审核模式：规则自动"));
+        })
+        .unwrap();
+    }
+
+    /// 目录授权对话框可以直接增删当前会话的授权。
+    #[gpui_kit::test]
+    async fn access_dialog_adds_and_removes_directories(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let dir = std::env::temp_dir().join(format!("haloeth-access-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("grant dir");
+
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| haloeth.show_access(window, cx));
+        })
+        .unwrap();
+        settle_dialog(cx, handle).await;
+
+        let path = dir.to_string_lossy().to_string();
+        cx.update_window(handle, |_, window, cx| {
+            window.within("dialog").click("access-path", cx);
+            window.within("dialog").input(&path, cx);
+            window.within("dialog").click("access-add", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        cx.update(|cx| {
+            let grants = haloeth.read(cx).session.read(cx).grants().to_vec();
+            assert_eq!(grants.len(), 1);
+            assert_eq!(grants[0].path, dir);
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            window.within("dialog").click("access-remove:0", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(haloeth.read(cx).session.read(cx).grants().is_empty());
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「⋯」菜单里的分类入口打开对应的设置分页。
+    #[gpui_kit::test]
+    async fn more_menu_opens_the_tool_settings(cx: &mut TestAppContext) {
+        let (_haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("more", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let mut menu = window.within(r#"popover:dropdown-menu:Name("more")"#);
+            // 第一项是「工具 · n / m 启用 →」。
+            menu.click(gpui_kit::ElementId::Integer(0), cx);
+        })
+        .unwrap();
+        settle_dialog(cx, handle).await;
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let dialog = window.within("dialog");
+            assert!(dialog.find("settings-panel").visible());
+            assert!(dialog.try_find("tool-toggle:shell").is_some());
+        })
+        .unwrap();
+    }
+
+    /// 主题设置立即切换到深色。
+    #[gpui_kit::test]
+    async fn settings_switches_the_color_scheme(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_settings(crate::settings::SettingsTab::General, window, cx)
+            });
+        })
+        .unwrap();
+        settle_dialog(cx, handle).await;
+
+        cx.update_window(handle, |_, window, cx| {
+            window.within("dialog").click("theme:dark", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(gpui_kit::component::Theme::global(cx).mode.is_dark());
+        });
+    }
+
+    /// 设置对话框展示各能力分区
+    #[gpui_kit::test]
+    async fn settings_dialog_shows_capability_sections(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.show_settings(&crate::ShowSettings, window, cx);
+            });
+        })
+        .unwrap();
+        settle_dialog(cx, handle).await;
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            {
+                let mut dialog = window.within("dialog");
+                assert!(dialog.find("settings-panel").visible());
+                assert!(dialog.find("settings-save").visible());
+                // 通用分页：外观与审核模型。
+                assert!(dialog.find("theme:dark").visible());
+                assert!(dialog.find("settings-reviewer").visible());
+                dialog.click("settings-tab:tools", cx);
+            }
+            window.render_frame(cx);
+            {
+                let mut dialog = window.within("dialog");
+                // 分页内容可能超出首屏，存在即可。
+                assert!(dialog.try_find("tool-toggle:shell").is_some());
+                assert!(dialog.try_find("settings-search").is_some());
+                dialog.click("settings-tab:mcp", cx);
+            }
+            window.render_frame(cx);
+            window.within("dialog").click("settings-tab:skill", cx);
+            window.render_frame(cx);
+            let dialog = window.within("dialog");
+            assert!(dialog.try_find("skill-dir-add").is_some());
+            assert!(dialog.try_find("skill-create").is_some());
+        })
+        .unwrap();
+    }
+
+    /// 手动审核：拒绝后工具不执行，模型收到拒绝观测后结束
+    #[gpui_kit::test]
+    async fn manual_denial_skips_the_tool(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        // 运行在独立的 Tokio 运行时上，允许测试在等待跨线程事件时暂停调度。
+        cx.executor().allow_parking();
+        configure(cx, &haloeth, "local", "secret", &["m"]);
+
+        let replies = vec![
+            tool_call("shell", serde_json::json!({ "command": "echo hi" })),
+            final_answer(serde_json::json!("stopped")),
+        ];
+        let builder: ModelBuilder = Arc::new(move || Box::new(ScriptedModel::new(replies.clone())));
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    session.set_model_builder(builder, cx);
+                });
+            });
+        });
+
+        cx.update_window(handle, |_, _, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| session.submit("run".to_owned(), cx));
+            });
+        })
+        .unwrap();
+        wait_for_status(cx, handle, "等待确认").await;
+
+        let id = cx
+            .update(|cx| haloeth.read(cx).conversation.read(cx).pending_approval(cx))
+            .expect("a pending approval should be visible");
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(gpui_kit::ElementId::Name(format!("approval-deny:{id}").into()), cx);
+        })
+        .unwrap();
+        wait_for_status(cx, handle, "就绪").await;
+
+        cx.update(|cx| {
+            let conversation = haloeth.read(cx).conversation.read(cx);
+            let label = conversation.last_message_source().expect("a final answer");
+            assert!(label.contains("stopped"), "答案来自被拒绝后的观测：{label}");
+        });
     }
 }

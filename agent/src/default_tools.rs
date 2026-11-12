@@ -2,13 +2,15 @@
 //!
 //! 名称沿用 smolagents 的 `default_tools`；当前包含两个工具，后续按同一契约扩充。
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
 use crate::error::ToolError;
 use crate::text::truncate;
-use crate::tool::{InputSpec, InputType, Tool, ToolFuture, ToolSet, ToolSpec};
+use crate::tool::{
+    ApprovalRequirement, InputSpec, InputType, Tool, ToolEffect, ToolFuture, ToolSet, ToolSpec,
+};
 
 /// 网页访问工具的名称。
 pub const FETCH_URL: &str = "fetch_url";
@@ -18,6 +20,12 @@ pub const CURRENT_TIME: &str = "current_time";
 
 /// 网页正文保留的最大字符数。
 const MAX_PAGE_LENGTH: usize = 20_000;
+
+/// 响应体允许读取的最大字节数。
+const MAX_BODY_BYTES: usize = 2_000_000;
+
+/// 请求超时。
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 构造内置工具集。
 pub fn default_tools() -> ToolSet {
@@ -36,14 +44,21 @@ pub struct FetchUrlTool {
 impl FetchUrlTool {
     /// 构造工具。
     pub fn new() -> Self {
+        let spec = ToolSpec::new(
+            FETCH_URL,
+            "Fetches a web page over HTTP and returns its readable content as plain text. Use it to read pages the user refers to.",
+            InputType::String,
+        )
+        .input("url", InputSpec::new(InputType::String, "Absolute URL of the page to fetch."))
+        .effect(ToolEffect::Network {
+            argument: Some("url".to_owned()),
+        });
         Self {
-            client: reqwest::Client::new(),
-            spec: ToolSpec::new(
-                FETCH_URL,
-                "Fetches a web page over HTTP and returns its readable content as plain text. Use it to read pages the user refers to.",
-                InputType::String,
-            )
-            .input("url", InputSpec::new(InputType::String, "Absolute URL of the page to fetch.")),
+            client: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            spec,
         }
     }
 }
@@ -62,6 +77,9 @@ impl Tool for FetchUrlTool {
     fn invoke<'a>(&'a self, arguments: &'a Map<String, Value>) -> ToolFuture<'a> {
         Box::pin(async move {
             let url = arguments.get("url").and_then(Value::as_str).unwrap_or_default();
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(failure(format!("{url} is not an http(s) URL")));
+            }
             let response = self
                 .client
                 .get(url)
@@ -72,6 +90,11 @@ impl Tool for FetchUrlTool {
             let status = response.status();
             if !status.is_success() {
                 return Err(failure(format!("request to {url} was rejected with status {status}")));
+            }
+            if response.content_length().is_some_and(|length| length > MAX_BODY_BYTES as u64) {
+                return Err(failure(format!(
+                    "{url} is larger than the {MAX_BODY_BYTES} byte limit"
+                )));
             }
             let is_html = response
                 .headers()
@@ -106,7 +129,8 @@ impl CurrentTimeTool {
                 CURRENT_TIME,
                 "Returns the current date and time in UTC.",
                 InputType::String,
-            ),
+            )
+            .approval(ApprovalRequirement::Never),
         }
     }
 }
@@ -181,26 +205,28 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
-/// 把 **HTML** 转为纯文本：移除脚本与样式、剥离标签、还原实体、压缩空白。
+/// 把 **HTML** 转为纯文本：先移除脚本与样式，再由 **html5ever** 解析并取正文，最后压缩空白。
 fn html_to_text(html: &str) -> String {
     let without_scripts = strip_blocks(html, "script");
     let without_styles = strip_blocks(&without_scripts, "style");
+    let document = scraper::Html::parse_document(&without_styles);
 
-    let mut text = String::with_capacity(without_styles.len());
-    let mut inside_tag = false;
-    for character in without_styles.chars() {
-        match character {
-            '<' => inside_tag = true,
-            '>' => {
-                inside_tag = false;
-                text.push(' ');
-            }
-            _ if !inside_tag => text.push(character),
-            _ => {}
-        }
+    for selector in ["body", "html"] {
+        let Ok(selector) = scraper::Selector::parse(selector) else {
+            continue;
+        };
+        let Some(element) = document.select(&selector).next() else {
+            continue;
+        };
+        return element
+            .text()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
     }
-
-    decode_entities(&text).split_whitespace().collect::<Vec<_>>().join(" ")
+    without_styles.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 移除成对标签之间的内容，标签名按 **ASCII** 大小写不敏感匹配。
@@ -228,17 +254,6 @@ fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
     haystack.char_indices().find_map(|(index, _)| {
         haystack.get(index..index + length)?.eq_ignore_ascii_case(needle).then_some(index)
     })
-}
-
-/// 还原常见 **HTML** 实体；`&amp;` 最后处理以避免二次解码。
-fn decode_entities(text: &str) -> String {
-    text.replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
-        .replace("&amp;", "&")
 }
 
 #[cfg(test)]
@@ -287,12 +302,6 @@ mod tests {
     #[test]
     fn keeps_text_after_an_unclosed_block() {
         assert_eq!(strip_blocks("a<script>hidden", "script"), "a");
-    }
-
-    #[test]
-    fn decodes_entities_without_double_decoding() {
-        assert_eq!(decode_entities("&amp;lt;"), "&lt;");
-        assert_eq!(decode_entities("&lt;tag&gt;"), "<tag>");
     }
 
     #[test]
