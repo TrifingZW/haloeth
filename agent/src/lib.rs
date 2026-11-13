@@ -1,6 +1,7 @@
 //! Haloeth 的代理内核：消息表示、工具契约、模型抽象与编排循环。
 
 pub mod agent;
+pub mod anthropic;
 pub mod approval;
 pub mod default_tools;
 pub mod error;

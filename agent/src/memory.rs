@@ -132,10 +132,10 @@ impl ActionStep {
 
         for outcome in &self.outcomes {
             let observation = match &outcome.result {
-                Ok(value) => render_value(value),
-                Err(error) => render_failure(error),
+                Ok(output) => render_output(output),
+                Err(error) => vec![crate::message::ContentBlock::text(render_failure(error))],
             };
-            messages.push(Message::tool_response(outcome.call.id.clone(), observation));
+            messages.push(Message::tool_response_blocks(outcome.call.id.clone(), observation));
         }
 
         if let Some(error) = &self.error {
@@ -152,7 +152,7 @@ pub struct ToolOutcome {
     /// 被执行的调用。
     pub call: ToolCall,
     /// 执行结果；失败时为工具错误。
-    pub result: Result<Value, ToolError>,
+    pub result: Result<crate::tool::ToolOutput, ToolError>,
 }
 
 /// 计划步骤。
@@ -253,6 +253,16 @@ impl Memory {
     }
 }
 
+/// 渲染工具输出为内容块；结构化值转成文本块，媒体块原样保留。
+fn render_output(output: &crate::tool::ToolOutput) -> Vec<crate::message::ContentBlock> {
+    match output {
+        crate::tool::ToolOutput::Json(value) => {
+            vec![crate::message::ContentBlock::text(render_value(value))]
+        }
+        crate::tool::ToolOutput::Blocks(blocks) => blocks.clone(),
+    }
+}
+
 /// 渲染工具输出为观测文本；字符串直接使用其内容，其余值使用 **JSON** 文本。
 fn render_value(value: &Value) -> String {
     match value {
@@ -335,7 +345,7 @@ mod tests {
             model_output: Some(Message::assistant("I will search.")),
             outcomes: vec![ToolOutcome {
                 call: call.clone(),
-                result: Ok(json!("42 results")),
+                result: Ok(json!("42 results").into()),
             }],
             error: None,
             output: None,
@@ -363,7 +373,7 @@ mod tests {
             model_output: None,
             outcomes: vec![ToolOutcome {
                 call,
-                result: Ok(json!({ "hits": 2 })),
+                result: Ok(json!({ "hits": 2 }).into()),
             }],
             error: None,
             output: None,
@@ -473,7 +483,7 @@ mod tests {
             model_output: Some(Message::assistant("thinking")),
             outcomes: vec![ToolOutcome {
                 call,
-                result: Ok(json!("42 results")),
+                result: Ok(json!("42 results").into()),
             }],
             error: None,
             output: None,
@@ -546,7 +556,7 @@ mod tests {
             }),
             outcomes: vec![ToolOutcome {
                 call,
-                result: Ok(json!("ok")),
+                result: Ok(json!("ok").into()),
             }],
             error: None,
             output: None,

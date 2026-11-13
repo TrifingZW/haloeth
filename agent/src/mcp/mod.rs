@@ -323,7 +323,7 @@ impl Tool for McpTool {
                     reason: truncate(&text, MAX_OUTPUT),
                 });
             }
-            Ok(Value::String(truncate(&text, MAX_OUTPUT)))
+            Ok(Value::String(truncate(&text, MAX_OUTPUT)).into())
         })
     }
 }

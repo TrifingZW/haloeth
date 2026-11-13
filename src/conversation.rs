@@ -6,7 +6,9 @@
 //!
 //! 行的稳定标识由 [`Conversation`] 维护，活动行插入不会影响正在流式写入的文本行。
 
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use agent::approval::{ApprovalDecision, ApprovalRequest, RiskLevel};
 use gpui_kit::assets::IconName;
@@ -126,7 +128,17 @@ pub enum TranscriptEntry {
     },
     /// 活动卡片
     Activity(ActivityRecord),
+    /// 本地图片
+    Image {
+        /// 图片路径
+        path: String,
+        /// 说明
+        caption: String,
+    },
 }
+
+/// 思考过程卡片的标题；渲染时据此使用灰色斜体，与最终答复区分。
+const THINKING_TITLE: &str = "思考过程";
 
 /// 一张活动卡片：自绘实体，持有会话弱引用以回报审批决定。
 pub struct ActivityCard {
@@ -142,6 +154,10 @@ pub struct ActivityCard {
 }
 
 impl ActivityCard {
+    /// 是否是一条思考过程（灰色斜体，与最终答复区分）。
+    fn is_thinking(&self) -> bool {
+        self.title == THINKING_TITLE
+    }
     /// 构造卡片。
     fn new(
         id: impl Into<String>,
@@ -235,21 +251,41 @@ impl ActivityCard {
 impl Render for ActivityCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        let color = self.status_color(cx);
+        let thinking = self.is_thinking();
+        // 思考过程整体使用灰色，避免与「成功」状态色混淆。
+        let color = if thinking {
+            muted
+        } else {
+            self.status_color(cx)
+        };
         let title = self.title.clone();
         let detail = self.detail.clone();
         let risk = self.risk.map(|risk| risk.label());
         let elapsed = self.elapsed_ms.map(|elapsed| format!("{elapsed} ms"));
         let preview = self.preview.clone();
+        let copy_text = format!(
+            "{}
+{}
+{}",
+            title,
+            detail,
+            preview.clone().unwrap_or_default()
+        );
+        let activity_id = self.id.clone();
         let expanded = self.expanded;
-        let expandable = preview.is_some() || detail.chars().count() > 160;
+        let expandable = !thinking && (preview.is_some() || detail.chars().count() > 160);
 
         let header = h_flex()
             .items_center()
             .gap_2()
             .w_full()
             .child(Icon::new(IconName::CircleSmall).xsmall().text_color(color))
-            .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title))
+            .child(if thinking {
+                // 思考过程用灰色斜体的普通字号，与最终答复区分。
+                div().text_sm().italic().text_color(muted).child(title).into_any_element()
+            } else {
+                div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title).into_any_element()
+            })
             .when_some(risk, |this, risk| {
                 this.child(
                     div()
@@ -265,7 +301,19 @@ impl Render for ActivityCard {
             .when_some(elapsed, |this, elapsed| {
                 this.child(div().text_xs().text_color(muted).child(elapsed))
             })
-            .child(div().text_xs().text_color(color).child(self.status.label()))
+            .when(!thinking, |this| {
+                this.child(div().text_xs().text_color(color).child(self.status.label()))
+            })
+            .child(
+                Button::new(ElementId::Name(format!("activity-copy:{activity_id}").into()))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Copy)
+                    .tooltip("复制这条活动的内容")
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    }),
+            )
             .when(expandable, |this| {
                 this.child(
                     Button::new(ElementId::Name(format!("activity-toggle:{}", self.id).into()))
@@ -281,6 +329,17 @@ impl Render for ActivityCard {
             });
 
         let body = (!detail.is_empty()).then(|| {
+            if thinking {
+                // 思考过程：灰色斜体、正文同款字体，不折叠成一行小字。
+                let shown = agent::text::truncate(&detail, 12_000);
+                return div()
+                    .mt_2()
+                    .text_sm()
+                    .italic()
+                    .text_color(muted)
+                    .whitespace_normal()
+                    .child(shown);
+            }
             let shown = if expanded {
                 agent::text::truncate(&detail, 8_000)
             } else {
@@ -351,6 +410,95 @@ impl Render for ActivityCard {
     }
 }
 
+/// 对话中的本地图片卡片。
+pub struct ImageCard {
+    path: PathBuf,
+    caption: String,
+    /// 按文件字节解码的缩略图；路径缓存会在同名文件重新生成后返回旧图。
+    image: Option<Arc<Image>>,
+    conversation: WeakEntity<Conversation>,
+}
+
+impl ImageCard {
+    fn new(path: PathBuf, caption: String, conversation: WeakEntity<Conversation>) -> Self {
+        Self {
+            image: decode_thumbnail(&path),
+            path,
+            caption,
+            conversation,
+        }
+    }
+}
+
+/// 读取并解码本地图片，失败时退回按路径加载。
+fn decode_thumbnail(path: &std::path::Path) -> Option<Arc<Image>> {
+    let bytes = std::fs::read(path).ok()?;
+    let format = image::guess_format(&bytes).ok()?;
+    let format = match format {
+        image::ImageFormat::Png => ImageFormat::Png,
+        image::ImageFormat::Jpeg => ImageFormat::Jpeg,
+        image::ImageFormat::Gif => ImageFormat::Gif,
+        image::ImageFormat::Bmp => ImageFormat::Bmp,
+        _ => return None,
+    };
+    Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
+impl Render for ImageCard {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let path = self.path.clone();
+        let caption = self.caption.clone();
+        let conversation = self.conversation.clone();
+        let muted = cx.theme().muted_foreground;
+
+        v_flex()
+            .id(ElementId::Name(format!("image:{}", self.path.display()).into()))
+            .test_support()
+            .gap_1()
+            .p_2()
+            .rounded(cx.theme().radius)
+            .border_2()
+            .border_color(cx.theme().border)
+            .max_w(px(440.))
+            .child(
+                div()
+                    .id(ElementId::Name(format!("image-open:{}", self.path.display()).into()))
+                    .test_support()
+                    .cursor_pointer()
+                    .w(px(320.))
+                    .h(px(200.))
+                    .overflow_hidden()
+                    .flex_shrink_0()
+                    .child(
+                        match &self.image {
+                            Some(image) => img(image.clone()),
+                            None => img(self.path.clone()),
+                        }
+                        .w_full()
+                        .h_full()
+                        .object_fit(ObjectFit::Contain),
+                    )
+                    .on_click(move |event, _, cx| {
+                        // 双击只打开一个查看窗口。
+                        if event.click_count() > 1 {
+                            return;
+                        }
+                        let path = path.to_string_lossy().to_string();
+                        let caption = caption.clone();
+                        conversation
+                            .update(cx, |_conversation, cx| {
+                                cx.emit(ConversationEvent::OpenImage {
+                                    path,
+                                    caption,
+                                });
+                            })
+                            .ok();
+                    }),
+            )
+            .child(div().text_xs().text_color(muted).truncate().child(self.caption.clone()))
+    }
+}
+
 /// 对话区中的一行
 #[derive(Clone)]
 pub enum ChatRow {
@@ -358,6 +506,8 @@ pub enum ChatRow {
     Message(ChatMessage),
     /// 活动卡片
     Activity(Entity<ActivityCard>),
+    /// 本地图片
+    Image(Entity<ImageCard>),
 }
 
 /// 对话区向会话层报告的事件
@@ -369,6 +519,13 @@ pub enum ConversationEvent {
         id: String,
         /// 决定
         decision: ApprovalDecision,
+    },
+    /// 用户点击了对话中的图片
+    OpenImage {
+        /// 图片路径
+        path: String,
+        /// 说明
+        caption: String,
     },
 }
 
@@ -410,12 +567,22 @@ impl Conversation {
         self.rows.len()
     }
 
+    /// 最后一条助手回复的 Markdown 原文，供语音播报使用。
+    pub fn last_assistant_text(&self) -> Option<&str> {
+        self.rows.iter().rev().find_map(|row| match row {
+            ChatRow::Message(message) if message.role == ChatRole::Assistant => {
+                Some(message.source.as_ref())
+            }
+            _ => None,
+        })
+    }
+
     /// 最后一条文本消息的 Markdown 原文
     #[allow(dead_code)]
     pub fn last_message_source(&self) -> Option<&str> {
         self.rows.iter().rev().find_map(|row| match row {
             ChatRow::Message(message) => Some(message.source.as_ref()),
-            ChatRow::Activity(_) => None,
+            ChatRow::Activity(_) | ChatRow::Image(_) => None,
         })
     }
 
@@ -433,7 +600,7 @@ impl Conversation {
                 let card = card.read(cx);
                 (card.status() == ActivityStatus::Pending).then(|| card.id().to_owned())
             }
-            ChatRow::Message(_) => None,
+            ChatRow::Message(_) | ChatRow::Image(_) => None,
         })
     }
 
@@ -595,7 +762,8 @@ impl Conversation {
             });
             return;
         }
-        let card = self.push_activity(id.to_owned(), "思考过程".to_owned(), text.to_owned(), cx);
+        let card =
+            self.push_activity(id.to_owned(), THINKING_TITLE.to_owned(), text.to_owned(), cx);
         card.update(cx, |card, cx| {
             card.status = ActivityStatus::Ok;
             cx.notify();
@@ -635,6 +803,10 @@ impl Conversation {
                     text: message.source.to_string(),
                 },
                 ChatRow::Activity(card) => TranscriptEntry::Activity(card.read(cx).record()),
+                ChatRow::Image(card) => TranscriptEntry::Image {
+                    path: card.read(cx).path.display().to_string(),
+                    caption: card.read(cx).caption.clone(),
+                },
             })
             .collect()
     }
@@ -662,9 +834,52 @@ impl Conversation {
                     Rc::make_mut(&mut self.rows).push(ChatRow::Activity(card));
                     self.scroller.update(cx, |state, cx| state.append(1, cx));
                 }
+                TranscriptEntry::Image {
+                    path,
+                    caption,
+                } => {
+                    self.push_image(path, caption, cx);
+                }
             }
         }
         cx.notify();
+    }
+
+    /// 追加一张本地图片；同一路径紧邻出现时只保留一张。
+    pub fn push_image(&mut self, path: String, caption: String, cx: &mut Context<Self>) {
+        // 同一张图在生成本身与随后的 show_image 里各出现一次，只保留一行。
+        // 去重只看当前这一轮（最后一条用户消息之后）：之后的轮次重新生成同名文件
+        // 应当显示新内容，而不是被当成重复丢掉。
+        let start = self
+            .rows
+            .iter()
+            .rposition(
+                |row| matches!(row, ChatRow::Message(message) if message.role == ChatRole::User),
+            )
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let repeated = self.rows[start..].iter().any(|row| {
+            matches!(row, ChatRow::Image(card) if card.read(cx).path.to_string_lossy() == path)
+        });
+        if repeated {
+            return;
+        }
+        let conversation = cx.entity().downgrade();
+        let card = cx.new(|_| ImageCard::new(PathBuf::from(path), caption, conversation));
+        Rc::make_mut(&mut self.rows).push(ChatRow::Image(card));
+        self.scroller.update(cx, |state, cx| state.append(1, cx));
+        cx.notify();
+    }
+
+    /// 追加一批工具产出的图片。
+    pub fn push_images(&mut self, paths: &[String], cx: &mut Context<Self>) {
+        for path in paths {
+            let caption = std::path::Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone());
+            self.push_image(path.clone(), caption, cx);
+        }
     }
 
     /// 上报一次审批决定
@@ -694,7 +909,7 @@ impl Conversation {
     fn index_of_activity(&self, id: &str, cx: &App) -> Option<usize> {
         self.rows.iter().position(|row| match row {
             ChatRow::Activity(card) => card.read(cx).id() == id,
-            ChatRow::Message(_) => false,
+            ChatRow::Message(_) | ChatRow::Image(_) => false,
         })
     }
 
@@ -821,6 +1036,7 @@ impl Render for Conversation {
                                 render_message_row(message).into_any_element()
                             }
                             Some(ChatRow::Activity(card)) => card.clone().into_any_element(),
+                            Some(ChatRow::Image(card)) => card.clone().into_any_element(),
                             None => div().into_any_element(),
                         },
                     )
@@ -834,7 +1050,7 @@ impl Render for Conversation {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityStatus, ChatRole, ChatRow, Conversation, presentation};
+    use super::{ActivityStatus, ChatRole, ChatRow, Conversation, TranscriptEntry, presentation};
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
     use gpui_kit::component::bubble::BubbleVariant;
@@ -877,6 +1093,33 @@ mod tests {
             presentation(ChatRole::Assistant),
             (MessageAlignment::Start, BubbleVariant::Ghost)
         );
+    }
+
+    #[gpui_kit::test]
+    fn images_round_trip_through_the_transcript(cx: &mut TestAppContext) {
+        let conversation = cx.update(|cx| cx.new(Conversation::new));
+        let path = std::env::temp_dir().join("haloeth-image-row.png");
+        std::fs::write(&path, b"not-a-real-image").expect("file");
+
+        cx.update(|cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.push_images(&[path.display().to_string()], cx);
+            });
+        });
+        cx.update(|cx| {
+            let snapshot = conversation.read(cx).snapshot(cx);
+            assert!(matches!(snapshot[0], TranscriptEntry::Image { .. }));
+        });
+
+        let conversation2 = cx.update(|cx| cx.new(Conversation::new));
+        let snapshot = cx.update(|cx| conversation.read(cx).snapshot(cx));
+        cx.update(|cx| {
+            conversation2.update(cx, |conversation, cx| conversation.restore(snapshot, cx));
+        });
+        cx.update(|cx| {
+            assert_eq!(conversation2.read(cx).row_count(), 1);
+        });
+        let _ = std::fs::remove_file(path);
     }
 
     #[gpui_kit::test]

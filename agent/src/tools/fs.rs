@@ -84,7 +84,7 @@ impl Tool for ReadFileTool {
             if selected.chars().count() > MAX_READ {
                 header.push_str(&format!("\n[truncated to {MAX_READ} characters]"));
             }
-            Ok(Value::String(format!("{header}\n\n{body}")))
+            Ok(Value::String(format!("{header}\n\n{body}")).into())
         })
     }
 }
@@ -141,7 +141,7 @@ impl Tool for WriteFileTool {
             tokio::fs::write(&path, content.as_bytes())
                 .await
                 .map_err(|error| failure(&path, error))?;
-            Ok(Value::String(format!("wrote {} bytes to {path}", content.len())))
+            Ok(Value::String(format!("wrote {} bytes to {path}", content.len())).into())
         })
     }
 }
@@ -207,9 +207,9 @@ impl Tool for ListDirTool {
                 lines.push(format!("[showing {MAX_ENTRIES} of {total} entries]"));
             }
             if lines.is_empty() {
-                return Ok(Value::String(format!("{path} is empty")));
+                return Ok(Value::String(format!("{path} is empty")).into());
             }
-            Ok(Value::String(format!("{path}\n{}", lines.join("\n"))))
+            Ok(Value::String(format!("{path}\n{}", lines.join("\n"))).into())
         })
     }
 }

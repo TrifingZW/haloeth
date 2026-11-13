@@ -16,6 +16,7 @@ use std::pin::Pin;
 use serde_json::{Map, Value};
 
 use crate::error::ToolError;
+use crate::message::ContentBlock;
 
 /// 文件访问方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -315,17 +316,89 @@ impl ToolSpec {
     }
 }
 
-/// 工具执行返回的 future。
-pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + 'a>>;
+/// 工具执行结果的 future 类型。
+pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>>;
 
-/// 工具契约。
+/// 工具契约与输出类型。
+///
+/// 要求 [`Send`] 与 [`Sync`]：工具存放于注册表并跨线程共享。
+/// 工具输出：结构化值，或文本与媒体组成的内容块。
+///
+/// 大多数工具返回 [`ToolOutput::Json`]；生成类工具可以返回内容块，让支持多模态的
+/// 对话模型直接看到结果。不支持该模态的提供方会把媒体降级为文字说明。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ToolOutput {
+    /// 内容块序列；放在前面，让反序列化优先匹配块结构，普通值回落到 `Json`。
+    Blocks(Vec<ContentBlock>),
+    /// 结构化值。
+    Json(Value),
+}
+
+impl ToolOutput {
+    /// 输出中的结构化值；内容块输出返回 [`None`]。
+    pub fn json(&self) -> Option<&Value> {
+        match self {
+            Self::Json(value) => Some(value),
+            Self::Blocks(_) => None,
+        }
+    }
+
+    /// 字符串形式的输出，供测试与观测使用。
+    pub fn as_str(&self) -> Option<&str> {
+        self.json().and_then(Value::as_str)
+    }
+
+    /// 观测文本：结构化值按 `JSON` 渲染，内容块只取文本部分。
+    pub fn observation(&self) -> String {
+        match self {
+            Self::Json(value) => render_json(value),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+impl From<Value> for ToolOutput {
+    fn from(value: Value) -> Self {
+        Self::Json(value)
+    }
+}
+
+impl From<String> for ToolOutput {
+    fn from(value: String) -> Self {
+        Self::Json(Value::String(value))
+    }
+}
+
+impl From<&str> for ToolOutput {
+    fn from(value: &str) -> Self {
+        Self::Json(Value::String(value.to_owned()))
+    }
+}
+
+/// 把结构化值渲染为观测文本；字符串直接使用其内容。
+fn render_json(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// 工具契约：声明元数据并提供执行方法。
 ///
 /// 要求 [`Send`] 与 [`Sync`]：工具存放于注册表并跨线程共享。
 pub trait Tool: Send + Sync {
     /// 返回工具元数据。
     fn spec(&self) -> &ToolSpec;
 
-    /// 执行工具；参数已由 [`resolve_arguments`] 校验与规范化。
+    /// 执行工具；参数已由 [`ToolSpec::resolve`] 校验与规范化。
     fn invoke<'a>(&'a self, arguments: &'a Map<String, Value>) -> ToolFuture<'a>;
 }
 
@@ -364,7 +437,7 @@ where
     }
 
     fn invoke<'a>(&'a self, arguments: &'a Map<String, Value>) -> ToolFuture<'a> {
-        Box::pin(async move { (self.handler)(arguments) })
+        Box::pin(async move { (self.handler)(arguments).map(ToolOutput::Json) })
     }
 }
 
@@ -399,7 +472,7 @@ impl ToolSet {
     }
 
     /// 按名称查找工具、校验参数并执行。
-    pub async fn call(&self, name: &str, arguments: &Value) -> Result<Value, ToolError> {
+    pub async fn call(&self, name: &str, arguments: &Value) -> Result<ToolOutput, ToolError> {
         let tool = self.get(name).ok_or_else(|| ToolError::UnknownTool {
             name: name.to_owned(),
         })?;
@@ -664,7 +737,7 @@ mod tests {
         let output =
             tools.call("search", &json!({ "query": "rust" })).await.expect("call should succeed");
 
-        assert_eq!(output, json!({ "query": "rust" }));
+        assert_eq!(output, json!({ "query": "rust" }).into());
     }
 
     #[tokio::test]
@@ -700,7 +773,7 @@ mod tests {
             fn invoke<'a>(&'a self, arguments: &'a Map<String, Value>) -> ToolFuture<'a> {
                 Box::pin(async move {
                     tokio::task::yield_now().await;
-                    Ok(arguments.get("text").cloned().unwrap_or(Value::Null))
+                    Ok(arguments.get("text").cloned().unwrap_or(Value::Null).into())
                 })
             }
         }
@@ -716,7 +789,22 @@ mod tests {
         let output =
             tools.call("slow", &json!({ "text": "echo" })).await.expect("call should succeed");
 
-        assert_eq!(output, json!("echo"));
+        assert_eq!(output, json!("echo").into());
+    }
+
+    #[test]
+    fn tool_output_round_trips_media_blocks() {
+        let output = ToolOutput::Blocks(vec![
+            ContentBlock::text("saved"),
+            ContentBlock::image_base64("image/png", "QUJD"),
+        ]);
+
+        let text = serde_json::to_string(&output).expect("serialize");
+        let restored: ToolOutput = serde_json::from_str(&text).expect("deserialize");
+
+        assert_eq!(restored, output);
+        let legacy: ToolOutput = serde_json::from_str("\"plain\"").expect("legacy value");
+        assert_eq!(legacy, ToolOutput::Json(Value::String("plain".to_owned())));
     }
 
     #[test]

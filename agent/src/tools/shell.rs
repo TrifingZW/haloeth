@@ -132,7 +132,7 @@ impl Tool for ShellTool {
                 text.push_str("\nstderr:\n");
                 text.push_str(stderr.trim_end());
             }
-            Ok(Value::String(truncate(&text, MAX_OUTPUT)))
+            Ok(Value::String(truncate(&text, MAX_OUTPUT)).into())
         })
     }
 }

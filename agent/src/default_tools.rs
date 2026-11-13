@@ -111,7 +111,7 @@ impl Tool for FetchUrlTool {
             } else {
                 body
             };
-            Ok(Value::String(truncate(content.trim(), MAX_PAGE_LENGTH)))
+            Ok(Value::String(truncate(content.trim(), MAX_PAGE_LENGTH)).into())
         })
     }
 }
@@ -147,7 +147,7 @@ impl Tool for CurrentTimeTool {
     }
 
     fn invoke<'a>(&'a self, _arguments: &'a Map<String, Value>) -> ToolFuture<'a> {
-        Box::pin(async move { Ok(Value::String(render_utc(SystemTime::now()))) })
+        Box::pin(async move { Ok(Value::String(render_utc(SystemTime::now())).into()) })
     }
 }
 

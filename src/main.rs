@@ -3,18 +3,30 @@
 //! 应用内所有边框统一 2px，一律使用 GPUI 的 `border_2` 系列缩放方法；
 //! 组件自带的 1px 边框在调用处覆盖。
 
+// Release 构建不附带控制台窗口；Debug 保留控制台，便于查看日志与调试输出。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod access;
+mod audio;
+mod background;
 mod composer;
 mod config;
 mod conversation;
+mod image_viewer;
+mod logging;
+mod mcp_form;
+mod media_form;
 mod models;
+mod preferences;
 mod session;
 mod session_store;
 mod sessions;
 mod settings;
+mod skill_form;
 mod ui;
 
 use access::AccessForm;
+use audio::{ConfiguredRecognizer, TtsService, TtsSettings};
 use composer::{Composer, ComposerEvent};
 use conversation::{ChatRole, Conversation, ConversationEvent};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -22,15 +34,20 @@ use gpui_kit::{
     assets::{AllAssets, IconName},
     base::{TestSupportExt as _, h_flex, v_flex},
     component::{
-        ActiveTheme as _, Disableable as _, Icon, Sizable, TitleBar, WindowExt as _,
+        ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable, TitleBar,
+        WindowExt as _,
         button::{Button, ButtonVariants},
         dialog::{DialogDescription, DialogFooter},
         menu::{AppMenuBar, DropdownMenu, PopupMenuItem},
+        popover::Popover,
+        speech::{SpeechEvent, SpeechState},
         status_bar::StatusBar,
     },
     *,
 };
+use image_viewer::ImageViewer;
 use models::ModelsForm;
+use preferences::{PrefSection, PreferencesWindow};
 use session::{Session, Status};
 use session_store::{SessionFile, SessionStore};
 use sessions::SessionsForm;
@@ -39,7 +56,16 @@ use ui::{Tone, chip, tinted};
 
 actions!(
     haloeth,
-    [NewSession, ClearSession, ShowSessions, ShowModels, ShowSettings, ShowAbout, Quit]
+    [
+        NewSession,
+        ClearSession,
+        ShowSessions,
+        ShowModels,
+        ShowSettings,
+        ShowPreferences,
+        ShowAbout,
+        Quit
+    ]
 );
 
 /// 窗口默认尺寸，竖长矩形，y 轴为长边
@@ -59,13 +85,33 @@ struct Haloeth {
     active: SessionFile,
     /// 标题栏展示的会话标题
     title: SharedString,
+    /// 左下角快速设置面板是否展开
+    more_open: bool,
+    /// 偏好窗口；单实例，重复打开时聚焦已有窗口。
+    preferences: Option<(AnyWindowHandle, WeakEntity<PreferencesWindow>)>,
+    /// 语音输入状态。
+    speech: Entity<SpeechState>,
+    /// 语音播报服务。
+    tts: TtsService,
+    /// 是否自动播报最终回复。
+    auto_speak: bool,
+    /// 最近一次语音错误。
+    audio_error: Option<SharedString>,
+    /// 按住说话后自动发送（后台快捷键触发）。
+    auto_submit_speech: bool,
+    /// 托盘与全局快捷键。
+    background: Option<background::Background>,
     /// 上一次观察到的运行状态，用于在终态触发保存
     last_status: Status,
+    /// 主窗口句柄，托盘菜单用它恢复窗口。
+    main_window: AnyWindowHandle,
     _composer_subscription: Subscription,
     _conversation_subscription: Subscription,
     _conversation_observation: Subscription,
     _composer_observation: Subscription,
     _session_observation: Subscription,
+    _speech_subscription: Subscription,
+    _speech_observation: Subscription,
     _appearance_subscription: Subscription,
 }
 
@@ -89,34 +135,70 @@ impl Haloeth {
         let conversation = cx.new(Conversation::new);
         let session = cx.new(|_| Session::new(config, conversation.clone()));
         session.update(cx, |session, cx| session.set_config_persistence(persist_config, cx));
-        let composer = cx.new(|cx| Composer::new(window, cx));
+        let send_key = session.read(cx).config().ui.send_key;
+        let line_numbers = session.read(cx).config().ui.line_numbers;
+        let composer = cx.new(|cx| Composer::new(window, send_key, line_numbers, cx));
+        let speech = cx.new(|cx| {
+            SpeechState::new(cx)
+                .recognizer(ConfiguredRecognizer::new(session.downgrade()))
+                .input(crate::audio::SelectableMicrophone::new(session.downgrade()))
+                .system_fallback(false)
+                // 云端转写可能要十几秒，给停止后的收尾留足时间。
+                .stop_timeout(std::time::Duration::from_secs(60))
+        });
 
         // 启动恢复：上次会话 → 最近更新的会话 → 新建。
         let active = Self::restore_session(&store, cx, &session, &conversation);
 
-        let subscription = cx.subscribe(&composer, |this, _composer, event: &ComposerEvent, cx| {
-            let ComposerEvent::Submit(text) = event;
-            this.conversation.update(cx, |conversation, cx| {
-                conversation.push(ChatRole::User, text.clone(), cx);
-            });
-            this.session.update(cx, |session, cx| session.submit(text.to_string(), cx));
-            this.save_active(cx);
-        });
+        let subscription = cx.subscribe_in(
+            &composer,
+            window,
+            |this, _composer, event: &ComposerEvent, window, cx| {
+                let ComposerEvent::Submit(text) = event;
+                // 运行中不接受新消息：把文本放回输入框，避免用户看到消息已发出却没被处理。
+                if this.session.read(cx).status().is_busy() {
+                    this.composer.update(cx, |composer, cx| {
+                        composer.append_text(text, window, cx);
+                    });
+                    return;
+                }
+                this.conversation.update(cx, |conversation, cx| {
+                    conversation.push(ChatRole::User, text.clone(), cx);
+                });
+                this.session.update(cx, |session, cx| session.submit(text.to_string(), cx));
+                this.save_active(cx);
+            },
+        );
         // 审批卡片上的按钮回到会话，由会话把决定交给挂起中的审批
-        let conversation_subscription =
-            cx.subscribe(&conversation, |this, _, event: &ConversationEvent, cx| {
-                let ConversationEvent::ApprovalDecision {
+        let conversation_subscription = cx.subscribe_in(
+            &conversation,
+            window,
+            |this, _, event: &ConversationEvent, window, cx| match event {
+                ConversationEvent::ApprovalDecision {
                     id,
                     decision,
-                } = event;
-                this.session.update(cx, |session, cx| {
-                    session.resolve_approval(id, *decision, cx);
-                });
-                this.save_active(cx);
-            });
+                } => {
+                    this.session.update(cx, |session, cx| {
+                        session.resolve_approval(id, *decision, cx);
+                    });
+                    this.save_active(cx);
+                }
+                ConversationEvent::OpenImage {
+                    path,
+                    caption,
+                } => this.open_image_viewer(path.clone(), caption.clone(), window, cx),
+            },
+        );
         // 底部栏的消息数、会话状态与发送按钮可用性跟随各自状态变化
         let observation = cx.observe(&conversation, |_, _, cx| cx.notify());
         let composer_observation = cx.observe(&composer, |_, _, cx| cx.notify());
+        // 录音状态变化时刷新麦克风按钮。
+        let speech_observation = cx.observe(&speech, |_, _, cx| cx.notify());
+        // 语音识别结束后把文本追加到输入框；按住说话触发的识别直接发送。
+        let speech_subscription =
+            cx.subscribe_in(&speech, window, |this, _, event: &SpeechEvent, window, cx| {
+                this.apply_speech_result(event, window, cx)
+            });
         let appearance_subscription = cx.observe_window_appearance(window, |this, window, cx| {
             let preference = this.session.read(cx).config().ui.theme;
             if preference == config::ThemePreference::System {
@@ -125,11 +207,26 @@ impl Haloeth {
         });
         let session_observation = cx.observe(&session, |this, session, cx| {
             let status = session.read(cx).status();
+            let previous = this.last_status;
             // 运行进入终态或等待审批时落盘，避免流式增量逐帧写文件。
-            if status != this.last_status {
+            if status != previous {
                 this.last_status = status;
                 if matches!(status, Status::Idle | Status::Failed | Status::AwaitingApproval) {
                     this.save_active(cx);
+                }
+                if status == Status::Cancelling {
+                    this.tts.stop();
+                }
+                // 自动播报：一轮运行结束后朗读最终回复。
+                if status == Status::Idle
+                    && previous.is_busy()
+                    && this.auto_speak
+                    && this.session.read(cx).last_run_ok()
+                    && let Some(text) = this.conversation.read(cx).last_assistant_text()
+                {
+                    let text = text.to_owned();
+                    let settings = this.tts_settings(cx);
+                    this.tts.speak(text, settings);
                 }
             }
             cx.notify();
@@ -141,8 +238,84 @@ impl Haloeth {
             buffer.update(cx, |buffer, cx| buffer.focus(window, cx));
         });
 
+        // 关闭主窗口时按偏好最小化到托盘，而不是退出应用。
+        // GPUI 默认在最后一个窗口关闭后退出；必须拦截平台层的 WM_CLOSE。
+        let this = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            let keep_running = this
+                .upgrade()
+                .map(|this| this.read(cx).session.read(cx).config().ui.run_in_background)
+                .unwrap_or(false);
+            if keep_running {
+                window.minimize_window();
+                false
+            } else {
+                true
+            }
+        });
+
+        // 托盘与全局快捷键只在真实运行中启动，避免测试创建系统托盘项。
+        let background = persist_config.then(|| {
+            let hotkey = background::Hotkey::parse(&session.read(cx).config().ui.voice_hotkey);
+            background::Background::start(hotkey, store.root().to_path_buf())
+        });
+        if background.is_some() {
+            let this = cx.weak_entity();
+            let main_window = window.window_handle();
+            // 事件处理必须发生在实体更新之外：在 `this.update` 里再调用
+            // `window_handle.update` / `open_window` 会二次借用 App 并直接 panic
+            // （托盘里的「偏好设置」就是这样把程序弄崩的）。
+            cx.spawn(async move |_, cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(120)).await;
+                    let Ok(events) = this.update(cx, |this, _| this.take_background_events())
+                    else {
+                        break;
+                    };
+                    for event in events {
+                        match event {
+                            background::BackgroundEvent::Quit => {
+                                let _ = this.update(cx, |_, cx| cx.quit());
+                            }
+                            background::BackgroundEvent::Show => {
+                                let _ = cx.update_window(main_window, |_, window, _| {
+                                    window.activate_window();
+                                });
+                            }
+                            background::BackgroundEvent::ShowPreferences => {
+                                let haloeth = this.clone();
+                                let _ = cx.update_window(main_window, move |_, window, cx| {
+                                    let _ = haloeth.update(cx, |this, cx| {
+                                        this.open_preferences(PrefSection::General, window, cx)
+                                    });
+                                });
+                            }
+                            background::BackgroundEvent::OpenSession(id) => {
+                                let haloeth = this.clone();
+                                let _ = cx.update_window(main_window, move |_, window, cx| {
+                                    let _ = haloeth.update(cx, |this, cx| {
+                                        this.open_session(&id, cx);
+                                        if this.active.id == id {
+                                            window.activate_window();
+                                        }
+                                    });
+                                });
+                            }
+                            background::BackgroundEvent::TalkStart => {
+                                let _ = this.update(cx, |this, cx| this.start_hold_to_talk(cx));
+                            }
+                            background::BackgroundEvent::TalkStop => {
+                                let _ = this.update(cx, |this, cx| this.stop_hold_to_talk(cx));
+                            }
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+
         let initial_title = SharedString::from(active.title.clone());
-        Self {
+        let mut this = Self {
             menu_bar: AppMenuBar::new(cx),
             conversation,
             composer,
@@ -150,14 +323,27 @@ impl Haloeth {
             store,
             active,
             title: initial_title,
+            more_open: false,
+            preferences: None,
+            speech,
+            tts: TtsService::new(),
+            auto_speak: false,
+            audio_error: None,
+            auto_submit_speech: false,
+            background,
+            main_window: window.window_handle(),
             last_status: Status::Idle,
             _composer_subscription: subscription,
             _conversation_subscription: conversation_subscription,
             _conversation_observation: observation,
             _composer_observation: composer_observation,
             _session_observation: session_observation,
+            _speech_subscription: speech_subscription,
+            _speech_observation: speech_observation,
             _appearance_subscription: appearance_subscription,
-        }
+        };
+        this.refresh_tray(cx);
+        this
     }
 
     /// 启动时恢复会话：先尝试上次打开的会话，再退到最近更新的会话，最后新建。
@@ -198,24 +384,28 @@ impl Haloeth {
     /// 保存当前会话：显示记录、执行上下文、授权与当前模型。
     pub(crate) fn save_active(&mut self, cx: &mut Context<Self>) {
         let transcript = self.conversation.read(cx).snapshot(cx);
-        let (context, usage, selection, grants, rules, last_session) = {
+        let (context, usage, usage_by_model, selection, grants, rules, features, last_session) = {
             let session = self.session.read(cx);
             (
                 session.context().clone(),
                 session.usage(),
+                session.usage_by_model().clone(),
                 session
                     .selection()
                     .map(|(provider, model)| (provider.to_owned(), model.to_owned())),
                 session.grants().to_vec(),
                 session.always_allow().to_vec(),
+                session.feature_overrides().clone(),
                 session.config().storage.last_session.clone(),
             )
         };
         self.active.transcript = transcript;
         self.active.context = context;
         self.active.usage = usage;
+        self.active.usage_by_model = usage_by_model;
         self.active.grants = grants;
         self.active.rules = rules;
+        self.active.features = features;
         if let Some((provider, model)) = selection {
             self.active.provider = Some(provider);
             self.active.model = Some(model);
@@ -226,6 +416,8 @@ impl Haloeth {
             tracing::warn!("保存会话失败：{error}");
             return;
         }
+        // 托盘菜单里的「当前对话」跟随标题与会话列表变化。
+        self.refresh_tray(cx);
         if last_session != self.active.id {
             self.session.update(cx, |session, cx| session.remember_session(&self.active.id, cx));
         }
@@ -244,8 +436,14 @@ impl Haloeth {
     }
 
     /// 新建一个空会话，并把它设为当前会话。
+    /// 新建会话；当前已经是空白会话时不做任何事。
     fn create_session(&mut self, cx: &mut Context<Self>) {
         if self.session.read(cx).status().is_busy() {
+            return;
+        }
+        let blank = self.conversation.read(cx).message_count() == 0
+            && self.session.read(cx).context().steps.is_empty();
+        if blank {
             return;
         }
         self.save_active(cx);
@@ -269,12 +467,14 @@ impl Haloeth {
         self.save_active(cx);
     }
 
-    /// 打开设置对话框，并定位到指定分页。
+    /// 打开设置对话框，并定位到指定分页（测试与内部兼容入口）。
+    #[allow(dead_code)]
     fn open_settings(&mut self, tab: SettingsTab, window: &mut Window, cx: &mut Context<Self>) {
         let config = self.session.read(cx).config().clone();
         let session = self.session.downgrade();
         let haloeth = cx.weak_entity();
-        let form = cx.new(|cx| SettingsForm::new(window, &config, session, haloeth, tab, cx));
+        let form =
+            cx.new(|cx| SettingsForm::new(window, &config, session, haloeth, tab, false, cx));
 
         window.open_dialog(cx, move |dialog, _, cx| {
             dialog
@@ -286,9 +486,64 @@ impl Haloeth {
         });
     }
 
-    /// 打开设置对话框（通用分页）。
+    /// 打开偏好窗口；已有窗口时聚焦并切换分区。
+    pub(crate) fn open_preferences(
+        &mut self,
+        section: PrefSection,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((handle, view)) = &self.preferences {
+            if let Some(view) = view.upgrade() {
+                let switched = handle
+                    .update(cx, |_, window, cx| {
+                        view.update(cx, |view, cx| view.set_section(section, window, cx));
+                        window.activate_window();
+                    })
+                    .is_ok();
+                if !switched {
+                    view.update(cx, |view, cx| view.set_section_quick(section, cx));
+                }
+                return;
+            }
+            self.preferences = None;
+        }
+
+        let session = self.session.downgrade();
+        let haloeth = cx.weak_entity();
+        let window_size = size(px(960.), px(640.));
+        let options = WindowOptions {
+            // 居中于主窗口所在的屏幕，而不是主窗口本身。
+            window_bounds: Some(WindowBounds::centered(window_size, cx)),
+            window_min_size: Some(size(px(720.), px(520.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("偏好设置".into()),
+                ..TitleBar::title_bar_options()
+            }),
+            ..TitleBar::window_options()
+        };
+        let opened = gpui_kit::open_window(options, cx, |window, cx| {
+            cx.new(|cx| PreferencesWindow::new(window, session, haloeth, section, cx))
+        });
+        if let Ok((handle, view)) = opened {
+            self.preferences = Some((handle, view.downgrade()));
+        }
+    }
+
+    /// 旧设置入口：保留对话框，供内部与测试使用。
+    #[allow(dead_code)]
     fn show_settings(&mut self, _: &ShowSettings, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings(SettingsTab::General, window, cx);
+    }
+
+    /// 打开偏好窗口（通用分页）。
+    fn show_preferences(
+        &mut self,
+        _: &ShowPreferences,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_preferences(PrefSection::General, window, cx);
     }
 
     /// 打开目录授权对话框。
@@ -307,51 +562,99 @@ impl Haloeth {
         self.session.update(cx, |session, cx| session.update_config(cx, f));
     }
 
+    /// 把当前的按键偏好同步到输入缓冲区；设置保存后调用。
+    pub(crate) fn sync_input_preferences(&mut self, cx: &mut Context<Self>) {
+        let (send_key, line_numbers, hotkey) = {
+            let config = self.session.read(cx).config();
+            (config.ui.send_key, config.ui.line_numbers, config.ui.voice_hotkey.clone())
+        };
+        self.composer.update(cx, |composer, cx| {
+            composer.set_send_key(send_key, cx);
+            composer.set_line_numbers(line_numbers, cx);
+        });
+        if let Some(background) = &self.background {
+            background.set_hotkey(background::Hotkey::parse(&hotkey));
+        }
+    }
+
+    /// 处理语音识别结果：把文本放进输入框；按住说话触发的结果直接发送。
+    fn apply_speech_result(
+        &mut self,
+        event: &SpeechEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SpeechEvent::Final(text) => {
+                let auto = std::mem::take(&mut self.auto_submit_speech);
+                let text = text.trim().to_owned();
+                if text.is_empty() {
+                    cx.notify();
+                    return;
+                }
+                self.composer.update(cx, |composer, cx| {
+                    composer.append_text(&text, window, cx);
+                });
+                if auto {
+                    self.composer.update(cx, |composer, cx| composer.submit(window, cx));
+                }
+            }
+            SpeechEvent::Cancelled => {
+                self.auto_submit_speech = false;
+            }
+            SpeechEvent::Error(error) => {
+                self.auto_submit_speech = false;
+                self.audio_error = Some(format!("语音识别失败：{error}").into());
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    /// 展开或收起左下角的快速设置面板。
+    pub(crate) fn set_more_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.more_open != open {
+            self.more_open = open;
+            cx.notify();
+        }
+    }
+
     /// 切换审核模式。
     fn set_approval_mode(&mut self, mode: agent::approval::ApprovalMode, cx: &mut Context<Self>) {
         self.update_config(cx, |config| config.approval.mode = mode);
     }
 
-    /// 切换内置工具。
-    fn toggle_tool(&mut self, name: &str, cx: &mut Context<Self>) {
-        let name = name.to_owned();
-        self.update_config(cx, move |config| {
-            if let Some(index) = config.tools.disabled.iter().position(|entry| entry == &name) {
-                config.tools.disabled.remove(index);
-            } else {
-                config.tools.disabled.push(name);
-            }
-        });
+    /// 切换当前会话里的功能状态；全局配置不受影响。
+    fn toggle_feature(&mut self, kind: config::FeatureKind, name: &str, cx: &mut Context<Self>) {
+        let current = self.session.read(cx).feature_state(kind, name);
+        self.session.update(cx, |session, cx| session.set_feature_state(kind, name, !current, cx));
+        self.save_active(cx);
     }
 
-    /// 切换 MCP 服务器。
-    fn toggle_mcp(&mut self, name: &str, cx: &mut Context<Self>) {
-        let name = name.to_owned();
-        self.update_config(cx, move |config| {
-            if let Some(server) = config.mcp_servers.iter_mut().find(|server| server.name == name) {
-                server.enabled = !server.enabled;
-            }
+    /// 在独立窗口中查看图片。
+    fn open_image_viewer(
+        &mut self,
+        path: String,
+        caption: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::centered(size(px(900.), px(700.)), cx)),
+            window_min_size: Some(size(px(480.), px(360.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("图片".into()),
+                ..TitleBar::title_bar_options()
+            }),
+            ..TitleBar::window_options()
+        };
+        let title = caption.clone();
+        let opened = gpui_kit::open_window(options, cx, move |_, cx| {
+            cx.new(|_| ImageViewer::new(path.clone(), title.clone()))
         });
-    }
-
-    /// 切换 Skill。
-    fn toggle_skill(&mut self, name: &str, cx: &mut Context<Self>) {
-        let discovered: Vec<String> =
-            agent::skill::discover(&self.session.read(cx).config().skill_dirs())
-                .into_iter()
-                .map(|skill| skill.name)
-                .collect();
-        let name = name.to_owned();
-        self.update_config(cx, move |config| {
-            if config.skills.enabled.is_empty() {
-                config.skills.enabled = discovered;
-            }
-            if let Some(index) = config.skills.enabled.iter().position(|entry| entry == &name) {
-                config.skills.enabled.remove(index);
-            } else {
-                config.skills.enabled.push(name);
-            }
-        });
+        if let Err(error) = opened {
+            tracing::warn!("打开图片窗口失败：{error}");
+        }
     }
 
     /// 打开会话对话框
@@ -387,13 +690,16 @@ impl Haloeth {
         });
         self.title = SharedString::from(file.title.clone());
         self.active = file;
+        self.refresh_tray(cx);
     }
 
     /// 新建空会话但不保存当前会话（删除当前会话时使用）。
     fn create_blank(&mut self, cx: &mut Context<Self>) {
+        // 新会话使用通用设置里的默认模型；当前会话的临时选择不继承。
         let (provider, model) = self
             .session
             .read(cx)
+            .config()
             .selection()
             .map(|(provider, model)| (Some(provider.to_owned()), Some(model.to_owned())))
             .unwrap_or((None, None));
@@ -435,15 +741,17 @@ impl Haloeth {
         let file = self.store.rename(&self.active.id, title)?;
         self.active.title = file.title.clone();
         self.title = SharedString::from(file.title);
+        self.refresh_tray(cx);
         cx.notify();
         Ok(())
     }
 
-    /// 打开模型对话框：编辑作用于草稿，保存后才生效
+    /// 旧模型入口：保留对话框，供内部与测试使用。
+    #[allow(dead_code)]
     fn show_models(&mut self, _: &ShowModels, window: &mut Window, cx: &mut Context<Self>) {
         let config = self.session.read(cx).config().clone();
         let session = self.session.downgrade();
-        let form = cx.new(|cx| ModelsForm::new(window, &config, session, cx));
+        let form = cx.new(|cx| ModelsForm::new(window, &config, session, false, cx));
 
         window.open_dialog(cx, move |dialog, _, cx| {
             dialog
@@ -512,6 +820,52 @@ impl Haloeth {
         });
     }
 
+    /// 取出后台线程攒下的事件；处理交给调用方在实体更新之外完成。
+    fn take_background_events(&mut self) -> Vec<background::BackgroundEvent> {
+        let Some(background) = self.background.as_ref() else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        while let Some(event) = background.next_event() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// 按住说话开始：记住要自动发送，并把窗口带到前台。
+    fn start_hold_to_talk(&mut self, cx: &mut Context<Self>) {
+        self.auto_submit_speech = true;
+        if !self.speech.read(cx).is_available(cx) {
+            self.auto_submit_speech = false;
+            self.audio_error = Some("按住说话需要先配置语音识别".into());
+            cx.notify();
+            return;
+        }
+        self.speech.update(cx, |speech, cx| speech.start(cx));
+        self.show_main_window(cx);
+    }
+
+    /// 按住说话结束：停止录音，转写结果由 [`Self::apply_speech_result`] 自动发送。
+    fn stop_hold_to_talk(&mut self, cx: &mut Context<Self>) {
+        self.speech.update(cx, |speech, cx| speech.stop(cx));
+    }
+
+    /// 把主窗口带到前台；最小化时平台会先还原。
+    fn show_main_window(&mut self, cx: &mut Context<Self>) {
+        let _ = self.main_window.update(cx, |_, window, _| window.activate_window());
+    }
+
+    /// 把当前会话标识与标题推给托盘菜单；会话列表由后台线程在展开菜单时读取。
+    fn refresh_tray(&mut self, _cx: &mut Context<Self>) {
+        let Some(background) = &self.background else {
+            return;
+        };
+        background.set_tray(background::TrayState {
+            current_id: self.active.id.clone(),
+            current: self.title.to_string(),
+        });
+    }
+
     /// 品牌标识，标题栏最左侧
     fn render_brand(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
@@ -531,6 +885,7 @@ impl Haloeth {
         Button::new("session")
             .ghost()
             .small()
+            .max_w(rems(16.))
             .label(self.title.clone())
             .tooltip("会话")
             .accessibility_label(format!("当前会话：{}", self.title))
@@ -551,8 +906,7 @@ impl Haloeth {
                     .menu_with_icon("会话…", IconName::FolderOpen, Box::new(ShowSessions))
                     .menu_with_icon("清空会话", IconName::Eraser, Box::new(ClearSession))
                     .separator()
-                    .menu_with_icon("模型…", IconName::BrainCircuit, Box::new(ShowModels))
-                    .menu_with_icon("设置…", IconName::Settings, Box::new(ShowSettings))
+                    .menu_with_icon("偏好设置…", IconName::Settings, Box::new(ShowPreferences))
                     .menu_with_icon("关于 Haloeth…", IconName::Info, Box::new(ShowAbout))
                     .separator()
                     .menu_with_icon("退出", IconName::LogOut, Box::new(Quit))
@@ -561,30 +915,51 @@ impl Haloeth {
 
     /// 标题栏
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        TitleBar::new().border_b_2().child(
-            h_flex()
-                .items_center()
-                .gap_2()
-                .min_w_0()
-                .flex_1()
-                .child(self.render_brand(cx))
-                .child(self.render_main_menu())
-                .child(self.render_session_button(cx))
-                .child(self.menu_bar.clone()),
-        )
+        let background = self.session.read(cx).config().ui.run_in_background;
+        TitleBar::new()
+            .border_b_2()
+            .on_close_window(move |_, window, _| {
+                if background {
+                    // 后台运行：只最小化窗口，托盘仍在。
+                    window.minimize_window();
+                } else {
+                    window.remove_window();
+                }
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(self.render_brand(cx))
+                    .child(self.render_main_menu())
+                    .child(self.render_session_button(cx))
+                    .child(self.menu_bar.clone()),
+            )
     }
 
     /// 模型切换：底部栏的下拉触发器，按提供商分组列出全部模型；没有模型时不可展开
     fn render_model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let config = self.session.read(cx).config();
-        let current =
-            config.selection().map(|(provider, model)| (provider.to_owned(), model.to_owned()));
-        let groups: Vec<(String, Vec<String>)> = config
-            .providers
-            .iter()
-            .filter(|provider| !provider.models.is_empty())
-            .map(|provider| (provider.name.clone(), provider.models.clone()))
-            .collect();
+        let config = self.session.read(cx).config().clone();
+        let current = self
+            .session
+            .read(cx)
+            .selection()
+            .map(|(provider, model)| (provider.to_owned(), model.to_owned()));
+        // 对话主模型只列同时支持文本输入与文本输出的模型。
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        for selection in
+            config.models_with(&[agent::model::Modality::Text], &[agent::model::Modality::Text])
+        {
+            match groups.last_mut() {
+                Some((provider, models)) if provider == &selection.provider => {
+                    models.push(selection.model)
+                }
+                _ => groups.push((selection.provider, vec![selection.model])),
+            }
+        }
         let label = current
             .as_ref()
             .map(|(_, model)| model.clone())
@@ -600,7 +975,19 @@ impl Haloeth {
                 None => format!("模型：{label}"),
             });
         if groups.is_empty() {
-            return trigger.disabled(true).into_any_element();
+            // 没有可用模型时不置灰：用 warning 色 + 下划线提示可以点击去配置。
+            return tinted(
+                Button::new("model").outline().border_2().xsmall().underline(),
+                Tone::Warning,
+                cx,
+            )
+            .label("未配置模型 · 点击设置")
+            .tooltip("还没有可用的对话模型，点击打开模型配置")
+            .accessibility_label("模型：未配置，点击设置")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_preferences(PrefSection::Models, window, cx)
+            }))
+            .into_any_element();
         }
 
         let haloeth = cx.weak_entity();
@@ -637,22 +1024,43 @@ impl Haloeth {
     /// 左下角「更多」：快速查看与切换工具、MCP、Skill，并进入对应设置。
     fn render_more_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let config = self.session.read(cx).config().clone();
+        // 快速面板只列全局「显示」的功能，状态取当前会话。
         let tools = agent::tools::builtin_tools(&agent::tools::BuiltinOptions::default());
         let tool_rows: Vec<(String, bool)> = tools
             .iter()
-            .map(|tool| {
-                let name = tool.spec().name.clone();
-                let enabled = !config.tools.disabled.iter().any(|entry| entry == &name);
+            .map(|tool| tool.spec().name.clone())
+            .chain([
+                "web_search".to_owned(),
+                agent::tools::media::GENERATE_IMAGE.to_owned(),
+                agent::tools::media::GENERATE_VIDEO.to_owned(),
+                agent::tools::media::GENERATE_MUSIC.to_owned(),
+            ])
+            .filter(|name| config.feature_prefs.is_visible(config::FeatureKind::Tool, name))
+            .map(|name| {
+                let enabled = self.session.read(cx).feature_state(config::FeatureKind::Tool, &name);
                 (name, enabled)
             })
             .collect();
-        let mcp_rows: Vec<(String, bool)> =
-            config.mcp_servers.iter().map(|server| (server.name.clone(), server.enabled)).collect();
+        let mcp_rows: Vec<(String, bool)> = config
+            .mcp_servers
+            .iter()
+            .filter(|server| {
+                config.feature_prefs.is_visible(config::FeatureKind::Mcp, &server.name)
+            })
+            .map(|server| {
+                let enabled =
+                    self.session.read(cx).feature_state(config::FeatureKind::Mcp, &server.name);
+                (server.name.clone(), enabled)
+            })
+            .collect();
         let skill_rows: Vec<(String, bool)> = agent::skill::discover(&config.skill_dirs())
             .iter()
+            .filter(|skill| {
+                config.feature_prefs.is_visible(config::FeatureKind::Skill, &skill.name)
+            })
             .map(|skill| {
-                let enabled = config.skills.enabled.is_empty()
-                    || config.skills.enabled.iter().any(|entry| entry == &skill.name);
+                let enabled =
+                    self.session.read(cx).feature_state(config::FeatureKind::Skill, &skill.name);
                 (skill.name.clone(), enabled)
             })
             .collect();
@@ -672,121 +1080,149 @@ impl Haloeth {
             skill_rows.len()
         );
         let haloeth = cx.weak_entity();
-
-        Button::new("more")
+        let open = self.more_open;
+        let trigger = Button::new("more")
             .ghost()
             .small()
             .compact()
             .label("⋯")
             .tooltip("快速设置：工具、MCP、Skill 与目录")
-            .accessibility_label("快速设置")
-            .dropdown_menu(move |menu, _, _| {
-                let mut menu = menu.scrollable(true);
+            .accessibility_label("快速设置");
 
-                menu = menu.item(PopupMenuItem::new(tool_summary.clone()).on_click({
-                    let haloeth = haloeth.clone();
-                    move |_, window, cx| {
-                        haloeth
-                            .update(cx, |this, cx| {
-                                this.open_settings(SettingsTab::Tools, window, cx)
-                            })
-                            .ok();
-                    }
-                }));
+        Popover::new("more-popover")
+            // 触发按钮贴在窗口左下角，面板向上展开。
+            .anchor(Anchor::BottomLeft)
+            .offset(px(6.))
+            .open(open)
+            .on_open_change({
+                let haloeth = haloeth.clone();
+                move |open, _, cx| {
+                    haloeth.update(cx, |this, cx| this.set_more_open(*open, cx)).ok();
+                }
+            })
+            .trigger(trigger)
+            .w(rems(19.))
+            .content(move |_, _, cx| {
+                let divider = || div().h(px(1.)).w_full().bg(cx.theme().border);
+                let mut menu = v_flex()
+                    .id("more-menu")
+                    .test_support()
+                    .w_full()
+                    .gap_1()
+                    .max_h(rems(24.))
+                    .overflow_y_scroll();
+
+                menu = menu.child(more_section(
+                    "more-tools",
+                    tool_summary.clone(),
+                    PrefSection::Tools,
+                    haloeth.clone(),
+                ));
                 for (name, enabled) in &tool_rows {
                     let haloeth = haloeth.clone();
                     let id = name.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(format!(
-                            "{name}  ·  {}",
-                            if *enabled {
-                                "已启用"
-                            } else {
-                                "已停用"
-                            }
-                        ))
-                        .checked(*enabled)
-                        .on_click(move |_, _, cx| {
-                            haloeth.update(cx, |this, cx| this.toggle_tool(&id, cx)).ok();
-                        }),
-                    );
+                    menu = menu.child(more_toggle(
+                        ElementId::Name(format!("more-tool:{name}").into()),
+                        name,
+                        *enabled,
+                        move |cx| {
+                            haloeth
+                                .update(cx, |this, cx| {
+                                    this.toggle_feature(config::FeatureKind::Tool, &id, cx)
+                                })
+                                .ok();
+                        },
+                        cx,
+                    ));
                 }
 
-                menu = menu.separator();
-                menu = menu.item(PopupMenuItem::new(mcp_summary.clone()).on_click({
-                    let haloeth = haloeth.clone();
-                    move |_, window, cx| {
-                        haloeth
-                            .update(cx, |this, cx| this.open_settings(SettingsTab::Mcp, window, cx))
-                            .ok();
-                    }
-                }));
+                menu = menu.child(divider()).child(more_section(
+                    "more-mcp",
+                    mcp_summary.clone(),
+                    PrefSection::Mcp,
+                    haloeth.clone(),
+                ));
                 for (name, enabled) in &mcp_rows {
                     let haloeth = haloeth.clone();
                     let id = name.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(format!(
-                            "{name}  ·  {}",
-                            if *enabled {
-                                "已启用"
-                            } else {
-                                "已停用"
-                            }
-                        ))
-                        .checked(*enabled)
-                        .on_click(move |_, _, cx| {
-                            haloeth.update(cx, |this, cx| this.toggle_mcp(&id, cx)).ok();
-                        }),
-                    );
+                    menu = menu.child(more_toggle(
+                        ElementId::Name(format!("more-mcp:{name}").into()),
+                        name,
+                        *enabled,
+                        move |cx| {
+                            haloeth
+                                .update(cx, |this, cx| {
+                                    this.toggle_feature(config::FeatureKind::Mcp, &id, cx)
+                                })
+                                .ok();
+                        },
+                        cx,
+                    ));
                 }
 
-                menu = menu.separator();
-                menu = menu.item(PopupMenuItem::new(skill_summary.clone()).on_click({
-                    let haloeth = haloeth.clone();
-                    move |_, window, cx| {
-                        haloeth
-                            .update(cx, |this, cx| {
-                                this.open_settings(SettingsTab::Skill, window, cx)
-                            })
-                            .ok();
-                    }
-                }));
+                menu = menu.child(divider()).child(more_section(
+                    "more-skills",
+                    skill_summary.clone(),
+                    PrefSection::Skill,
+                    haloeth.clone(),
+                ));
                 for (name, enabled) in &skill_rows {
                     let haloeth = haloeth.clone();
                     let id = name.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(format!(
-                            "{name}  ·  {}",
-                            if *enabled {
-                                "已启用"
-                            } else {
-                                "已停用"
-                            }
-                        ))
-                        .checked(*enabled)
-                        .on_click(move |_, _, cx| {
-                            haloeth.update(cx, |this, cx| this.toggle_skill(&id, cx)).ok();
-                        }),
-                    );
+                    menu = menu.child(more_toggle(
+                        ElementId::Name(format!("more-skill:{name}").into()),
+                        name,
+                        *enabled,
+                        move |cx| {
+                            haloeth
+                                .update(cx, |this, cx| {
+                                    this.toggle_feature(config::FeatureKind::Skill, &id, cx)
+                                })
+                                .ok();
+                        },
+                        cx,
+                    ));
                 }
 
-                menu = menu.separator();
-                menu = menu.item(PopupMenuItem::new("目录授权…").on_click({
-                    let haloeth = haloeth.clone();
-                    move |_, window, cx| {
-                        haloeth.update(cx, |this, cx| this.show_access(window, cx)).ok();
-                    }
-                }));
-                menu.item(PopupMenuItem::new("设置…").on_click({
-                    let haloeth = haloeth.clone();
-                    move |_, window, cx| {
-                        haloeth
-                            .update(cx, |this, cx| {
-                                this.open_settings(SettingsTab::General, window, cx)
-                            })
-                            .ok();
-                    }
-                }))
+                menu.child(divider())
+                    .child(
+                        Button::new("more-access")
+                            .outline()
+                            .border_2()
+                            .xsmall()
+                            .w_full()
+                            .label("目录授权…")
+                            .on_click({
+                                let haloeth = haloeth.clone();
+                                move |_, window, cx| {
+                                    haloeth
+                                        .update(cx, |this, cx| {
+                                            this.set_more_open(false, cx);
+                                            this.show_access(window, cx);
+                                        })
+                                        .ok();
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("more-settings")
+                            .outline()
+                            .border_2()
+                            .xsmall()
+                            .w_full()
+                            .label("偏好设置…")
+                            .on_click({
+                                let haloeth = haloeth.clone();
+                                move |_, window, cx| {
+                                    haloeth
+                                        .update(cx, |this, cx| {
+                                            this.set_more_open(false, cx);
+                                            this.open_preferences(PrefSection::General, window, cx);
+                                        })
+                                        .ok();
+                                }
+                            }),
+                    )
             })
             .into_any_element()
     }
@@ -809,12 +1245,13 @@ impl Haloeth {
                 agent::approval::ApprovalMode::Off,
             ] {
                 let haloeth = haloeth.clone();
-                menu =
-                    menu.item(PopupMenuItem::new(value.label()).checked(value == mode).on_click(
-                        move |_, _, cx| {
+                menu = menu.item(
+                    PopupMenuItem::new(format!("{} · {}", value.label(), value.description()))
+                        .checked(value == mode)
+                        .on_click(move |_, _, cx| {
                             haloeth.update(cx, |this, cx| this.set_approval_mode(value, cx)).ok();
-                        },
-                    ));
+                        }),
+                );
             }
             menu
         })
@@ -861,27 +1298,174 @@ impl Haloeth {
     }
 
     /// 底部栏：左侧快速设置，右侧模型、会话状态与发送动作
+    /// 输入框上方的工具条：当前会话的快速设置与模型 / 语音。
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .id("composer-toolbar")
+            .test_support()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .border_t_2()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(self.render_more_menu(cx))
+                    .child(self.render_approval_chip(cx))
+                    .child(self.render_access_chip(cx)),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_1()
+                    .child(self.render_model_picker(cx))
+                    .when_some(self.audio_error.clone(), |this, error| {
+                        this.child(
+                            div()
+                                .id("speech-error")
+                                .role(Role::Status)
+                                .test_support()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .max_w(rems(12.))
+                                .truncate()
+                                .child(error),
+                        )
+                    })
+                    .child(self.render_audio_controls(cx)),
+            )
+    }
+
+    /// 底部状态栏：运行状态、用量、消息数与发送动作。
     fn render_bottom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.session.read(cx).status();
         let message_count = self.conversation.read(cx).message_count();
         let total_tokens = self.session.read(cx).usage().total();
-        let quick = h_flex()
-            .items_center()
-            .gap_1()
-            .child(self.render_more_menu(cx))
-            .child(self.render_approval_chip(cx))
-            .child(self.render_access_chip(cx));
+        let usage_by_model = self.session.read(cx).usage_by_model().clone();
 
         StatusBar::new()
             .border_t_2()
-            .child(quick)
-            .right(self.render_model_picker(cx))
-            .right(chip("session-state", status.label(), status_tone(status), cx))
+            .child(chip(
+                "session-state",
+                self.session.read(cx).status_text(),
+                status_tone(status),
+                cx,
+            ))
             .when(total_tokens > 0, |this| {
-                this.right(status_item("token-usage", format_tokens(total_tokens)))
+                this.right(status_item_with_tooltip(
+                    "token-usage",
+                    format_tokens(total_tokens),
+                    usage_tooltip(&usage_by_model),
+                ))
             })
             .right(status_item("message-count", format!("{message_count} 条消息")))
             .right(self.render_submit_action(status, cx))
+    }
+
+    /// 语音识别与播报按钮。
+    fn render_audio_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let capturing = self.speech.read(cx).status().is_capturing();
+        let mic = tinted(
+            Button::new("mic").outline().border_2().small().icon(IconName::Mic),
+            if capturing {
+                Tone::Success
+            } else {
+                Tone::Neutral
+            },
+            cx,
+        )
+        .tooltip(if capturing {
+            "停止录音"
+        } else {
+            "语音输入"
+        })
+        .accessibility_label("语音输入")
+        .on_click(cx.listener(|this, _, window, cx| this.toggle_microphone(window, cx)));
+
+        let speaker = tinted(
+            Button::new("tts-toggle").outline().border_2().small().icon(if self.auto_speak {
+                IconName::Pause
+            } else {
+                IconName::Play
+            }),
+            if self.auto_speak {
+                Tone::Success
+            } else {
+                Tone::Neutral
+            },
+            cx,
+        )
+        .tooltip(if self.auto_speak {
+            "关闭自动播报"
+        } else {
+            "自动播报回复"
+        })
+        .accessibility_label("自动播报")
+        .on_click(cx.listener(|this, _, window, cx| this.toggle_speaker(window, cx)));
+
+        h_flex().items_center().gap_1().child(mic).child(speaker)
+    }
+
+    /// 当前 TTS 配置快照。
+    fn tts_settings(&self, cx: &App) -> TtsSettings {
+        let session = self.session.read(cx);
+        let config = session.config();
+        let tts = &config.audio.tts;
+        let (base_url, api_key) = config
+            .provider_named(tts.provider.trim())
+            .map(|provider| (provider.endpoint(), provider.api_key.clone()))
+            .unwrap_or_default();
+        TtsSettings {
+            backend: tts.backend,
+            base_url,
+            api_key,
+            model: tts.model.clone(),
+            voice: tts.voice.clone(),
+            rate: tts.rate,
+            volume: tts.volume,
+            endpoint: tts.endpoint.clone(),
+            headers: config
+                .provider_named(tts.provider.trim())
+                .map(|provider| provider.headers.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// 切换录音；未配置时跳到偏好设置。
+    fn toggle_microphone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.speech.read(cx).is_available(cx) {
+            self.speech.update(cx, |speech, cx| speech.toggle(cx));
+        } else {
+            self.open_preferences(PrefSection::Audio, window, cx);
+        }
+    }
+
+    /// 试听当前语音播报配置。
+    pub(crate) fn preview_tts(&mut self, cx: &mut Context<Self>) {
+        let settings = self.tts_settings(cx);
+        self.tts.speak("Haloeth 语音播报测试", settings);
+    }
+
+    /// 切换自动播报；未配置时跳到偏好设置。
+    fn toggle_speaker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.auto_speak {
+            self.auto_speak = false;
+            self.tts.stop();
+            cx.notify();
+            return;
+        }
+        let settings = self.tts_settings(cx);
+        if !TtsService::is_configured(&settings) {
+            self.open_preferences(PrefSection::Audio, window, cx);
+            return;
+        }
+        self.auto_speak = true;
+        cx.notify();
     }
 
     /// 提交动作：运行中显示停止按钮，否则显示发送按钮
@@ -900,11 +1484,12 @@ impl Haloeth {
                 .into_any_element();
         }
 
+        let send_key = self.composer.read(cx).send_key();
         Button::new("send")
             .primary()
             .small()
             .icon(IconName::Airplay)
-            .tooltip(composer::SUBMIT_HINT)
+            .tooltip(composer::submit_hint(send_key))
             .accessibility_label("发送")
             .disabled(!self.composer.read(cx).is_submittable())
             .on_click(cx.listener(|this, _, window, cx| {
@@ -912,6 +1497,67 @@ impl Haloeth {
             }))
             .into_any_element()
     }
+}
+
+/// 快速设置面板的分类入口：点击关闭面板并打开对应设置分页。
+fn more_section(
+    id: &'static str,
+    label: String,
+    section: PrefSection,
+    haloeth: WeakEntity<Haloeth>,
+) -> AnyElement {
+    Button::new(id)
+        .outline()
+        .border_2()
+        .xsmall()
+        .w_full()
+        .label(label)
+        .tooltip("打开对应的设置")
+        .on_click(move |_, window, cx| {
+            haloeth
+                .update(cx, |this, cx| {
+                    this.set_more_open(false, cx);
+                    this.open_preferences(section, window, cx);
+                })
+                .ok();
+        })
+        .into_any_element()
+}
+
+/// 快速设置面板的开关行：点击只切换状态，不关闭面板。
+fn more_toggle(
+    id: ElementId,
+    name: &str,
+    enabled: bool,
+    on_click: impl Fn(&mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let button = Button::new(id)
+        .outline()
+        .border_2()
+        .xsmall()
+        .w_full()
+        .label(format!(
+            "{name} · {}",
+            if enabled {
+                "已启用"
+            } else {
+                "已停用"
+            }
+        ))
+        .selected(enabled)
+        .toggled(enabled);
+    tinted(
+        button,
+        if enabled {
+            Tone::Success
+        } else {
+            Tone::Danger
+        },
+        cx,
+    )
+    .on_click(move |_, _, cx| on_click(cx))
+    .into_any_element()
 }
 
 /// 运行状态对应的展示色调。
@@ -936,6 +1582,40 @@ fn approval_tone(mode: agent::approval::ApprovalMode) -> Tone {
 }
 
 /// 状态项：带状态角色与无障碍名称的文本
+/// 按模型拆分的用量提示。
+fn usage_tooltip(usage: &std::collections::BTreeMap<String, agent::metrics::TokenUsage>) -> String {
+    if usage.is_empty() {
+        return "还没有模型用量".to_owned();
+    }
+    let mut lines = vec!["各模型 Token 用量：".to_owned()];
+    let mut entries: Vec<_> = usage.iter().collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.1.total()));
+    for (model, usage) in entries {
+        lines.push(format!("{model}：{}", format_tokens(usage.total())));
+    }
+    lines.join(
+        "
+",
+    )
+}
+
+fn status_item_with_tooltip(
+    id: &'static str,
+    text: impl Into<SharedString>,
+    tooltip: String,
+) -> impl IntoElement {
+    let label: SharedString = text.into();
+    div()
+        .id(id)
+        .role(Role::Status)
+        .test_support()
+        .aria_label(label.clone())
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+        })
+        .child(label)
+}
+
 fn status_item(id: &'static str, text: impl Into<SharedString>) -> impl IntoElement {
     let label: SharedString = text.into();
 
@@ -961,17 +1641,18 @@ impl Render for Haloeth {
             .on_action(
                 cx.listener(|this, _: &ShowSessions, window, cx| this.show_sessions(window, cx)),
             )
-            .on_action(cx.listener(Self::show_models))
-            .on_action(cx.listener(Self::show_settings))
+            .on_action(cx.listener(Self::show_preferences))
             .on_action(cx.listener(Self::show_about))
             .child(self.render_title_bar(cx))
             .child(self.conversation.clone())
+            .child(self.render_toolbar(cx))
             .child(self.composer.clone())
             .child(self.render_bottom_bar(cx))
     }
 }
 
 fn main() {
+    logging::init();
     application().with_assets(AllAssets).run(|cx| {
         init(cx);
 
@@ -1005,11 +1686,12 @@ mod tests {
     use agent::message::{Message, StreamDelta, ToolCall};
     use agent::model::{GenerateRequest, Model, ModelBuilder};
     use gpui_kit::component::Root;
+    use gpui_kit::component::speech::SpeechEvent;
     use gpui_kit::test::TestAppContextExt as _;
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, Entity, Pixels, Role, Size, TestAppContext, Window,
-        point, px,
+        point, px, size,
     };
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -1170,6 +1852,23 @@ mod tests {
         settle_dialog(cx, handle).await;
     }
 
+    /// 等待偏好窗口出现并完成首帧。
+    async fn settle_preferences(cx: &mut TestAppContext, handle: AnyWindowHandle) {
+        cx.wait_for(handle, Duration::from_secs(1), |window, _| {
+            window.try_find("preferences-window").is_some()
+        })
+        .await;
+        std::thread::sleep(Duration::from_millis(200));
+        cx.update_window(handle, |_, window, cx| window.render_frame(cx)).ok();
+    }
+
+    /// 读取当前偏好窗口句柄。
+    fn preferences_handle(cx: &TestAppContext, haloeth: &Entity<Haloeth>) -> AnyWindowHandle {
+        haloeth
+            .read_with(cx, |haloeth, _| haloeth.preferences.as_ref().map(|(handle, _)| *handle))
+            .expect("the preferences window should be open")
+    }
+
     /// 等待对话框出现并等它结束入场动画
     ///
     /// 入场动画按墙上时间推进，未结束时元素位置仍在变化，
@@ -1246,7 +1945,7 @@ mod tests {
         let content = window.find("conversation").bounds();
         let mut previous_right = content.left();
 
-        for id in ["model", "session-state", "message-count", "send"] {
+        for id in ["session-state", "message-count", "send"] {
             let bounds = window.find(id).bounds();
             assert!(bounds.left() >= previous_right, "{id} 与相邻项重叠");
             assert!(bounds.right() <= content.right(), "{id} 越出窗口");
@@ -1388,7 +2087,7 @@ mod tests {
     /// 模型对话框：新增提供商与模型，行内删除模型
     #[gpui_kit::test]
     async fn models_dialog_adds_providers_and_models(cx: &mut TestAppContext) {
-        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let (haloeth, handle) = open_shell(cx, size(px(480.), px(1400.)));
         open_models_dialog(cx, &haloeth, handle).await;
 
         cx.update_window(handle, |_, window, cx| {
@@ -1421,8 +2120,13 @@ mod tests {
                 window.find("provider-toggle:local").label(),
                 Some("提供商：local（2 个模型）")
             );
-            assert_eq!(window.find("model-select:local/m-a").label(), Some("使用模型「m-a」"));
-            assert_eq!(window.find("model-select:local/m-b").label(), Some("使用模型「m-b」"));
+            assert_eq!(window.find("model-enabled:local/m-a").label(), Some("已启用"));
+            assert_eq!(window.find("model-enabled:local/m-b").label(), Some("已启用"));
+
+            // 禁用模型后状态切换，但行仍保留
+            window.click("model-enabled:local/m-b", cx);
+            window.render_frame(cx);
+            assert_eq!(window.find("model-enabled:local/m-b").label(), Some("已停用"));
 
             // 行内删除模型，其余行不受影响
             window.click("model-remove:local/m-b", cx);
@@ -1431,7 +2135,7 @@ mod tests {
                 window.find("provider-toggle:local").label(),
                 Some("提供商：local（1 个模型）")
             );
-            assert!(window.find("model-select:local/m-a").visible());
+            assert!(window.find("model-enabled:local/m-a").visible());
 
             window.click("models-cancel", cx);
         })
@@ -1442,7 +2146,7 @@ mod tests {
     /// 删除提供商需要确认，取消保留、确认移除
     #[gpui_kit::test]
     async fn models_dialog_removes_a_provider_after_confirmation(cx: &mut TestAppContext) {
-        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let (haloeth, handle) = open_shell(cx, size(px(480.), px(1400.)));
         configure(cx, &haloeth, "local", "secret", &["m-a"]);
         open_models_dialog(cx, &haloeth, handle).await;
 
@@ -1474,23 +2178,15 @@ mod tests {
         .unwrap();
     }
 
-    /// 面板内换选模型后，保存校验指向新模型所在提供商
+    /// 当前模型所在提供商缺少密钥时，保存被拒并提示
     #[gpui_kit::test]
     async fn models_dialog_validates_before_saving(cx: &mut TestAppContext) {
         let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
-        configure(cx, &haloeth, "ready", "secret", &["m-a"]);
-        add_provider_with_models(cx, &haloeth, "keyless", "", &["m-b"]);
+        configure(cx, &haloeth, "keyless", "", &["m-a"]);
         open_models_dialog(cx, &haloeth, handle).await;
 
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            // 展开另一个提供商并选用它的模型
-            window.within("dialog").click("provider-toggle:keyless", cx);
-            window.render_frame(cx);
-            window.within("dialog").click("model-select:keyless/m-b", cx);
-            window.render_frame(cx);
-
-            // 保存被拒：提示指向刚选中的模型所在提供商
             window.within("dialog").click("models-save", cx);
             window.render_frame(cx);
             assert_eq!(
@@ -1505,7 +2201,7 @@ mod tests {
     /// 拉取前先校验密钥，不发起网络请求
     #[gpui_kit::test]
     async fn models_dialog_requires_a_key_before_fetching(cx: &mut TestAppContext) {
-        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let (haloeth, handle) = open_shell(cx, size(px(480.), px(1400.)));
         configure(cx, &haloeth, "keyless", "", &["m-a"]);
         open_models_dialog(cx, &haloeth, handle).await;
 
@@ -1524,12 +2220,18 @@ mod tests {
     /// 提供商之间的分隔线与全局边框一致，为 2px
     #[gpui_kit::test]
     async fn provider_divider_matches_the_two_pixel_border_rule(cx: &mut TestAppContext) {
-        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let (haloeth, handle) = open_shell(cx, size(px(480.), px(1400.)));
         configure(cx, &haloeth, "ready", "secret", &["m-a"]);
         add_provider_with_models(cx, &haloeth, "keyless", "", &["m-b"]);
         open_models_dialog(cx, &haloeth, handle).await;
 
         cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("dialog").scroll(
+                "models-panel",
+                gpui_kit::ScrollDelta::Lines(point(0., -20.)),
+                cx,
+            );
             window.render_frame(cx);
             let divider = window.within("dialog").find("provider-divider:keyless");
             assert!(divider.visible());
@@ -1541,7 +2243,7 @@ mod tests {
     /// 输入控件由外框绘制 2px 边框，字段总高保持组件默认值
     #[gpui_kit::test]
     async fn input_frame_draws_a_two_pixel_border(cx: &mut TestAppContext) {
-        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let (haloeth, handle) = open_shell(cx, size(px(480.), px(1400.)));
         configure(cx, &haloeth, "local", "secret", &["m-a"]);
         open_models_dialog(cx, &haloeth, handle).await;
 
@@ -1614,22 +2316,26 @@ mod tests {
         });
     }
 
-    /// 没有模型时底部栏的模型选择器为空态且不可展开
+    /// 没有模型时底部栏的模型选择器提示去配置
     #[gpui_kit::test]
-    fn model_picker_is_disabled_without_models(cx: &mut TestAppContext) {
+    async fn model_picker_is_disabled_without_models(cx: &mut TestAppContext) {
         let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
 
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            assert_eq!(window.find("model").label(), Some("模型：未选择模型"));
+            // 未配置模型时按钮不置灰，而是可点击并跳到模型配置。
+            assert_eq!(window.find("model").label(), Some("模型：未配置，点击设置"));
             window.click("model", cx);
         })
         .unwrap();
         cx.run_until_parked();
 
-        cx.update_window(handle, |_, window, cx| {
+        cx.run_until_parked();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+        cx.update_window(prefs, |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find(r#"popover:dropdown-menu:Name("model")"#).is_none());
+            assert!(window.find("models-panel").visible());
         })
         .unwrap();
 
@@ -1722,8 +2428,8 @@ mod tests {
         .unwrap();
 
         cx.update(|cx| {
-            // 选择模型同时切换了提供商
-            assert_eq!(haloeth.read(cx).session.read(cx).config().selection(), Some(("b", "m-b")));
+            // 底部选择只影响当前会话，不覆盖通用里的默认模型
+            assert_eq!(haloeth.read(cx).session.read(cx).selection(), Some(("b", "m-b")));
         });
     }
 
@@ -1740,7 +2446,8 @@ mod tests {
     }
 
     /// 最小窗口尺寸下底部栏仍按阅读顺序排布，不重叠也不越界
-    /// 空缓冲区拒绝发送；Enter 换行，Ctrl+Enter 与发送按钮提交，提交后写入对话并清空缓冲区
+    /// 空缓冲区拒绝发送；默认 Enter 发送、Shift+Enter 换行，发送按钮同样提交
+    /// 并且提交后写入对话并清空缓冲区
     #[gpui_kit::test]
     fn composer_submits_and_resets(cx: &mut TestAppContext) {
         let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
@@ -1781,7 +2488,7 @@ mod tests {
         })
         .unwrap();
 
-        // Enter 在编辑器里换行，不提交
+        // 默认偏好：Enter 直接发送
         cx.update_window(handle, |_, window, cx| {
             window.click(buffer_id, cx);
             window.input("列出当前目录", cx);
@@ -1791,12 +2498,30 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.find("conversation-empty").visible());
-            assert_eq!(composer.read(cx).buffer().read(cx).value().as_ref(), "列出当前目录\n");
+            assert!(window.try_find("conversation-empty").is_none());
+            assert_eq!(window.find(("message", 0_u64)).label(), Some("你：列出当前目录"));
+            assert!(composer.read(cx).buffer().read(cx).value().is_empty());
+            assert_eq!(window.find("message-count").label(), Some("1 条消息"));
         })
         .unwrap();
 
-        // Ctrl+Enter 提交
+        // Shift+Enter 换行，不提交
+        cx.update_window(handle, |_, window, cx| {
+            window.click(buffer_id, cx);
+            window.input("第一行", cx);
+            window.press("shift-enter", cx);
+            window.input("第二行", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(composer.read(cx).buffer().read(cx).value().as_ref(), "第一行\n第二行");
+            assert_eq!(window.find("message-count").label(), Some("1 条消息"));
+        })
+        .unwrap();
+
+        // 即使偏好是 Enter 发送，Ctrl+Enter 也可以提交
         cx.update_window(handle, |_, window, cx| {
             window.press("secondary-enter", cx);
         })
@@ -1804,10 +2529,9 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find("conversation-empty").is_none());
-            assert_eq!(window.find(("message", 0_u64)).label(), Some("你：列出当前目录"));
+            assert_eq!(window.find(("message", 1_u64)).label(), Some("你：第一行\n第二行"));
             assert!(composer.read(cx).buffer().read(cx).value().is_empty());
-            assert_eq!(window.find("message-count").label(), Some("1 条消息"));
+            assert_eq!(window.find("message-count").label(), Some("2 条消息"));
         })
         .unwrap();
 
@@ -1825,9 +2549,9 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            assert_eq!(window.find(("message", 1_u64)).label(), Some("你：再删掉临时文件"));
+            assert_eq!(window.find(("message", 2_u64)).label(), Some("你：再删掉临时文件"));
             assert!(composer.read(cx).buffer().read(cx).value().is_empty());
-            assert_eq!(window.find("message-count").label(), Some("2 条消息"));
+            assert_eq!(window.find("message-count").label(), Some("3 条消息"));
             assert!(
                 window.find(("message", 1_u64)).bounds().top()
                     >= window.find(("message", 0_u64)).bounds().bottom()
@@ -1836,6 +2560,53 @@ mod tests {
                 window.find("message-count").bounds().top()
                     >= window.find("composer").bounds().bottom()
             );
+        })
+        .unwrap();
+    }
+
+    /// 按键偏好切到 Ctrl+Enter 后，Enter 换行、Ctrl+Enter 发送。
+    #[gpui_kit::test]
+    fn composer_honours_the_send_key_preference(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let composer = haloeth.read_with(cx, |haloeth, _cx| haloeth.composer.clone());
+        let buffer_id =
+            ("input", composer.read_with(cx, |composer, _cx| composer.buffer().entity_id()));
+
+        cx.update_window(handle, |_, _, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    session.update_config(cx, |config| {
+                        config.ui.send_key = crate::config::SendKey::SecondaryEnter;
+                    });
+                });
+                haloeth.sync_input_preferences(cx);
+            });
+        })
+        .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.click(buffer_id, cx);
+            window.input("用 Ctrl 发送", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(composer.read(cx).buffer().read(cx).value().as_ref(), "用 Ctrl 发送\n");
+            assert!(window.find("conversation-empty").visible());
+        })
+        .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.press("secondary-enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.find(("message", 0_u64)).label(), Some("你：用 Ctrl 发送"));
+            assert_eq!(window.find("message-count").label(), Some("1 条消息"));
         })
         .unwrap();
     }
@@ -1887,6 +2658,48 @@ mod tests {
             assert!(label.contains("最终答案"), "最终答案可见：{label}");
             assert!(label.contains("done"), "答案内容可见：{label}");
         });
+    }
+
+    /// 多次运行的用量累计，并按模型拆分。
+    #[gpui_kit::test]
+    async fn usage_accumulates_per_model(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        configure(cx, &haloeth, "local", "secret", &["m-a"]);
+        let replies = vec![
+            tool_call("final_answer", serde_json::json!({ "answer": "ok" }))
+                .with_usage(agent::metrics::TokenUsage::new(10, 5)),
+        ];
+        let builder: ModelBuilder = Arc::new(move || Box::new(ScriptedModel::new(replies.clone())));
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    session.set_model_builder(builder, cx);
+                });
+            });
+        });
+        for _ in 0..2 {
+            cx.update_window(handle, |_, _, cx| {
+                haloeth.update(cx, |haloeth, cx| {
+                    haloeth.session.update(cx, |session, cx| session.submit("run".to_owned(), cx));
+                });
+            })
+            .unwrap();
+            wait_for_status(cx, handle, "就绪").await;
+        }
+
+        cx.update(|cx| {
+            let session = haloeth.read(cx).session.read(cx);
+            assert_eq!(session.usage().total(), 30);
+            let per_model = session.usage_by_model();
+            assert_eq!(per_model.get("m-a").map(|usage| usage.total()), Some(30));
+        });
+        // 重新打开会话后用量仍然保留
+        let id = cx.update(|cx| haloeth.read(cx).active_id().to_owned());
+        cx.update(|cx| haloeth.update(cx, |haloeth, cx| haloeth.save_active(cx)));
+        let saved = cx.update(|cx| haloeth.read(cx).store.load(&id).expect("load"));
+        assert_eq!(saved.usage.total(), 30);
+        assert_eq!(saved.usage_by_model.get("m-a").map(|usage| usage.total()), Some(30));
     }
 
     /// 会话自动保存，并能在多个会话之间切换恢复
@@ -2109,7 +2922,7 @@ mod tests {
     /// 「⋯」菜单里的分类入口打开对应的设置分页。
     #[gpui_kit::test]
     async fn more_menu_opens_the_tool_settings(cx: &mut TestAppContext) {
-        let (_haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
 
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
@@ -2120,20 +2933,851 @@ mod tests {
 
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            let mut menu = window.within(r#"popover:dropdown-menu:Name("more")"#);
-            // 第一项是「工具 · n / m 启用 →」。
-            menu.click(gpui_kit::ElementId::Integer(0), cx);
+            let mut menu = window.within("more-menu");
+            menu.click("more-tools", cx);
         })
         .unwrap();
-        settle_dialog(cx, handle).await;
+        cx.run_until_parked();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("settings-panel").visible());
+            assert!(window.try_find("feature-visible:tool:shell").is_some());
+        })
+        .unwrap();
+    }
+
+    /// 快速设置面板一次可以连续切换多个开关，只有点击别处才收起。
+    #[gpui_kit::test]
+    fn more_menu_stays_open_while_toggling(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
 
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
-            let dialog = window.within("dialog");
-            assert!(dialog.find("settings-panel").visible());
-            assert!(dialog.try_find("tool-toggle:shell").is_some());
+            window.click("more", cx);
         })
         .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("more-menu").visible());
+            let mut menu = window.within("more-menu");
+            menu.click("more-tool:shell", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            // 点击开关后面板保持展开，且状态已经切换。
+            assert!(window.find("more-menu").visible());
+            assert!(
+                window
+                    .find("more-tool:shell")
+                    .label()
+                    .is_some_and(|label| label.contains("已停用"))
+            );
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(
+                !haloeth
+                    .read(cx)
+                    .session
+                    .read(cx)
+                    .feature_state(crate::config::FeatureKind::Tool, "shell",)
+            );
+        });
+
+        // 点击面板之外收起：点对话区左上角，避免落在向上的面板上。
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click_at("conversation", point(px(10.), px(10.)), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("more-menu").is_none());
+        })
+        .unwrap();
+    }
+
+    /// 连续关闭两个 Skill 时，第二个不能反过来把第一个打开。
+    #[gpui_kit::test]
+    fn toggling_two_skills_keeps_both_disabled(cx: &mut TestAppContext) {
+        let root = std::env::temp_dir().join(format!("haloeth-skills-{}", uuid::Uuid::new_v4()));
+        for name in ["alpha", "beta"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).expect("skill dir");
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\n\nBody.\n"),
+            )
+            .expect("skill file");
+        }
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let root_text = root.to_string_lossy().to_string();
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    let mut config = session.config().clone();
+                    config.skills.dirs = vec![root_text];
+                    for name in ["alpha", "beta"] {
+                        config.feature_prefs.set(
+                            crate::config::FeatureKind::Skill,
+                            name,
+                            crate::config::FeaturePref::new(false, true),
+                        );
+                    }
+                    session.apply_config(config, cx);
+                });
+            });
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("more", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("more-menu").click("more-skill:alpha", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("more-menu").click("more-skill:beta", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let session = haloeth.read(cx).session.read(cx);
+            assert!(!session.feature_state(crate::config::FeatureKind::Skill, "alpha"));
+            assert!(!session.feature_state(crate::config::FeatureKind::Skill, "beta"));
+        });
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 全局隐藏的功能不出现在快速面板里。
+    #[gpui_kit::test]
+    fn hidden_features_are_absent_from_the_quick_panel(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    let mut config = session.config().clone();
+                    config.feature_prefs.set(
+                        crate::config::FeatureKind::Tool,
+                        "shell",
+                        crate::config::FeaturePref::new(true, false),
+                    );
+                    session.apply_config(config, cx);
+                });
+            });
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("more", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.within("more-menu").try_find("more-tool:shell").is_none());
+            assert!(window.within("more-menu").try_find("more-tool:read_file").is_some());
+        })
+        .unwrap();
+    }
+
+    /// 新会话使用偏好里配置的默认模型。
+    #[gpui_kit::test]
+    fn new_sessions_use_the_preferred_default_model(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        configure(cx, &haloeth, "local", "secret", &["m-a", "m-b"]);
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    session.update_config(cx, |config| {
+                        let _ = config.select_model("local", "m-b");
+                    });
+                });
+                haloeth.conversation.update(cx, |conversation, cx| {
+                    conversation.push(crate::conversation::ChatRole::User, "先做点事", cx);
+                });
+            });
+        });
+        cx.update_window(handle, |_, _, cx| {
+            haloeth.update(cx, |haloeth, cx| haloeth.create_session(cx));
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert_eq!(haloeth.read(cx).session.read(cx).selection(), Some(("local", "m-b")));
+        });
+    }
+
+    /// 已经是空白会话时，再点「新对话」不会创建新文件。
+    #[gpui_kit::test]
+    fn creating_a_session_on_a_blank_conversation_is_a_noop(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let before = cx.update(|cx| haloeth.read(cx).active_id().to_owned());
+
+        cx.update_window(handle, |_, _, cx| {
+            haloeth.update(cx, |haloeth, cx| haloeth.create_session(cx));
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert_eq!(haloeth.read(cx).active_id(), before);
+        });
+    }
+
+    /// 审核模型可以从「当前对话模型」切到「单独指定」，并且切换会立即保存。
+    #[gpui_kit::test]
+    async fn reviewer_model_can_be_switched_to_a_specific_model(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        configure(cx, &haloeth, "local", "secret", &["m-a"]);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::General, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            window.scroll("pref-scroll", gpui_kit::ScrollDelta::Lines(point(0., -30.)), cx);
+            window.render_frame(cx);
+            assert!(
+                window.find("settings-reviewer").label().is_some_and(|l| l.contains("当前对话"))
+            );
+            window.click("settings-reviewer", cx);
+            window.render_frame(cx);
+            // 切换后不会被自动保存逻辑拨回去：审核模型的按钮确实有反应。
+            assert!(window.find("settings-reviewer").label().is_some_and(|l| l.contains("单独")));
+            assert!(window.try_find("reviewer-model").is_some());
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let reviewer = haloeth.read(cx).session.read(cx).config().approval.reviewer.clone();
+            assert!(!reviewer.use_current);
+        });
+    }
+
+    /// 偏好窗口在独立窗口中打开，左侧导航切换分页。
+    #[gpui_kit::test]
+    async fn preferences_window_opens_and_switches_sections(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::General, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("preferences-window").visible());
+            assert!(window.find("pref-nav:models").visible());
+            window.click("pref-nav:models", cx);
+            window.render_frame(cx);
+            assert!(window.find("models-panel").visible());
+            window.click("pref-nav:tools", cx);
+            window.render_frame(cx);
+            assert!(window.find("settings-panel").visible());
+        })
+        .unwrap();
+    }
+
+    /// 按住说话得到的转写结果直接发送；普通麦克风输入只写进输入框。
+    #[gpui_kit::test]
+    fn hold_to_talk_submits_the_transcript(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.auto_submit_speech = true;
+                haloeth.apply_speech_result(&SpeechEvent::Final("你好".into()), window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let haloeth = haloeth.read(cx);
+            assert_eq!(haloeth.composer.read(cx).buffer().read(cx).value(), "");
+            assert_eq!(haloeth.conversation.read(cx).message_count(), 1);
+            assert!(!haloeth.auto_submit_speech);
+        });
+
+        // 手动点麦克风时不自动发送，方便用户改完再发。
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.apply_speech_result(&SpeechEvent::Final("再补充".into()), window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let haloeth = haloeth.read(cx);
+            assert_eq!(haloeth.composer.read(cx).buffer().read(cx).value(), "再补充");
+            assert_eq!(haloeth.conversation.read(cx).message_count(), 1);
+        });
+    }
+
+    /// 运行中提交不会丢消息：文本留在输入框里，等这一轮结束后再发。
+    #[gpui_kit::test]
+    fn submitting_while_busy_keeps_the_text(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    session.set_status_for_test(crate::session::Status::Running, cx);
+                });
+                let composer = haloeth.composer.clone();
+                composer.update(cx, |composer, cx| {
+                    composer.append_text("先排队", window, cx);
+                    composer.submit(window, cx);
+                });
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let haloeth = haloeth.read(cx);
+            assert_eq!(haloeth.composer.read(cx).buffer().read(cx).value(), "先排队");
+            assert_eq!(haloeth.conversation.read(cx).message_count(), 0);
+        });
+    }
+
+    /// 点击「录制」后按下的组合键会直接写入快捷键设置。
+    #[gpui_kit::test]
+    async fn hotkey_capture_records_the_pressed_combination(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::General, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("hotkey-capture", cx);
+            window.render_frame(cx);
+            window.press("ctrl-shift-k", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let hotkey = haloeth.read(cx).session.read(cx).config().ui.voice_hotkey.clone();
+            assert_eq!(hotkey, "ctrl+shift+k");
+        });
+    }
+
+    /// 没有模型时默认模型显示「无」，点击跳到模型页。
+    #[gpui_kit::test]
+    async fn default_model_points_to_the_model_page(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::General, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("default-model").label().is_some_and(|label| label.contains("无")));
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::Models, window, cx)
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("models-panel").visible());
+        })
+        .unwrap();
+    }
+
+    /// 模型页只提供启用 / 禁用，不再改变当前选择。
+    #[gpui_kit::test]
+    async fn model_page_toggles_enabled_state(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        configure(cx, &haloeth, "local", "secret", &["m-a"]);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::Models, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            window.scroll("pref-scroll", gpui_kit::ScrollDelta::Lines(point(0., -30.)), cx);
+            window.render_frame(cx);
+            window.click("model-enabled:local/m-a", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let entry = haloeth
+                .read(cx)
+                .session
+                .read(cx)
+                .config()
+                .model_entry("local", "m-a")
+                .cloned()
+                .expect("model");
+            assert!(!entry.enabled);
+        });
+    }
+
+    /// 未配置生成模型时，工具页显示警告而不是启用开关。
+    #[gpui_kit::test]
+    async fn generation_tools_need_a_model_before_enabling(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::Tools, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("media-unready:generate_image").is_some());
+            assert!(window.try_find("feature-visible:tool:generate_image").is_none());
+        })
+        .unwrap();
+    }
+
+    /// 偏好里的默认审核模式即时写回配置。
+    #[gpui_kit::test]
+    async fn preferences_change_the_default_approval_mode(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::General, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            window.scroll("pref-scroll", gpui_kit::ScrollDelta::Lines(point(0., -30.)), cx);
+            window.render_frame(cx);
+            window.click("pref-mode:model", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(
+                haloeth.read(cx).session.read(cx).config().approval.mode,
+                agent::approval::ApprovalMode::Model
+            );
+        });
+    }
+
+    /// 行号开关即时生效并同步到输入框。
+    #[gpui_kit::test]
+    async fn line_numbers_can_be_toggled(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::General, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings-line-numbers", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(haloeth.read(cx).session.read(cx).config().ui.line_numbers);
+            assert!(haloeth.read(cx).composer.read(cx).line_numbers());
+        });
+    }
+
+    /// 偏好页面内容被限制在标题栏下方并可滚动。
+    #[gpui_kit::test]
+    async fn preferences_content_stays_below_the_header(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::Models, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            let header = window.find("pref-header").bounds();
+            let scroll = window.find("pref-scroll").bounds();
+            let root = window.find("preferences-window").bounds();
+            assert!(scroll.top() >= header.bottom(), "内容不应盖住头部");
+            assert!(scroll.bottom() <= root.bottom(), "内容不应越出窗口");
+        })
+        .unwrap();
+    }
+
+    /// 偏好左侧导航可以收起为图标。
+    #[gpui_kit::test]
+    async fn preferences_nav_collapses(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::General, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            let before = window.find("preferences-nav").bounds().size.width;
+            window.click("pref-nav-toggle", cx);
+            window.render_frame(cx);
+            let after = window.find("preferences-nav").bounds().size.width;
+            assert!(after < before, "导航应收起：{before:?} -> {after:?}");
+            assert!(window.find("pref-nav:models").visible());
+        })
+        .unwrap();
+    }
+
+    /// 真实系统语音播报（会发出声音），手动运行。
+    #[test]
+    #[ignore = "plays audio through the system voice"]
+    fn live_system_tts_speaks() {
+        let mut service = crate::audio::TtsService::new();
+        service.speak(
+            "Haloeth speech test",
+            crate::audio::TtsSettings {
+                backend: crate::config::AudioBackend::System,
+                base_url: String::new(),
+                api_key: String::new(),
+                model: String::new(),
+                voice: String::new(),
+                rate: 0,
+                volume: 40,
+                endpoint: String::new(),
+                headers: Default::default(),
+            },
+        );
+        // 等播报自然结束，覆盖 SAPI 异步读取文本的生命周期。
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        service.stop();
+    }
+
+    /// 工具输出里的用量会被计入按模型统计。
+    #[test]
+    fn tool_usage_blocks_are_detected() {
+        let output = agent::tool::ToolOutput::Blocks(vec![
+            agent::message::ContentBlock::text("Image saved to /tmp/a.png"),
+            agent::message::ContentBlock::text(
+                "__usage__{\"model\":\"img-model\",\"usage\":{\"input_tokens\":12,\"output_tokens\":34}}",
+            ),
+        ]);
+        // 解析逻辑由 agent 侧覆盖；这里确认文本块格式可被解析。
+        let text = match &output {
+            agent::tool::ToolOutput::Blocks(blocks) => blocks
+                .iter()
+                .find_map(|block| match block {
+                    agent::message::ContentBlock::Text(text) => {
+                        text.strip_prefix("__usage__").map(str::to_owned)
+                    }
+                    _ => None,
+                })
+                .expect("usage block"),
+            _ => panic!("expected blocks"),
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["model"], "img-model");
+        assert_eq!(value["usage"]["output_tokens"], 34);
+    }
+
+    /// 真实云端 TTS 播报（会发出声音），手动运行。
+    #[test]
+    #[ignore = "plays cloud TTS audio"]
+    fn live_cloud_tts_plays() {
+        let Some(key) = std::env::var_os("HALOETH_TEST_KEYS_FILE")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("阿里云千问平台通用：").map(str::to_owned))
+            })
+        else {
+            return;
+        };
+        let mut service = crate::audio::TtsService::new();
+        service.speak(
+            "Haloeth cloud speech test",
+            crate::audio::TtsSettings {
+                backend: crate::config::AudioBackend::Cloud,
+                base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
+                api_key: key.trim().to_owned(),
+                model: "qwen3-tts-flash".into(),
+                voice: "Cherry".into(),
+                rate: 0,
+                volume: 80,
+                endpoint: String::new(),
+                headers: Default::default(),
+            },
+        );
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        service.stop();
+    }
+
+    /// 用量提示按模型列出 Token。
+    #[test]
+    fn usage_tooltip_lists_each_model() {
+        let mut usage = std::collections::BTreeMap::new();
+        usage.insert("deepseek-flash".to_owned(), agent::metrics::TokenUsage::new(1200, 300));
+        usage.insert("glm-5.3-flash".to_owned(), agent::metrics::TokenUsage::new(400, 100));
+
+        let text = crate::usage_tooltip(&usage);
+
+        assert!(text.contains("deepseek-flash：1500 tokens"));
+        assert!(text.contains("glm-5.3-flash：500 tokens"));
+        assert!(text.find("deepseek-flash").unwrap() < text.find("glm-5.3-flash").unwrap());
+    }
+
+    /// 偏好窗口的修改即时生效，无需保存按钮。
+    #[gpui_kit::test]
+    async fn preferences_apply_changes_immediately(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::General, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("theme:dark", cx);
+            window.render_frame(cx);
+            window.click("send-key:secondary-enter", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(gpui_kit::component::Theme::global(cx).mode.is_dark());
+            assert_eq!(
+                haloeth.read(cx).session.read(cx).config().ui.send_key,
+                crate::config::SendKey::SecondaryEnter
+            );
+            assert_eq!(
+                haloeth.read(cx).composer.read(cx).send_key(),
+                crate::config::SendKey::SecondaryEnter
+            );
+        });
+    }
+
+    /// 拖动输入框上方的拖动条可以调整高度。
+    #[gpui_kit::test]
+    fn composer_can_be_resized_by_dragging(cx: &mut TestAppContext) {
+        let (_haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let before = window.find("buffer").bounds().size.height;
+            window.drag_to("composer-resize", "conversation", cx);
+            window.render_frame(cx);
+            let after = window.find("buffer").bounds().size.height;
+            assert!(after > before, "拖动后应更高：{before:?} -> {after:?}");
+        })
+        .unwrap();
+    }
+
+    /// 点击对话里的图片会打开独立查看窗口。
+    #[gpui_kit::test]
+    async fn clicking_an_image_opens_the_viewer(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let path = std::env::temp_dir().join("haloeth-click-image.png");
+        let image = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255]));
+        image.save(&path).expect("image");
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.conversation.update(cx, |conversation, cx| {
+                    conversation.push_images(&[path.display().to_string()], cx);
+                });
+            });
+        });
+        let before = cx.update(|cx| cx.windows().len());
+        let target = gpui_kit::ElementId::Name(format!("image-open:{}", path.display()).into());
+        for _ in 0..20 {
+            cx.update_window(handle, |_, window, cx| window.render_frame(cx)).ok();
+            let visible = cx
+                .update_window(handle, |_, window, _| {
+                    window.try_find(target.clone()).is_some_and(|element| element.visible())
+                })
+                .unwrap_or(false);
+            if visible {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click(target.clone(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let windows = cx.update(|cx| cx.windows());
+        assert!(windows.len() > before, "应打开图片窗口");
+        let viewer =
+            windows.into_iter().find(|candidate| *candidate != handle).expect("viewer window");
+        cx.wait_for(viewer, Duration::from_secs(1), |window, _| {
+            window.try_find("image-viewer").is_some()
+        })
+        .await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 无模型时点击麦克风 / 播报按钮跳到偏好设置。
+    #[gpui_kit::test]
+    async fn audio_buttons_open_preferences_when_unconfigured(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("mic", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("preferences-window").visible());
+        })
+        .unwrap();
+    }
+
+    /// 无模型时点击播报按钮同样跳到偏好设置。
+    #[gpui_kit::test]
+    async fn speaker_button_opens_preferences_when_unconfigured(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("tts-toggle", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("pref-nav:audio", cx);
+            window.render_frame(cx);
+            assert!(window.find("asr-backend:system").visible());
+            assert!(window.find("tts-backend:system").visible());
+            assert!(window.find("asr-model").visible());
+            assert!(window.find("tts-model").visible());
+            assert!(window.find("asr-test").visible());
+            assert!(window.find("tts-test").visible());
+            assert!(window.find("asr-device").visible());
+        })
+        .unwrap();
+    }
+
+    /// 工具页展示生成工具的模型选择。
+    #[gpui_kit::test]
+    async fn tools_page_lists_generation_models(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::Tools, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("media-model:generate_image").is_some());
+            assert!(window.try_find("media-model:generate_video").is_some());
+            assert!(window.try_find("media-model:generate_music").is_some());
+            assert!(window.try_find("media-advanced:generate_image").is_some());
+        })
+        .unwrap();
+    }
+
+    /// 模型页的模态开关即时写回配置。
+    #[gpui_kit::test]
+    async fn model_modalities_apply_immediately(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        configure(cx, &haloeth, "local", "secret", &["m-a"]);
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_preferences(crate::preferences::PrefSection::Models, window, cx)
+            });
+        })
+        .unwrap();
+        let prefs = preferences_handle(cx, &haloeth);
+        settle_preferences(cx, prefs).await;
+
+        cx.update_window(prefs, |_, window, cx| {
+            window.render_frame(cx);
+            window.scroll("pref-scroll", gpui_kit::ScrollDelta::Lines(point(0., -30.)), cx);
+            window.render_frame(cx);
+            window.click("model-in:local/m-a:image", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let entry = haloeth
+                .read(cx)
+                .session
+                .read(cx)
+                .config()
+                .model_entry("local", "m-a")
+                .cloned()
+                .expect("model");
+            assert!(entry.inputs().contains(&agent::model::Modality::Image));
+        });
     }
 
     /// 主题设置立即切换到深色。
@@ -2179,14 +3823,15 @@ mod tests {
                 assert!(dialog.find("settings-save").visible());
                 // 通用分页：外观与审核模型。
                 assert!(dialog.find("theme:dark").visible());
-                assert!(dialog.find("settings-reviewer").visible());
+                // 新增的通用项把审核移到首屏下方，存在即可。
+                assert!(dialog.try_find("settings-reviewer").is_some());
                 dialog.click("settings-tab:tools", cx);
             }
             window.render_frame(cx);
             {
                 let mut dialog = window.within("dialog");
                 // 分页内容可能超出首屏，存在即可。
-                assert!(dialog.try_find("tool-toggle:shell").is_some());
+                assert!(dialog.try_find("feature-visible:tool:shell").is_some());
                 assert!(dialog.try_find("settings-search").is_some());
                 dialog.click("settings-tab:mcp", cx);
             }
@@ -2195,9 +3840,206 @@ mod tests {
             window.render_frame(cx);
             let dialog = window.within("dialog");
             assert!(dialog.try_find("skill-dir-add").is_some());
-            assert!(dialog.try_find("skill-create").is_some());
+            assert!(dialog.try_find("skill-new").is_some());
         })
         .unwrap();
+    }
+
+    /// 设置页眉展示当前分页的说明，而不是固定的提示语。
+    #[gpui_kit::test]
+    async fn settings_describes_the_active_tab(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_settings(crate::settings::SettingsTab::General, window, cx)
+            });
+        })
+        .unwrap();
+        settle_dialog(cx, handle).await;
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("settings-description").label(),
+                Some(crate::settings::SettingsTab::General.description())
+            );
+            window.within("dialog").click("settings-tab:mcp", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find("settings-description").label(),
+                Some(crate::settings::SettingsTab::Mcp.description())
+            );
+        })
+        .unwrap();
+    }
+
+    /// 按键偏好保存后立即作用于输入缓冲区。
+    #[gpui_kit::test]
+    async fn settings_switch_the_send_key(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_settings(crate::settings::SettingsTab::General, window, cx)
+            });
+        })
+        .unwrap();
+        settle_dialog(cx, handle).await;
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("dialog").click("send-key:secondary-enter", cx);
+            window.render_frame(cx);
+            window.within("dialog").click("settings-save", cx);
+        })
+        .unwrap();
+        wait_for_dialog_close(cx, handle).await;
+
+        cx.update(|cx| {
+            let haloeth = haloeth.read(cx);
+            assert_eq!(
+                haloeth.session.read(cx).config().ui.send_key,
+                crate::config::SendKey::SecondaryEnter
+            );
+            assert_eq!(
+                haloeth.composer.read(cx).send_key(),
+                crate::config::SendKey::SecondaryEnter
+            );
+        });
+    }
+
+    /// 「新建 MCP 服务器」在独立对话框里收集字段，保存后回到设置列表。
+    #[gpui_kit::test]
+    async fn mcp_form_creates_a_server(cx: &mut TestAppContext) {
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_settings(crate::settings::SettingsTab::Mcp, window, cx)
+            });
+        })
+        .unwrap();
+        settle_dialog(cx, handle).await;
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("dialog").click("mcp-new", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, Duration::from_secs(1), |window, _| {
+            window.try_find("mcp-form-panel").is_some()
+        })
+        .await;
+        std::thread::sleep(Duration::from_millis(200));
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("mcp-form-name", cx);
+            window.input("demo", cx);
+            window.click("mcp-form-command", cx);
+            window.input("npx", cx);
+            window.render_frame(cx);
+            window.click("mcp-form-save", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, Duration::from_secs(1), |window, _| {
+            window.try_find("mcp-form-panel").is_none()
+        })
+        .await;
+        std::thread::sleep(Duration::from_millis(200));
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("feature-visible:mcp:demo").is_some());
+            window.within("dialog").click("settings-save", cx);
+        })
+        .unwrap();
+        wait_for_dialog_close(cx, handle).await;
+
+        cx.update(|cx| {
+            let servers = &haloeth.read(cx).session.read(cx).config().mcp_servers;
+            assert_eq!(servers.len(), 1);
+            assert_eq!(servers[0].name, "demo");
+            assert!(matches!(
+                &servers[0].transport,
+                agent::mcp::McpTransport::Stdio { command, .. } if command == "npx"
+            ));
+        });
+    }
+
+    /// 「新建 Skill」在独立对话框里收集字段，并在所选根目录写入骨架。
+    #[gpui_kit::test]
+    async fn skill_form_creates_a_skill(cx: &mut TestAppContext) {
+        let root =
+            std::env::temp_dir().join(format!("haloeth-skill-form-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("skill root");
+        let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+        let root_text = root.to_string_lossy().to_string();
+        cx.update(|cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.session.update(cx, |session, cx| {
+                    let mut config = session.config().clone();
+                    config.skills.dirs = vec![root_text];
+                    session.apply_config(config, cx);
+                });
+            });
+        });
+
+        cx.update_window(handle, |_, window, cx| {
+            haloeth.update(cx, |haloeth, cx| {
+                haloeth.open_settings(crate::settings::SettingsTab::Skill, window, cx)
+            });
+        })
+        .unwrap();
+        settle_dialog(cx, handle).await;
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            // Skill 分页内容较长，先滚到底部再点「新建」。
+            window.within("dialog").scroll(
+                "settings-panel",
+                gpui_kit::ScrollDelta::Lines(point(0., -30.)),
+                cx,
+            );
+            window.render_frame(cx);
+            window.within("dialog").click("skill-new", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, Duration::from_secs(1), |window, _| {
+            window.try_find("skill-form-panel").is_some()
+        })
+        .await;
+        std::thread::sleep(Duration::from_millis(200));
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("skill-form-name", cx);
+            window.input("demo-skill", cx);
+            window.click("skill-form-description", cx);
+            window.input("演示技能", cx);
+            window.click("skill-form-when", cx);
+            window.input("用户要求演示", cx);
+            window.render_frame(cx);
+            window.click("skill-form-save", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle, Duration::from_secs(1), |window, _| {
+            window.try_find("skill-form-panel").is_none()
+        })
+        .await;
+        std::thread::sleep(Duration::from_millis(200));
+
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("feature-visible:skill:demo-skill").is_some());
+        })
+        .unwrap();
+
+        let text = std::fs::read_to_string(root.join("demo-skill").join("SKILL.md"))
+            .expect("the skill file should be created");
+        assert!(text.contains("when_to_use: 用户要求演示"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 手动审核：拒绝后工具不执行，模型收到拒绝观测后结束

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["agent"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 authors = ["TrifingZW <email@gmail.com>"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
@@ -27,7 +27,12 @@ agent = { path = "agent" }
 chrono = "0.4.45"
 directories = "6.0.0"
 rfd = "0.18.0"
-gpui-kit = "0.9.1"
+cpal = "0.15.3"
+smallvec = "1.16.5"
+smol = "2.0.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+reqwest = { workspace = true, features = ["blocking", "multipart"] }
+gpui-kit = { version = "0.9.1", features = ["speech"] }
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3.27.0"
@@ -41,6 +46,20 @@ uuid = { version = "1.29.2", features = ["v4", "serde"] }
 async-trait = "0.1.92"
 gpui-kit = { version = "0.9.1", features = ["test-support"] }
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_Speech",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [profile.release]
 opt-level = "z"
 lto = "fat"
@@ -53,3 +72,6 @@ debug-assertions = false
 overflow-checks = false
 incremental = false
 rpath = false
+
+[build-dependencies]
+embed-resource = "=3.0.12"

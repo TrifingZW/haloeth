@@ -159,21 +159,45 @@ pub fn select(mut skills: Vec<Skill>, enabled: &[String]) -> Vec<Skill> {
     skills
 }
 
-/// 在指定目录下创建一个 Skill 骨架，返回目录路径。
-pub fn create_skill(root: &Path, name: &str, description: &str) -> std::io::Result<PathBuf> {
+/// 在指定目录下创建一个 Skill 骨架，并写入触发条件。
+///
+/// frontmatter 用 `serde_yaml_ng` 序列化，名称或描述里的冒号、引号与换行
+/// 由 YAML 规则转义，不会破坏格式。
+pub fn create_skill(
+    root: &Path,
+    name: &str,
+    description: &str,
+    when_to_use: &str,
+) -> std::io::Result<PathBuf> {
     let dir = root.join(safe_dir_name(name));
     std::fs::create_dir_all(&dir)?;
     let skill_file = dir.join(SKILL_FILE);
     if !skill_file.exists() {
-        let description = description.trim();
+        let meta = SkillMeta {
+            name: Some(name.trim().to_owned()),
+            description: description.trim().to_owned(),
+            when_to_use: when_to_use.trim().to_owned(),
+        };
+        let frontmatter = serde_yaml_ng::to_string(&meta).unwrap_or_default();
         let text = format!(
-            "---\nname: {name}\ndescription: {description}\nwhen_to_use: \n---\n\n\
+            "---\n{frontmatter}---\n\n\
              Describe here how the agent should complete tasks with this skill.\n\
              Mention any scripts or resources stored next to this file.\n"
         );
         std::fs::write(skill_file, text)?;
     }
     Ok(dir)
+}
+
+/// 删除一个 Skill 目录；目录里必须有 `SKILL.md`，避免误删普通目录。
+pub fn delete_skill(root: &Path) -> std::io::Result<()> {
+    if !root.join(SKILL_FILE).is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the directory does not contain SKILL.md",
+        ));
+    }
+    std::fs::remove_dir_all(root)
 }
 
 /// 把名称转为安全的目录名。
@@ -253,7 +277,7 @@ impl Tool for LoadSkillTool {
                     text.push_str(&format!("- {resource}\n"));
                 }
             }
-            Ok(Value::String(text))
+            Ok(Value::String(text).into())
         })
     }
 }
@@ -360,12 +384,21 @@ mod tests {
     fn creating_a_skill_writes_a_skeleton() {
         let root = workspace("create");
 
-        let dir = create_skill(&root, "My Skill", "Does things").expect("create");
+        let dir = create_skill(&root, "My Skill", "Does: things", "the user asks for it")
+            .expect("create");
 
         let text = std::fs::read_to_string(dir.join(SKILL_FILE)).expect("skeleton");
         assert_eq!(dir.file_name().unwrap(), "My Skill");
-        assert!(text.starts_with("---\nname: My Skill\ndescription: Does things\n"));
-        assert!(discover(&[root]).len() == 1);
+        let (meta, body) = parse_skill(&text).expect("the generated frontmatter should parse");
+        assert_eq!(meta.name.as_deref(), Some("My Skill"));
+        assert_eq!(meta.description, "Does: things");
+        assert_eq!(meta.when_to_use, "the user asks for it");
+        assert!(body.contains("Describe here"));
+        assert!(discover(std::slice::from_ref(&root)).len() == 1);
+
+        delete_skill(&dir).expect("delete");
+        assert!(discover(std::slice::from_ref(&root)).is_empty());
+        assert!(delete_skill(&root).is_err(), "普通目录不能被当作 Skill 删除");
     }
 
     /// 在同步测试里驱动一个已完成的 future。

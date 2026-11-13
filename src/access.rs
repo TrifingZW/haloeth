@@ -7,14 +7,14 @@ use agent::tool::Access;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{TestSupportExt as _, h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::Haloeth;
 use crate::session::Session;
-use crate::ui::{Tone, cancel_button, tinted};
+use crate::ui::{Tone, cancel_button, input_frame, pick_folder, tinted};
 
 /// 目录授权面板。
 pub struct AccessForm {
@@ -249,7 +249,29 @@ impl Render for AccessForm {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(Input::new(&self.path).id("access-path").cleanable(true).flex_1())
+                    .child(input_frame(&self.path, "access-path", true, cx).flex_1())
+                    .child(
+                        Button::new("access-pick")
+                            .outline()
+                            .border_2()
+                            .xsmall()
+                            .icon(IconName::FolderOpen)
+                            .tooltip("选择目录")
+                            .accessibility_label("选择目录")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let path = this.path.clone();
+                                pick_folder(
+                                    window,
+                                    cx,
+                                    "选择授权目录",
+                                    move |_, selected, window, cx| {
+                                        path.update(cx, |state, cx| {
+                                            state.set_value(selected, window, cx)
+                                        });
+                                    },
+                                );
+                            })),
+                    )
                     .child(
                         tinted(
                             Button::new("access-mode").outline().border_2().xsmall(),
