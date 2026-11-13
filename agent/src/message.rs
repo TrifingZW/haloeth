@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 ///
 /// 前三个角色与提供方协议一致；后两个角色用于区分「工具调用指令」与「工具执行结果」，
 /// 投影为提供方协议时分别并入助手消息与工具消息。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     /// 系统指令。
     System,
@@ -25,7 +25,7 @@ pub enum Role {
 }
 
 /// 消息内容块。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ContentBlock {
     /// 文本块。
     Text(String),
@@ -54,7 +54,7 @@ impl ContentBlock {
 }
 
 /// 图像数据来源。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ImageSource {
     /// 资源地址。
     Url(String),
@@ -81,7 +81,7 @@ impl ImageSource {
 }
 
 /// 一次工具调用。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     /// 调用标识符，用于关联工具执行结果。
     pub id: String,
@@ -92,7 +92,7 @@ pub struct ToolCall {
 }
 
 /// 一条对话消息。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     /// 内部角色。
     pub role: Role,
@@ -172,6 +172,8 @@ impl Message {
 pub struct StreamDelta {
     /// 文本增量。
     pub content: Option<String>,
+    /// 推理过程增量（提供方的 `reasoning_content` 等字段），不进入上下文。
+    pub reasoning: Option<String>,
     /// 工具调用分片。
     pub tool_calls: Vec<ToolCallDelta>,
     /// 本帧携带的 **Token** 用量。

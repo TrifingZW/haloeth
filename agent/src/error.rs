@@ -6,7 +6,7 @@ use std::error::Error;
 use std::fmt;
 
 /// 工具契约相关的错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ToolError {
     /// 工具元数据不合法。
     InvalidSpec {
@@ -39,6 +39,18 @@ pub enum ToolError {
         /// 失败原因。
         reason: String,
     },
+    /// 调用被审核策略拒绝。
+    Denied {
+        /// 工具名称。
+        name: String,
+        /// 拒绝原因。
+        reason: String,
+    },
+    /// 运行在调用执行前被取消。
+    Cancelled {
+        /// 工具名称。
+        name: String,
+    },
 }
 
 impl fmt::Display for ToolError {
@@ -62,6 +74,13 @@ impl fmt::Display for ToolError {
                 name,
                 reason,
             } => write!(f, "tool '{name}' failed: {reason}"),
+            Self::Denied {
+                name,
+                reason,
+            } => write!(f, "tool '{name}' was denied: {reason}"),
+            Self::Cancelled {
+                name,
+            } => write!(f, "tool '{name}' was cancelled before it ran"),
         }
     }
 }
@@ -69,7 +88,7 @@ impl fmt::Display for ToolError {
 impl Error for ToolError {}
 
 /// 模型契约相关的错误。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ModelError {
     /// 请求序列化失败。
     Encode {
@@ -120,7 +139,7 @@ impl Error for ModelError {}
 /// 代理循环错误。
 ///
 /// 可恢复性即错误分类：仅模型生成失败为致命错误，其余错误均以文本形式回灌上下文并进入下一轮。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AgentError {
     /// 模型输出无法解析为动作。
     Parsing {
@@ -133,12 +152,17 @@ pub enum AgentError {
     Generation(ModelError),
     /// 达到最大步数。
     MaxSteps,
+    /// 运行准备失败（缺少模型、装配工具失败等）。
+    Setup {
+        /// 失败原因。
+        reason: String,
+    },
 }
 
 impl AgentError {
     /// 判断错误是否致命。
     pub fn is_fatal(&self) -> bool {
-        matches!(self, Self::Generation(_))
+        matches!(self, Self::Generation(_) | Self::Setup { .. })
     }
 }
 
@@ -151,6 +175,9 @@ impl fmt::Display for AgentError {
             Self::Tool(error) => error.fmt(f),
             Self::Generation(error) => error.fmt(f),
             Self::MaxSteps => f.write_str("reached the maximum number of steps"),
+            Self::Setup {
+                reason,
+            } => write!(f, "failed to set up the run: {reason}"),
         }
     }
 }

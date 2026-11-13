@@ -5,7 +5,6 @@
 //! 请求体与响应体均经 `serde_json` 自行编解码。
 
 use std::fmt;
-use std::future::Future;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -89,6 +88,32 @@ pub struct HttpModelOptions {
     pub send_stop_sequences: bool,
     /// 是否请求流式 **Token** 用量。
     pub stream_usage: bool,
+    /// 工具选择策略；思考型模型不接受 `required`，默认发送 `auto`。
+    pub tool_choice: ToolChoicePolicy,
+}
+
+/// 发送给提供方的工具选择策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolChoicePolicy {
+    /// 发送 `auto`：由模型决定是否调用工具。思考型模型（如 DeepSeek）只接受这一项。
+    #[default]
+    Auto,
+    /// 发送 `required`：强制调用工具；部分思考型模型会拒绝。
+    Required,
+    /// 完全不发送 `tool_choice` 字段。
+    Omit,
+}
+
+impl ToolChoicePolicy {
+    /// 配置中的取值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Required => "required",
+            Self::Omit => "omit",
+        }
+    }
 }
 
 impl HttpModelOptions {
@@ -101,6 +126,7 @@ impl HttpModelOptions {
             extras: Map::new(),
             send_stop_sequences: true,
             stream_usage: true,
+            tool_choice: ToolChoicePolicy::default(),
         }
     }
 
@@ -127,6 +153,12 @@ impl HttpModelOptions {
         self.stream_usage = enabled;
         self
     }
+
+    /// 设置工具选择策略。
+    pub fn tool_choice(mut self, policy: ToolChoicePolicy) -> Self {
+        self.tool_choice = policy;
+        self
+    }
 }
 
 impl fmt::Debug for HttpModelOptions {
@@ -138,6 +170,7 @@ impl fmt::Debug for HttpModelOptions {
             .field("extras", &self.extras)
             .field("send_stop_sequences", &self.send_stop_sequences)
             .field("stream_usage", &self.stream_usage)
+            .field("tool_choice", &self.tool_choice)
             .finish()
     }
 }
@@ -194,10 +227,16 @@ impl HttpModel {
         if !request.tools.is_empty() {
             body.insert("tools".into(), serde_json::to_value(&request.tools).map_err(encode)?);
             if request.tool_choice != ToolChoice::None {
-                body.insert(
-                    "tool_choice".into(),
-                    Value::String(request.tool_choice.as_str().to_owned()),
-                );
+                // 请求要求必须调用工具时，按后端策略决定实际发送的取值：
+                // 思考型模型只接受 `auto`，另一些模型需要 `required` 才会调用工具。
+                let policy = match self.options.tool_choice {
+                    ToolChoicePolicy::Auto => Some("auto"),
+                    ToolChoicePolicy::Required => Some("required"),
+                    ToolChoicePolicy::Omit => None,
+                };
+                if let Some(policy) = policy {
+                    body.insert("tool_choice".into(), Value::String(policy.to_owned()));
+                }
             }
         }
         if self.options.send_stop_sequences && !request.stop_sequences.is_empty() {
@@ -210,61 +249,55 @@ impl HttpModel {
     }
 }
 
+#[async_trait::async_trait]
 impl Model for HttpModel {
     fn model_id(&self) -> &str {
         &self.options.model_id
     }
 
-    fn generate<F>(
+    async fn generate(
         &self,
         request: GenerateRequest,
-        mut on_delta: F,
-    ) -> impl Future<Output = Result<Message, ModelError>> + Send
-    where
-        F: FnMut(StreamDelta) + Send,
-    {
-        async move {
-            let body = self.request_body(&request)?;
-            let payload = serde_json::to_vec(&body).map_err(|error| ModelError::Encode {
+        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+    ) -> Result<Message, ModelError> {
+        let body = self.request_body(&request)?;
+        let payload = serde_json::to_vec(&body).map_err(|error| ModelError::Encode {
+            reason: error.to_string(),
+        })?;
+
+        let mut builder = self
+            .client
+            .post(self.endpoint())
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if !self.options.api_key.is_empty() {
+            builder = builder.bearer_auth(&self.options.api_key);
+        }
+        let mut response =
+            builder.body(payload).send().await.map_err(|error| ModelError::Transport {
                 reason: error.to_string(),
             })?;
 
-            let mut builder = self
-                .client
-                .post(self.endpoint())
-                .header(reqwest::header::CONTENT_TYPE, "application/json");
-            if !self.options.api_key.is_empty() {
-                builder = builder.bearer_auth(&self.options.api_key);
-            }
-            let mut response =
-                builder.body(payload).send().await.map_err(|error| ModelError::Transport {
-                    reason: error.to_string(),
-                })?;
-
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(ModelError::Rejected {
-                    status: status.as_u16(),
-                    body: truncate(&body, MAX_ERROR_BODY),
-                });
-            }
-
-            let mut decoder = FrameDecoder::default();
-            let mut deltas = Vec::new();
-            while let Some(chunk) =
-                response.chunk().await.map_err(|error| ModelError::Transport {
-                    reason: error.to_string(),
-                })?
-            {
-                for delta in decoder.push(&chunk)? {
-                    on_delta(delta.clone());
-                    deltas.push(delta);
-                }
-            }
-
-            Ok(assemble(deltas))
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ModelError::Rejected {
+                status: status.as_u16(),
+                body: truncate(&body, MAX_ERROR_BODY),
+            });
         }
+
+        let mut decoder = FrameDecoder::default();
+        let mut deltas = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| ModelError::Transport {
+            reason: error.to_string(),
+        })? {
+            for delta in decoder.push(&chunk)? {
+                on_delta(delta.clone());
+                deltas.push(delta);
+            }
+        }
+
+        Ok(assemble(deltas))
     }
 }
 
@@ -331,6 +364,9 @@ struct ResponseChoice {
 struct ResponsePayload {
     #[serde(default)]
     content: Option<String>,
+    /// 推理过程文本，常见于推理类模型（`reasoning_content`）。
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ResponseCall>>,
 }
@@ -372,6 +408,7 @@ impl Response {
         let payload = payload.unwrap_or_default();
         StreamDelta {
             content: payload.content.filter(|text| !text.is_empty()),
+            reasoning: payload.reasoning_content.filter(|text| !text.is_empty()),
             tool_calls: payload
                 .tool_calls
                 .unwrap_or_default()
@@ -424,6 +461,34 @@ mod tests {
         )
     }
 
+    /// 真实提供商联调：思考型模型只接受 `auto`，且仍会调用工具。
+    ///
+    /// 设置 `DEEPSEEK_API_KEY` 后运行：
+    /// `cargo test -p agent live_deepseek -- --ignored`
+    #[tokio::test]
+    #[ignore = "requires DEEPSEEK_API_KEY"]
+    async fn live_deepseek_accepts_the_default_tool_choice() {
+        let Ok(key) = std::env::var("DEEPSEEK_API_KEY") else {
+            panic!("set DEEPSEEK_API_KEY to run this test");
+        };
+        let model = HttpModel::new(
+            HttpModelOptions::new("deepseek-flash", key).base_url("https://api.deepseek.com"),
+        );
+        let spec = ToolSpec::new("echo", "Echoes the given text.", InputType::String)
+            .input("text", InputSpec::new(InputType::String, "Text to echo."));
+        let request =
+            GenerateRequest::new(vec![Message::user("Use the echo tool to echo the word ping.")])
+                .tools(vec![WireTool::from_spec(&spec)]);
+
+        let mut sink = |_delta: StreamDelta| {};
+        let message = model.generate(request, &mut sink).await.expect("request should succeed");
+
+        assert!(
+            !message.tool_calls.is_empty(),
+            "the model should call a tool without tool_choice=required"
+        );
+    }
+
     #[test]
     fn builds_request_body_with_tools_and_stream_options() {
         let request = GenerateRequest::new(vec![Message::user("hi")])
@@ -437,8 +502,23 @@ mod tests {
         assert_eq!(body["stream_options"], json!({ "include_usage": true }));
         assert_eq!(body["messages"], json!([{ "role": "user", "content": "hi" }]));
         assert_eq!(body["tools"][0]["function"]["name"], "search");
-        assert_eq!(body["tool_choice"], "required");
+        assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["stop"], json!(["Observation:"]));
+    }
+
+    #[test]
+    fn tool_choice_policy_controls_the_wire_value() {
+        let request = GenerateRequest::new(vec![Message::user("hi")]).tools(vec![search_tool()]);
+
+        let auto = HttpModel::new(HttpModelOptions::new("m", ""));
+        let required =
+            HttpModel::new(HttpModelOptions::new("m", "").tool_choice(ToolChoicePolicy::Required));
+        let omit =
+            HttpModel::new(HttpModelOptions::new("m", "").tool_choice(ToolChoicePolicy::Omit));
+
+        assert_eq!(auto.request_body(&request).expect("body")["tool_choice"], "auto");
+        assert_eq!(required.request_body(&request).expect("body")["tool_choice"], "required");
+        assert!(omit.request_body(&request).expect("body").get("tool_choice").is_none());
     }
 
     #[test]

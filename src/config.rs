@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use agent::approval::ApprovalMode;
 use serde::{Deserialize, Serialize};
 
 /// **API** 密钥的环境变量名。
@@ -42,6 +43,9 @@ pub struct Provider {
     /// 模型标识目录。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// 工具选择策略；思考型提供商（如 DeepSeek）需要 `auto`。
+    #[serde(default)]
+    pub tool_choice: agent::openai::ToolChoicePolicy,
 }
 
 impl Provider {
@@ -56,6 +60,7 @@ impl Provider {
             base_url: base_url.into(),
             api_key: api_key.into(),
             models: Vec::new(),
+            tool_choice: agent::openai::ToolChoicePolicy::default(),
         }
     }
 
@@ -83,12 +88,13 @@ impl std::fmt::Debug for Provider {
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
             .field("models", &self.models.len())
+            .field("tool_choice", &self.tool_choice)
             .finish()
     }
 }
 
 /// 运行配置：提供商列表与当前模型。
-#[derive(Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// 全部提供商。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -99,6 +105,220 @@ pub struct Config {
     /// 当前模型标识。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_model: Option<String>,
+    /// 审核设置。
+    #[serde(default)]
+    pub approval: ApprovalConfig,
+    /// 搜索设置。
+    #[serde(default)]
+    pub search: SearchConfig,
+    /// 工具设置。
+    #[serde(default)]
+    pub tools: ToolsConfig,
+    /// 存储设置。
+    #[serde(default)]
+    pub storage: StorageConfig,
+    /// MCP 服务器。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<agent::mcp::McpServerConfig>,
+    /// Skill 设置。
+    #[serde(default)]
+    pub skills: SkillsConfig,
+    /// 界面设置。
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+/// 界面设置。
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// 配色方案。
+    #[serde(default)]
+    pub theme: ThemePreference,
+}
+
+/// 配色方案偏好。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    /// 跟随系统。
+    #[default]
+    System,
+    /// 浅色。
+    Light,
+    /// 深色。
+    Dark,
+}
+
+impl ThemePreference {
+    /// 配置中的取值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    /// 界面展示文本。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "跟随系统",
+            Self::Light => "浅色",
+            Self::Dark => "深色",
+        }
+    }
+}
+
+/// Skill 设置。
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    /// 启用的 Skill 名称；为空表示全部启用。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled: Vec<String>,
+    /// 额外的 Skill 根目录。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirs: Vec<String>,
+}
+
+/// 存储设置。
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// 会话目录；为空时使用系统默认目录。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sessions_dir: String,
+    /// 上次打开的会话标识符。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_session: String,
+}
+
+/// 审核设置。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalConfig {
+    /// 审核模式。
+    #[serde(default)]
+    pub mode: ApprovalMode,
+    /// 规则模式下是否自动放行公网网络访问。
+    #[serde(default)]
+    pub allow_network: bool,
+    /// 审核模型设置。
+    #[serde(default)]
+    pub reviewer: ReviewerConfig,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            mode: ApprovalMode::Manual,
+            allow_network: false,
+            reviewer: ReviewerConfig::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ApprovalConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApprovalConfig")
+            .field("mode", &self.mode)
+            .field("allow_network", &self.allow_network)
+            .field("reviewer", &self.reviewer)
+            .finish()
+    }
+}
+
+/// 审核模型设置：可以复用当前对话模型，也可以单独指定。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewerConfig {
+    /// 是否使用当前对话模型。
+    #[serde(default)]
+    pub use_current: bool,
+    /// 单独指定的提供商名称。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// 单独指定的模型标识。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model: String,
+}
+
+impl Default for ReviewerConfig {
+    fn default() -> Self {
+        Self {
+            use_current: true,
+            provider: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ReviewerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReviewerConfig")
+            .field("use_current", &self.use_current)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+/// 搜索设置。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// 是否启用 `web_search`。
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    /// 绑定的提供商名称；为空时使用当前对话提供商。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// 接口地址；为空时由提供商基地址推导。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+    /// 接口密钥；为空时复用提供商密钥。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
+    /// 默认返回结果数。
+    #[serde(default = "default_search_results")]
+    pub max_results: usize,
+}
+
+/// 序列化时的默认值：搜索默认启用。
+fn enabled_by_default() -> bool {
+    true
+}
+
+/// 搜索默认结果数。
+fn default_search_results() -> usize {
+    5
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: String::new(),
+            endpoint: String::new(),
+            api_key: String::new(),
+            max_results: default_search_results(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SearchConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchConfig")
+            .field("enabled", &self.enabled)
+            .field("provider", &self.provider)
+            .field("endpoint", &self.endpoint)
+            .field("api_key", &"<redacted>")
+            .field("max_results", &self.max_results)
+            .finish()
+    }
+}
+
+/// 工具设置。
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolsConfig {
+    /// 需要关闭的工具名称。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled: Vec<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -108,6 +328,13 @@ impl std::fmt::Debug for Config {
             .field("providers", &self.providers)
             .field("active_provider", &self.active_provider)
             .field("active_model", &self.active_model)
+            .field("approval", &self.approval)
+            .field("search", &self.search)
+            .field("tools", &self.tools)
+            .field("storage", &self.storage)
+            .field("mcp_servers", &self.mcp_servers)
+            .field("skills", &self.skills)
+            .field("ui", &self.ui)
             .finish()
     }
 }
@@ -134,6 +361,37 @@ impl Config {
             providers: vec![Provider::new(ENV_PROVIDER, base_url, api_key)],
             active_provider: Some(ENV_PROVIDER.to_owned()),
             active_model: None,
+            ..Self::default()
+        }
+    }
+
+    /// Skill 根目录：用户追加的目录在前，默认目录在后。
+    pub fn skill_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = self
+            .skills
+            .dirs
+            .iter()
+            .map(|dir| PathBuf::from(dir.trim()))
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .collect();
+        if let Some(base) = config_dir() {
+            dirs.push(base.join("skills"));
+        }
+        dirs
+    }
+
+    /// 默认的 Skill 创建目录。
+    pub fn default_skill_dir(&self) -> Option<PathBuf> {
+        config_dir().map(|dir| dir.join("skills"))
+    }
+
+    /// 会话目录：优先使用自定义路径，否则使用系统默认目录。
+    pub fn sessions_root(&self) -> PathBuf {
+        let custom = self.storage.sessions_dir.trim();
+        if custom.is_empty() {
+            crate::session_store::SessionStore::default_root()
+        } else {
+            PathBuf::from(custom)
         }
     }
 
@@ -475,6 +733,49 @@ mod tests {
 
         assert_eq!(config.selection(), Some(("b", "m2")));
         assert_eq!(config.provider().map(|provider| provider.name.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn mcp_and_skill_settings_round_trip_through_toml() {
+        let path = temp_path("mcp");
+        let mut config = Config::default();
+        config.mcp_servers.push(agent::mcp::McpServerConfig {
+            name: "files".into(),
+            enabled: true,
+            transport: agent::mcp::McpTransport::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), "server".into()],
+                env: std::collections::BTreeMap::new(),
+            },
+        });
+        config.skills.enabled.push("pdf".into());
+
+        config.save_to(&path).expect("保存应当成功");
+        let restored = read(&path).expect("应当能读回配置");
+
+        assert_eq!(restored.mcp_servers, config.mcp_servers);
+        assert_eq!(restored.skills, config.skills);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn theme_and_tool_choice_round_trip_through_toml() {
+        let path = temp_path("ui");
+        let mut config = Config::default();
+        config.ui.theme = ThemePreference::Dark;
+        let mut entry = provider("deepseek", &["deepseek-flash"]);
+        entry.tool_choice = agent::openai::ToolChoicePolicy::Required;
+        config.add_provider(entry).expect("新增应当成功");
+
+        config.save_to(&path).expect("保存应当成功");
+        let restored = read(&path).expect("应当能读回配置");
+
+        assert_eq!(restored.ui.theme, ThemePreference::Dark);
+        assert_eq!(restored.providers[0].tool_choice, agent::openai::ToolChoicePolicy::Required);
+        let text = std::fs::read_to_string(&path).expect("读取配置");
+        assert!(text.contains("theme = \"dark\""));
+        assert!(text.contains("tool_choice = \"required\""));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

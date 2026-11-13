@@ -5,6 +5,9 @@
 //! 2) 不提供惰性初始化钩子，需要延迟初始化的实现应自行使用 [`std::sync::OnceLock`]。
 //!
 //! 执行方法返回装箱 future：**Rust** 侧的**HTTP** 工具需要异步等待，而装箱保持契约可作 trait 对象使用。
+//!
+//! 审核相关：工具以 [`ToolEffect`] 声明自己对系统的影响，以 [`ApprovalRequirement`]
+//! 声明是否必须经过审核。`MCP` 工具等无法静态分析的来源声明为 [`ToolEffect::Unknown`]。
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -13,6 +16,61 @@ use std::pin::Pin;
 use serde_json::{Map, Value};
 
 use crate::error::ToolError;
+
+/// 文件访问方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    /// 只读。
+    Read,
+    /// 读写。
+    Write,
+}
+
+/// 工具对系统产生的影响，供审核层判断。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolEffect {
+    /// 读写某个路径；`argument` 是承载路径的参数名。
+    Path {
+        /// 参数名。
+        argument: String,
+        /// 访问方式。
+        access: Access,
+    },
+    /// 执行一条 shell 命令；`argument` 是承载命令的参数名。
+    Command {
+        /// 参数名。
+        argument: String,
+    },
+    /// 访问网络；`argument` 为空时表示地址不来自参数。
+    Network {
+        /// 承载地址的参数名。
+        argument: Option<String>,
+    },
+    /// 无法静态分析：审核层一律升级确认。
+    Unknown,
+}
+
+/// 是否需要经过审核。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApprovalRequirement {
+    /// 永不审核，例如 `final_answer`。
+    Never,
+    /// 交由审核策略决定。
+    #[default]
+    Policy,
+}
+
+/// 参数校验方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Validation {
+    /// 按声明的输入严格校验；内置工具使用。
+    #[default]
+    Strict,
+    /// 跳过本地校验，交给实现方（如 `MCP` 服务器）判断。
+    None,
+}
 
 /// 工具输入与输出的类型集合。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,15 +125,15 @@ impl InputType {
     }
 
     /// 投影为 **JSON Schema** 类型名；图像、音频与任意类型投影为字符串。
-    fn to_wire(self) -> wire::WireType {
+    fn to_wire(self) -> &'static str {
         match self {
-            Self::Boolean => wire::WireType::Boolean,
-            Self::Integer => wire::WireType::Integer,
-            Self::Number => wire::WireType::Number,
-            Self::Array => wire::WireType::Array,
-            Self::Object => wire::WireType::Object,
-            Self::Null => wire::WireType::Null,
-            Self::String | Self::Image | Self::Audio | Self::Any => wire::WireType::String,
+            Self::Boolean => "boolean",
+            Self::Integer => "integer",
+            Self::Number => "number",
+            Self::Array => "array",
+            Self::Object => "object",
+            Self::Null => "null",
+            Self::String | Self::Image | Self::Audio | Self::Any => "string",
         }
     }
 }
@@ -127,6 +185,14 @@ pub struct ToolSpec {
     pub output_type: InputType,
     /// 输出的 **JSON Schema**，仅用于向模型声明结构化返回。
     pub output_schema: Option<Value>,
+    /// 对系统的影响声明。
+    pub effects: Vec<ToolEffect>,
+    /// 是否需要审核。
+    pub approval: ApprovalRequirement,
+    /// 原始参数 **JSON Schema**；存在时直接投影给模型，不按 `inputs` 生成。
+    pub raw_parameters: Option<Value>,
+    /// 参数校验方式。
+    pub validation: Validation,
 }
 
 impl ToolSpec {
@@ -142,6 +208,10 @@ impl ToolSpec {
             inputs: BTreeMap::new(),
             output_type,
             output_schema: None,
+            effects: Vec::new(),
+            approval: ApprovalRequirement::Policy,
+            raw_parameters: None,
+            validation: Validation::Strict,
         }
     }
 
@@ -157,6 +227,30 @@ impl ToolSpec {
         self
     }
 
+    /// 声明一项系统影响。
+    pub fn effect(mut self, effect: ToolEffect) -> Self {
+        self.effects.push(effect);
+        self
+    }
+
+    /// 声明审核要求。
+    pub fn approval(mut self, approval: ApprovalRequirement) -> Self {
+        self.approval = approval;
+        self
+    }
+
+    /// 使用原始参数 **JSON Schema**。
+    pub fn raw_parameters(mut self, schema: Value) -> Self {
+        self.raw_parameters = Some(schema);
+        self
+    }
+
+    /// 设置参数校验方式。
+    pub fn validation(mut self, validation: Validation) -> Self {
+        self.validation = validation;
+        self
+    }
+
     /// 校验元数据合法性。
     pub fn validate(&self) -> Result<(), ToolError> {
         let invalid = |reason: String| ToolError::InvalidSpec {
@@ -166,6 +260,10 @@ impl ToolSpec {
 
         if !is_valid_name(&self.name) {
             return Err(invalid("name must be an identifier of at most 64 characters".into()));
+        }
+        // 参数校验交给实现方时，描述与输入声明可能由外部来源提供，不强制要求。
+        if self.validation == Validation::None {
+            return Ok(());
         }
         if self.description.trim().is_empty() {
             return Err(invalid("description must not be empty".into()));
@@ -181,6 +279,18 @@ impl ToolSpec {
             }
         }
         Ok(())
+    }
+
+    /// 校验并规范化调用参数；校验方式为 [`Validation::None`] 时原样传递对象。
+    pub fn resolve(&self, arguments: &Value) -> Result<Map<String, Value>, ToolError> {
+        match self.validation {
+            Validation::Strict => resolve_arguments(self, arguments),
+            Validation::None => match arguments {
+                Value::Object(map) => Ok(map.clone()),
+                Value::Null => Ok(Map::new()),
+                other => Ok(Map::from_iter([("value".to_owned(), other.clone())])),
+            },
+        }
     }
 
     /// 渲染工具描述，供工具调用空间的系统提示使用。
@@ -235,6 +345,16 @@ impl<F> FunctionTool<F> {
     }
 }
 
+impl Tool for Box<dyn Tool> {
+    fn spec(&self) -> &ToolSpec {
+        self.as_ref().spec()
+    }
+
+    fn invoke<'a>(&'a self, arguments: &'a Map<String, Value>) -> ToolFuture<'a> {
+        self.as_ref().invoke(arguments)
+    }
+}
+
 impl<F> Tool for FunctionTool<F>
 where
     F: Fn(&Map<String, Value>) -> Result<Value, ToolError> + Send + Sync,
@@ -283,13 +403,18 @@ impl ToolSet {
         let tool = self.get(name).ok_or_else(|| ToolError::UnknownTool {
             name: name.to_owned(),
         })?;
-        let resolved = resolve_arguments(tool.spec(), arguments)?;
+        let resolved = tool.spec().resolve(arguments)?;
         tool.invoke(&resolved).await
     }
 
     /// 迭代全部工具，按键名排序。
     pub fn iter(&self) -> impl Iterator<Item = &dyn Tool> {
         self.tools.values().map(Box::as_ref)
+    }
+
+    /// 按名称保留工具。
+    pub fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.tools.retain(|name, _| keep(name));
     }
 
     /// 工具数量。
@@ -374,7 +499,7 @@ pub fn resolve_arguments(
 pub mod wire {
     use super::ToolSpec;
     use serde::Serialize;
-    use std::collections::BTreeMap;
+    use serde_json::{Value, json};
 
     /// 工具声明。
     #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -396,79 +521,47 @@ pub mod wire {
     pub struct WireFunction {
         pub name: String,
         pub description: String,
-        pub parameters: WireParameters,
-    }
-
-    /// 参数模式。
-    #[derive(Debug, Clone, PartialEq, Serialize)]
-    pub struct WireParameters {
-        #[serde(rename = "type")]
-        pub kind: WireObjectKind,
-        pub properties: BTreeMap<String, WireProperty>,
-        pub required: Vec<String>,
-    }
-
-    /// 参数模式的根类型。
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-    #[serde(rename_all = "lowercase")]
-    pub enum WireObjectKind {
-        Object,
-    }
-
-    /// 单个参数的 **JSON Schema** 属性。
-    #[derive(Debug, Clone, PartialEq, Serialize)]
-    pub struct WireProperty {
-        #[serde(rename = "type")]
-        pub kind: WireType,
-        pub description: String,
-    }
-
-    /// **JSON Schema** 类型名。
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-    #[serde(rename_all = "lowercase")]
-    pub enum WireType {
-        String,
-        Boolean,
-        Integer,
-        Number,
-        Array,
-        Object,
-        Null,
+        /// 参数 **JSON Schema**：内置工具按输入声明生成，`MCP` 工具保留服务器原始模式。
+        pub parameters: Value,
     }
 
     impl WireTool {
         /// 由工具元数据投影工具声明。
         pub fn from_spec(spec: &ToolSpec) -> Self {
-            let properties = spec
-                .inputs
-                .iter()
-                .map(|(name, input)| {
-                    let property = WireProperty {
-                        kind: input.ty.to_wire(),
-                        description: input.description.clone(),
-                    };
-                    (name.clone(), property)
-                })
-                .collect();
-            let required = spec
-                .inputs
-                .iter()
-                .filter(|(_, input)| !input.nullable)
-                .map(|(name, _)| name.clone())
-                .collect();
+            let parameters =
+                spec.raw_parameters.clone().unwrap_or_else(|| generated_parameters(spec));
             Self {
                 kind: WireToolKind::Function,
                 function: WireFunction {
                     name: spec.name.clone(),
                     description: spec.description.clone(),
-                    parameters: WireParameters {
-                        kind: WireObjectKind::Object,
-                        properties,
-                        required,
-                    },
+                    parameters,
                 },
             }
         }
+    }
+
+    /// 按输入声明生成参数 **JSON Schema**。
+    fn generated_parameters(spec: &ToolSpec) -> Value {
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for (name, input) in &spec.inputs {
+            properties.insert(
+                name.clone(),
+                json!({
+                    "type": input.ty.to_wire(),
+                    "description": input.description,
+                }),
+            );
+            if !input.nullable {
+                required.push(Value::String(name.clone()));
+            }
+        }
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+        })
     }
 }
 
@@ -515,6 +608,7 @@ mod tests {
             .input("limit", InputSpec::new(InputType::Integer, "Maximum results.").nullable())
     }
 
+    #[allow(clippy::type_complexity)]
     fn search_tool() -> FunctionTool<fn(&Map<String, Value>) -> Result<Value, ToolError>> {
         FunctionTool::new(search_spec(), echo)
     }

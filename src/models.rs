@@ -182,7 +182,7 @@ impl ModelsForm {
             })
         };
 
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, cx| {
             let button_remove = remove.clone();
             let enter_remove = remove.clone();
             alert
@@ -193,10 +193,7 @@ impl ModelsForm {
                 .footer(
                     DialogFooter::new()
                         .child(
-                            Button::new("cancel")
-                                .outline()
-                                .border_2()
-                                .label("取消")
+                            crate::ui::cancel_button("cancel", "取消", cx)
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
                         )
                         .child(Button::new("ok").danger().label("删除").on_click(
@@ -375,10 +372,7 @@ impl ModelsForm {
                 )
             })
             .child(
-                Button::new("models-cancel")
-                    .outline()
-                    .border_2()
-                    .label("取消")
+                crate::ui::cancel_button("models-cancel", "取消", cx)
                     .on_click(|_, window, cx| window.close_dialog(cx)),
             )
             .child(Button::new("models-save").primary().label("保存").on_click({
@@ -503,6 +497,7 @@ impl ModelsForm {
                 cx,
             ))
             .child(field("API 密钥", input_frame(&self.api_key, "provider-key", true, cx), cx))
+            .child(self.render_tool_choice_row(provider, cx))
             .child(self.render_fetch_row(provider, cx))
             .child(self.render_models(provider, &models, entry_selected, cx))
             .child(
@@ -531,6 +526,47 @@ impl ModelsForm {
             })
             .when(expanded, |this| this.content(body))
             .into_any_element()
+    }
+
+    /// 工具选择策略：思考型提供商（如 DeepSeek）需要「自动」，否则会拒绝强制调用。
+    fn render_tool_choice_row(&self, provider: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let current =
+            self.draft.provider_named(provider).map(|entry| entry.tool_choice).unwrap_or_default();
+        h_flex()
+            .items_center()
+            .gap_3()
+            .child(
+                Button::new(provider_id("provider-tool-choice", provider))
+                    .outline()
+                    .border_2()
+                    .xsmall()
+                    .label(format!("工具选择：{}", policy_label(current)))
+                    .tooltip("思考型模型（如 DeepSeek）请选「自动」")
+                    .accessibility_label(format!("工具选择：{}", policy_label(current)))
+                    .on_click(cx.listener({
+                        let key = provider.to_owned();
+                        move |this, _, _, cx| this.cycle_tool_choice(&key, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("自动：由模型决定；必须：强制调用；省略：不发送该字段。"),
+            )
+    }
+
+    /// 在三种工具选择策略之间循环。
+    fn cycle_tool_choice(&mut self, provider: &str, cx: &mut Context<Self>) {
+        if let Some(entry) = self.draft.providers.iter_mut().find(|entry| entry.name == provider) {
+            entry.tool_choice = match entry.tool_choice {
+                agent::openai::ToolChoicePolicy::Auto => agent::openai::ToolChoicePolicy::Required,
+                agent::openai::ToolChoicePolicy::Required => agent::openai::ToolChoicePolicy::Omit,
+                agent::openai::ToolChoicePolicy::Omit => agent::openai::ToolChoicePolicy::Auto,
+            };
+        }
+        cx.notify();
     }
 
     /// 拉取动作与结果提示。
@@ -792,6 +828,15 @@ fn input_frame(
         .focus(|style| style.border_color(cx.theme().ring))
         // 控件默认高 2rem，外框上下各占 2px，因此控件限高 2rem − 4px，字段总高不变
         .child(Input::new(state).id(id).cleanable(cleanable).appearance(false).max_h(rems(1.75)))
+}
+
+/// 工具选择策略的展示文本。
+fn policy_label(policy: agent::openai::ToolChoicePolicy) -> &'static str {
+    match policy {
+        agent::openai::ToolChoicePolicy::Auto => "自动",
+        agent::openai::ToolChoicePolicy::Required => "必须",
+        agent::openai::ToolChoicePolicy::Omit => "省略",
+    }
 }
 
 /// 面板元素的稳定标识：以提供商名称命名空间，避免同名模型互相覆盖。

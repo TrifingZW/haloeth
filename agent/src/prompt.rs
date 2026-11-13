@@ -8,8 +8,17 @@ use crate::tool::ToolSet;
 /// 计划生成的停止标记。
 pub const PLAN_STOP_SEQUENCE: &str = "<end_plan>";
 
-/// 渲染系统提示：循环协议、示例、工具清单、规则与附加指令。
+/// 渲染系统提示（不含 Skill）。
 pub fn system_prompt(tools: &ToolSet, instructions: Option<&str>) -> String {
+    system_prompt_with_skills(tools, instructions, &[])
+}
+
+/// 渲染系统提示：循环协议、示例、工具清单、Skill 清单、规则与附加指令。
+pub fn system_prompt_with_skills(
+    tools: &ToolSet,
+    instructions: Option<&str>,
+    skills: &[crate::skill::Skill],
+) -> String {
     let mut prompt = String::from(
         "You are an expert assistant who solves tasks by calling tools. You will be given a task to solve as best you can.\n\
          To do so, you have been given access to a set of tools.\n\
@@ -27,6 +36,15 @@ pub fn system_prompt(tools: &ToolSet, instructions: Option<&str>) -> String {
          Above example used a notional tool that might not exist for you. You only have access to these tools:\n",
     );
     prompt.push_str(&tools.describe());
+    if !skills.is_empty() {
+        prompt.push_str(
+            "\n\nWhen a task matches one of these skills, call load_skill with its name to read the full instructions:\n",
+        );
+        for skill in skills {
+            prompt.push_str(&skill.summary());
+            prompt.push('\n');
+        }
+    }
     prompt.push_str(
         "\n\nHere are the rules you should always follow to solve your task:\n\
          1. Always provide at least one tool call in every step: a step with no tool call fails.\n\
@@ -165,6 +183,23 @@ mod tests {
         assert!(prompt.contains("Always provide at least one tool call"));
         assert!(prompt.contains("make it the only tool call of its step"));
         assert!(prompt.ends_with("Now begin!"));
+    }
+
+    #[test]
+    fn system_prompt_lists_enabled_skills() {
+        let skill = crate::skill::Skill {
+            name: "pdf".into(),
+            description: "Work with PDFs.".into(),
+            when_to_use: "the user mentions a PDF".into(),
+            body: "Body.".into(),
+            root: std::path::PathBuf::from("."),
+        };
+
+        let prompt = system_prompt_with_skills(&tool_set(), None, &[skill]);
+
+        assert!(prompt.contains("call load_skill"));
+        assert!(prompt.contains("- pdf: Work with PDFs."));
+        assert!(prompt.contains("use when: the user mentions a PDF"));
     }
 
     #[test]

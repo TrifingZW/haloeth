@@ -3,8 +3,13 @@
 //! 与 smolagents 的差异有两点：
 //! 1) 不实现从文本中解析工具调用的回退路径，仅采用提供方原生的工具调用字段。
 //! 2) 停止序列与流式用量的发送由后端配置显式控制，取代按模型名判断的兼容性开关。
+//!
+//! 生成接口以 `&mut dyn FnMut` 交付增量并返回装箱 future：这样 [`Model`] 保持对象安全，
+//! 会话可以用 `Box<dyn Model>` 持有生产模型，在测试中换成脚本模型。
 
-use std::future::Future;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 
 use crate::error::ModelError;
 use crate::message::{Message, StreamDelta};
@@ -79,19 +84,82 @@ impl GenerateRequest {
 /// 模型契约。
 ///
 /// 要求 [`Send`] 与 [`Sync`]：模型由代理持有，其生成过程可能在任意线程上执行。
+/// 流式是唯一路径：非流式响应等价于单帧流式响应，因此实现统一以增量回调交付输出，
+/// 并返回聚合后的完整消息。
+#[async_trait]
 pub trait Model: Send + Sync {
     /// 返回模型标识。
     fn model_id(&self) -> &str;
 
-    /// 生成回复。
-    ///
-    /// 流式是唯一路径：非流式响应等价于单帧流式响应，因此实现统一以增量回调交付输出，
-    /// 并返回聚合后的完整消息。`on_delta` 在增量到达时被调用。
-    fn generate<F>(
+    /// 生成回复；`on_delta` 在增量到达时被调用。
+    async fn generate(
         &self,
         request: GenerateRequest,
-        on_delta: F,
-    ) -> impl Future<Output = Result<Message, ModelError>> + Send
-    where
-        F: FnMut(StreamDelta) + Send;
+        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+    ) -> Result<Message, ModelError>;
+}
+
+#[async_trait]
+impl Model for Box<dyn Model> {
+    fn model_id(&self) -> &str {
+        self.as_ref().model_id()
+    }
+
+    async fn generate(
+        &self,
+        request: GenerateRequest,
+        on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+    ) -> Result<Message, ModelError> {
+        self.as_ref().generate(request, on_delta).await
+    }
+}
+
+/// 模型工厂：会话在每次运行前用它构建模型，测试可注入脚本模型。
+pub type ModelBuilder = Arc<dyn Fn() -> Box<dyn Model> + Send + Sync>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 记录调用的模型，用于验证 `dyn Model` 的对象安全性。
+    struct Echo;
+
+    #[async_trait]
+    impl Model for Echo {
+        fn model_id(&self) -> &str {
+            "echo"
+        }
+
+        async fn generate(
+            &self,
+            request: GenerateRequest,
+            on_delta: &mut (dyn FnMut(StreamDelta) + Send),
+        ) -> Result<Message, ModelError> {
+            on_delta(StreamDelta {
+                content: Some(format!("{} messages", request.messages.len())),
+                ..Default::default()
+            });
+            Ok(Message::assistant("ok"))
+        }
+    }
+
+    #[tokio::test]
+    async fn boxed_models_dispatch_through_the_trait_object() {
+        let model: Box<dyn Model> = Box::new(Echo);
+        assert_eq!(model.model_id(), "echo");
+
+        let mut streamed = String::new();
+        let mut sink = |delta: StreamDelta| {
+            if let Some(text) = delta.content {
+                streamed.push_str(&text);
+            }
+        };
+        let message = model
+            .generate(GenerateRequest::new(vec![Message::user("hi")]), &mut sink)
+            .await
+            .expect("generation should succeed");
+
+        assert_eq!(message.content, vec![crate::message::ContentBlock::text("ok")]);
+        assert_eq!(streamed, "1 messages");
+    }
 }

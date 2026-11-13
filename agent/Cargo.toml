@@ -6,10 +6,23 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "time", "macros", "sync"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rmcp = { version = "3.9.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+async-trait = "0.1.92"
+serde_yaml_ng = "0.10.0"
+scraper = "0.29.0"
+content_inspector = "0.2.4"
+shell-words = "1.1.1"
+dunce = "1.0.5"
+tracing = "0.1.44"
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
+tokio-util = "0.7.20"
+http = "1"
 
 [dev-dependencies]
+rmcp = { version = "3.9.0", default-features = false, features = ["server", "transport-async-rw", "client"] }
+tempfile = "3.27.0"
 tokio = { workspace = true, features = ["macros", "rt"] }
