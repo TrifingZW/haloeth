@@ -133,7 +133,7 @@ impl Tool for WebSearchTool {
                     ),
                 });
             }
-            Ok(Value::String(render_results(query, &body)))
+            Ok(Value::String(render_results(query, &body)).into())
         })
     }
 }

@@ -10,13 +10,15 @@ use gpui_kit::base::{TestSupportExt as _, h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::collapsible::Collapsible;
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Editor, EditorState, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Icon, Selectable as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::{FluentBuilder as _, InteractiveElement as _};
 use gpui_kit::*;
 
 use crate::config::{Config, DEFAULT_BASE_URL, Provider};
 use crate::session::Session;
+use crate::ui::{field, input_frame};
 
 /// 删除提供商的确认动作：对话框按钮与回车确认共用同一实现。
 type ProviderRemoval = Rc<dyn Fn(&mut Window, &mut App)>;
@@ -81,10 +83,23 @@ pub struct ModelsForm {
     api_key: Entity<InputState>,
     /// 待添加的模型标识
     new_model: Entity<InputState>,
+    /// 展开项的附加请求头
+    headers: Entity<EditorState>,
+    /// 展开项的额外请求体
+    extra_body: Entity<EditorState>,
+    /// 模型名称过滤
+    model_filter: Entity<InputState>,
+    /// 是否显示全部模型（避免一次渲染上百行）
+    show_all_models: bool,
     /// 拉取状态
     status: ModelsStatus,
     /// 面板级提示：保存校验与写盘失败
     error: Option<SharedString>,
+    /// 上一次保存成功的配置；即时生效模式用于去重。
+    last_saved: Config,
+    /// 改动后是否自动保存（偏好窗口使用）。
+    auto_save: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl ModelsForm {
@@ -93,12 +108,19 @@ impl ModelsForm {
         window: &mut Window,
         config: &Config,
         session: WeakEntity<Session>,
+        auto_save: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder("提供商名称"));
         let base_url = cx.new(|cx| InputState::new(window, cx).placeholder(DEFAULT_BASE_URL));
         let api_key = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("sk-…"));
         let new_model = cx.new(|cx| InputState::new(window, cx).placeholder("模型标识"));
+        let headers =
+            cx.new(|cx| EditorState::new(window, cx).placeholder("Name: value，每行一个请求头"));
+        let extra_body = cx.new(|cx| {
+            EditorState::new(window, cx).placeholder("额外请求体 JSON，例如 {\"top_p\": 0.9}")
+        });
+        let model_filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索模型…"));
 
         let expanded = config
             .selection()
@@ -112,17 +134,90 @@ impl ModelsForm {
             base_url,
             api_key,
             new_model,
+            headers,
+            extra_body,
+            model_filter,
+            show_all_models: false,
             status: ModelsStatus::Idle,
             error: None,
+            last_saved: config.clone(),
+            auto_save,
+            _subscriptions: Vec::new(),
         };
         form.draft.normalise();
         form.reload_fields(window, cx);
+        for input in [&form.name, &form.base_url, &form.api_key, &form.new_model] {
+            let subscription =
+                cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
+                    if this.auto_save && matches!(event, InputEvent::Change) {
+                        this.save_if_due(cx);
+                    }
+                });
+            form._subscriptions.push(subscription);
+        }
+        for editor in [&form.headers, &form.extra_body] {
+            let subscription =
+                cx.subscribe_in(editor, window, |this, _, event: &InputEvent, _, cx| {
+                    if this.auto_save && matches!(event, InputEvent::Change) {
+                        this.save_if_due(cx);
+                    }
+                });
+            form._subscriptions.push(subscription);
+        }
+        let filter_subscription =
+            cx.subscribe_in(&form.model_filter, window, |_, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            });
+        form._subscriptions.push(filter_subscription);
         form
     }
 
     /// 指定提供商是否正在展开。
     fn is_expanded(&self, provider: &str) -> bool {
         self.expanded.as_deref() == Some(provider)
+    }
+
+    /// 按预设添加提供商。
+    pub fn add_preset(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preset) =
+            crate::config::PROVIDER_PRESETS.iter().find(|preset| preset.name == name)
+        else {
+            return;
+        };
+        match self.draft.add_preset(preset) {
+            Ok(()) => {
+                let added = self.draft.providers.last().map(|provider| provider.name.clone());
+                self.expanded = added;
+                self.error = None;
+            }
+            Err(reason) => self.error = Some(reason.into()),
+        }
+        self.reload_fields(window, cx);
+        cx.notify();
+    }
+
+    /// 从当前会话配置重新载入草稿；切换偏好分页时使用。
+    pub(crate) fn reload_from(
+        &mut self,
+        config: &Config,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.draft = config.clone();
+        self.last_saved = config.clone();
+        self.draft.normalise();
+        self.expanded = self
+            .draft
+            .selection()
+            .map(|(provider, _)| provider.to_owned())
+            .or_else(|| self.draft.providers.first().map(|provider| provider.name.clone()));
+        self.status = ModelsStatus::Idle;
+        self.error = None;
+        self.show_all_models = false;
+        self.reload_fields(window, cx);
+        cx.notify();
     }
 
     /// 展开或收起提供商；切换前先把输入框内容写回草稿。
@@ -221,17 +316,6 @@ impl ModelsForm {
     }
 
     /// 选择模型：只修改草稿，保存后生效。
-    pub fn select_model(&mut self, provider: &str, model: &str, cx: &mut Context<Self>) {
-        if !self.commit_fields(cx) {
-            cx.notify();
-            return;
-        }
-        if let Err(reason) = self.draft.select_model(provider, model) {
-            self.error = Some(reason.into());
-        }
-        cx.notify();
-    }
-
     /// 以输入框中的标识为指定提供商添加模型。
     pub fn add_model(&mut self, provider: &str, window: &mut Window, cx: &mut Context<Self>) {
         if !self.commit_fields(cx) {
@@ -323,6 +407,7 @@ impl ModelsForm {
     }
 
     /// 保存草稿：写入配置文件并应用到会话；返回是否成功。
+    #[allow(dead_code)]
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(config) = self.commit(cx) else {
             return false;
@@ -336,12 +421,42 @@ impl ModelsForm {
         true
     }
 
+    /// 即时生效：草稿有变化时保存一次。
+    pub(crate) fn save_if_due(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.auto_save || !self.commit_fields(cx) {
+            return false;
+        }
+        self.draft.normalise();
+        if self.draft == self.last_saved {
+            return false;
+        }
+        // 即时生效不做密钥校验：允许先添加提供商，再慢慢填写密钥。
+        // 测试注入的会话不写真实配置文件。
+        let persist = self
+            .session
+            .upgrade()
+            .map(|session| session.read(cx).persists_config())
+            .unwrap_or(true);
+        if persist && let Err(error) = self.draft.save() {
+            self.error = Some(format!("保存失败：{error}").into());
+            cx.notify();
+            return false;
+        }
+        self.error = None;
+        let config = self.draft.clone();
+        self.last_saved = config.clone();
+        self.session.update(cx, |session, cx| session.apply_config(config, cx)).ok();
+        true
+    }
+
     /// 提交草稿：写回字段并校验当前模型的提供商已配置密钥；失败时记录提示。
+    #[allow(dead_code)]
     fn commit(&mut self, cx: &mut Context<Self>) -> Option<Config> {
         if !self.commit_fields(cx) {
             cx.notify();
             return None;
         }
+        self.draft.normalise();
         if let Some(provider) = self.draft.provider()
             && !provider.is_configured()
         {
@@ -354,6 +469,7 @@ impl ModelsForm {
     }
 
     /// 面板底部：保存状态与取消、保存动作。
+    #[allow(dead_code)]
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let form = cx.entity();
 
@@ -415,6 +531,12 @@ impl ModelsForm {
         let base_url = self.base_url.read(cx).value().trim().to_owned();
         let api_key = self.api_key.read(cx).value().trim().to_owned();
         self.draft.update_provider(&current, base_url, api_key);
+        let headers = parse_headers(self.headers.read(cx).value().as_ref());
+        let extra_body = parse_extra_body(self.extra_body.read(cx).value().as_ref())?;
+        if let Some(entry) = self.draft.providers.iter_mut().find(|entry| entry.name == current) {
+            entry.headers = headers;
+            entry.extra_body = extra_body;
+        }
         Ok(())
     }
 
@@ -432,6 +554,20 @@ impl ModelsForm {
         self.base_url.update(cx, |state, cx| state.set_value(base_url, window, cx));
         self.api_key.update(cx, |state, cx| state.set_value(api_key, window, cx));
         self.new_model.update(cx, |state, cx| state.set_value("", window, cx));
+        let headers = self
+            .expanded
+            .as_deref()
+            .and_then(|provider| self.draft.provider_named(provider))
+            .map(render_headers)
+            .unwrap_or_default();
+        self.headers.update(cx, |state, cx| state.set_value(headers, window, cx));
+        let extra_body = self
+            .expanded
+            .as_deref()
+            .and_then(|provider| self.draft.provider_named(provider))
+            .map(|provider| render_extra_body(&provider.extra_body))
+            .unwrap_or_default();
+        self.extra_body.update(cx, |state, cx| state.set_value(extra_body, window, cx));
         cx.notify();
     }
 
@@ -445,7 +581,7 @@ impl ModelsForm {
         let entry_selected =
             self.draft.provider().map(|entry| entry.name.as_str()) == Some(provider);
         let endpoint = entry.endpoint();
-        let models = entry.models.clone();
+        let models: Vec<String> = entry.models.iter().map(|model| model.name.clone()).collect();
         let muted = cx.theme().muted_foreground;
         let primary = cx.theme().primary;
 
@@ -497,6 +633,31 @@ impl ModelsForm {
                 cx,
             ))
             .child(field("API 密钥", input_frame(&self.api_key, "provider-key", true, cx), cx))
+            .child(self.render_protocol_row(provider, cx))
+            .child(field(
+                "额外请求体（高级 JSON，最后合并）",
+                div()
+                    .w_full()
+                    .border_2()
+                    .border_color(cx.theme().input)
+                    .rounded(cx.theme().radius)
+                    .child(
+                        Editor::new(&self.extra_body).h(rems(3.)).appearance(false).bordered(false),
+                    ),
+                cx,
+            ))
+            .child(field(
+                "请求头（高级，每行一个 Name: value）",
+                div()
+                    .w_full()
+                    .border_2()
+                    .border_color(cx.theme().input)
+                    .rounded(cx.theme().radius)
+                    .child(
+                        Editor::new(&self.headers).h(rems(4.)).appearance(false).bordered(false),
+                    ),
+                cx,
+            ))
             .child(self.render_tool_choice_row(provider, cx))
             .child(self.render_fetch_row(provider, cx))
             .child(self.render_models(provider, &models, entry_selected, cx))
@@ -526,6 +687,55 @@ impl ModelsForm {
             })
             .when(expanded, |this| this.content(body))
             .into_any_element()
+    }
+
+    /// 协议选择：OpenAI Chat 或 Anthropic Messages。
+    fn render_protocol_row(&self, provider: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let current =
+            self.draft.provider_named(provider).map(|entry| entry.protocol).unwrap_or_default();
+        let mut row = h_flex().items_center().gap_2();
+        for protocol in
+            [agent::model::Protocol::OpenAiChat, agent::model::Protocol::AnthropicMessages]
+        {
+            let selected = current == protocol;
+            let button = Button::new(ElementId::Name(
+                format!("provider-protocol:{provider}:{}", protocol.as_str()).into(),
+            ))
+            .outline()
+            .border_2()
+            .xsmall()
+            .label(protocol.label())
+            .selected(selected)
+            .toggled(selected);
+            let key = provider.to_owned();
+            row = row.child(if selected {
+                crate::ui::tinted(button, crate::ui::Tone::Accent, cx)
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.set_protocol(&key, protocol, cx)),
+                    )
+                    .into_any_element()
+            } else {
+                button
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.set_protocol(&key, protocol, cx)),
+                    )
+                    .into_any_element()
+            });
+        }
+        row
+    }
+
+    /// 修改协议。
+    fn set_protocol(
+        &mut self,
+        provider: &str,
+        protocol: agent::model::Protocol,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.draft.providers.iter_mut().find(|entry| entry.name == provider) {
+            entry.protocol = protocol;
+        }
+        cx.notify();
     }
 
     /// 工具选择策略：思考型提供商（如 DeepSeek）需要「自动」，否则会拒绝强制调用。
@@ -609,63 +819,76 @@ impl ModelsForm {
             })
     }
 
-    /// 模型列表：行内选择当前模型，行尾删除。
+    /// 模型列表：切换启用状态，行尾删除。
     fn render_models(
         &self,
         provider: &str,
         models: &[String],
-        entry_selected: bool,
+        _entry_selected: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mono = cx.theme().mono_font_family.clone();
-        let primary = cx.theme().primary;
         let muted = cx.theme().muted_foreground;
-        let current = entry_selected.then(|| self.draft.model()).flatten();
+        let filter = self.model_filter.read(cx).value().trim().to_lowercase();
+        let matching: Vec<String> = models
+            .iter()
+            .filter(|model| filter.is_empty() || model.to_lowercase().contains(&filter))
+            .cloned()
+            .collect();
+        let total = matching.len();
+        let visible = if self.show_all_models || !filter.is_empty() {
+            120
+        } else {
+            60
+        };
+        let shown: Vec<String> = matching.into_iter().take(visible).collect();
+        let hidden = total.saturating_sub(shown.len());
 
-        let rows: Vec<AnyElement> = models
+        let rows: Vec<AnyElement> = shown
             .iter()
             .map(|model| {
-                let selected = current == Some(model.as_str());
-                let select = Button::new(model_id("model-select", provider, model))
-                    .ghost()
+                let entry = self
+                    .draft
+                    .model_entry(provider, model)
+                    .cloned()
+                    .unwrap_or_else(|| crate::config::ModelEntry::text(model.clone()));
+                let enabled = entry.enabled;
+                let name = div()
                     .flex_1()
-                    .justify_start()
-                    .selected(selected)
-                    .toggled(selected)
-                    .accessibility_label(format!("使用模型「{model}」"))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap_2()
-                            .w_full()
-                            .child(
-                                div().w_4().child(
-                                    Icon::new(if selected {
-                                        IconName::Check
-                                    } else {
-                                        IconName::CircleSmall
-                                    })
-                                    .xsmall()
-                                    .text_color(if selected {
-                                        primary
-                                    } else {
-                                        muted
-                                    }),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .font_family(mono.clone())
-                                    .text_sm()
-                                    .truncate()
-                                    .child(model.clone()),
-                            ),
-                    )
-                    .on_click(cx.listener({
-                        let key = provider.to_owned();
-                        let id = model.clone();
-                        move |this, _, _, cx| this.select_model(&key, &id, cx)
-                    }));
+                    .min_w_0()
+                    .truncate()
+                    .font_family(mono.clone())
+                    .text_sm()
+                    .text_color(if enabled {
+                        cx.theme().foreground
+                    } else {
+                        muted
+                    })
+                    .child(model.clone());
+                let toggle = crate::ui::tinted(
+                    Button::new(model_id("model-enabled", provider, model))
+                        .outline()
+                        .border_2()
+                        .xsmall(),
+                    if enabled {
+                        crate::ui::Tone::Success
+                    } else {
+                        crate::ui::Tone::Danger
+                    },
+                    cx,
+                )
+                .label(if enabled {
+                    "已启用"
+                } else {
+                    "已停用"
+                })
+                .selected(enabled)
+                .toggled(enabled)
+                .on_click(cx.listener({
+                    let key = provider.to_owned();
+                    let id = model.clone();
+                    move |this, _, _, cx| this.toggle_model_enabled(&key, &id, cx)
+                }));
                 let remove = Button::new(model_id("model-remove", provider, model))
                     .ghost()
                     .xsmall()
@@ -678,12 +901,35 @@ impl ModelsForm {
                         move |this, _, _, cx| this.remove_model(&key, &id, cx)
                     }));
 
-                h_flex()
-                    .items_center()
+                let inputs = entry.inputs();
+                let outputs = entry.outputs();
+                let mut toggles = h_flex().items_center().gap_1().pl_6().flex_wrap();
+                toggles = toggles.child(div().text_xs().text_color(muted).child("输入"));
+                for modality in MODALITIES {
+                    let on = inputs.contains(&modality);
+                    toggles =
+                        toggles.child(modality_toggle(provider, model, modality, true, on, cx));
+                }
+                toggles = toggles.child(div().text_xs().text_color(muted).child("输出"));
+                for modality in MODALITIES {
+                    let on = outputs.contains(&modality);
+                    toggles =
+                        toggles.child(modality_toggle(provider, model, modality, false, on, cx));
+                }
+
+                v_flex()
                     .gap_1()
                     .w_full()
-                    .child(select)
-                    .child(remove)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .w_full()
+                            .child(name)
+                            .child(toggle)
+                            .child(remove),
+                    )
+                    .child(toggles)
                     .into_any_element()
             })
             .collect();
@@ -692,6 +938,19 @@ impl ModelsForm {
         v_flex()
             .gap_1()
             .w_full()
+            .when(hidden > 0, |this| {
+                this.child(
+                    Button::new(provider_id("models-show-all", provider))
+                        .outline()
+                        .border_2()
+                        .xsmall()
+                        .label(format!("还有 {hidden} 个未显示，点击显示全部"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_all_models = true;
+                            cx.notify();
+                        })),
+                )
+            })
             .when(empty, |this| {
                 this.child(
                     div()
@@ -747,12 +1006,31 @@ impl Render for ModelsForm {
             .id("models-panel")
             .test_support()
             .gap_5()
+            .when(self.auto_save, |this| {
+                this.when_some(self.error.clone(), |this, error| {
+                    this.child(
+                        div()
+                            .id("models-error")
+                            .role(Role::Status)
+                            .test_support()
+                            .aria_label(error.clone())
+                            .text_xs()
+                            .text_color(cx.theme().danger)
+                            .child(error),
+                    )
+                })
+            })
             .child(
                 div()
                     .text_sm()
                     .text_color(muted)
-                    .child("修改在保存后生效；密钥以明文写入本机配置文件。"),
+                    .child(if self.auto_save {
+                        "修改即时生效；密钥以明文写入本机配置文件。"
+                    } else {
+                        "修改在保存后生效；密钥以明文写入本机配置文件。"
+                    }),
             )
+            .child(input_frame(&self.model_filter, "model-filter", true, cx))
             .when(empty, |this| {
                 this.child(
                     div()
@@ -769,16 +1047,182 @@ impl Render for ModelsForm {
             })
             .children(blocks)
             .child(
-                h_flex().child(
-                    Button::new("provider-add")
-                        .outline()
-                        .border_2()
-                        .icon(IconName::Plus)
-                        .label("添加提供商")
-                        .on_click(cx.listener(|this, _, window, cx| this.add_provider(window, cx))),
-                ),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("provider-add")
+                            .outline()
+                            .border_2()
+                            .icon(IconName::Plus)
+                            .label("添加提供商")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_provider(window, cx)
+                            })),
+                    )
+                    .child({
+                        let form = cx.entity().downgrade();
+                        Button::new("provider-preset")
+                            .outline()
+                            .border_2()
+                            .icon(IconName::BookOpen)
+                            .label("从预设添加")
+                            .dropdown_menu(move |menu, _, _| {
+                                let mut menu = menu.scrollable(true);
+                                for preset in crate::config::PROVIDER_PRESETS {
+                                    let form = form.clone();
+                                    let name = preset.name;
+                                    menu = menu.item(PopupMenuItem::new(name).on_click(
+                                        move |_, window, cx| {
+                                            form.update(cx, |this, cx| {
+                                                this.add_preset(name, window, cx)
+                                            })
+                                            .ok();
+                                        },
+                                    ));
+                                }
+                                menu
+                            })
+                    }),
             )
     }
+}
+
+/// 模型可选的模态。
+const MODALITIES: [agent::model::Modality; 4] = [
+    agent::model::Modality::Text,
+    agent::model::Modality::Image,
+    agent::model::Modality::Audio,
+    agent::model::Modality::Video,
+];
+
+/// 单个模态开关。
+fn modality_toggle(
+    provider: &str,
+    model: &str,
+    modality: agent::model::Modality,
+    input: bool,
+    on: bool,
+    cx: &mut Context<ModelsForm>,
+) -> AnyElement {
+    let direction = if input {
+        "in"
+    } else {
+        "out"
+    };
+    let id = ElementId::Name(
+        format!("model-{direction}:{provider}/{model}:{}", modality.as_str()).into(),
+    );
+    let button = Button::new(id)
+        .outline()
+        .border_2()
+        .xsmall()
+        .label(modality.label())
+        .selected(on)
+        .toggled(on);
+    let key = provider.to_owned();
+    let name = model.to_owned();
+    let button = if on {
+        crate::ui::tinted(button, crate::ui::Tone::Success, cx)
+    } else {
+        button
+    };
+    let models = cx.entity().downgrade();
+    button
+        .on_click(move |_, _, cx| {
+            models
+                .update(cx, |this, cx| this.toggle_modality(&key, &name, modality, input, cx))
+                .ok();
+        })
+        .into_any_element()
+}
+
+impl ModelsForm {
+    /// 切换模型的启用状态；禁用的模型不出现在任何选择器中。
+    fn toggle_model_enabled(&mut self, provider: &str, model: &str, cx: &mut Context<Self>) {
+        if let Some(entry) = self.draft.providers.iter_mut().find(|entry| entry.name == provider)
+            && let Some(model) = entry.models.iter_mut().find(|entry| entry.name == model)
+        {
+            model.enabled = !model.enabled;
+        }
+        self.draft.normalise();
+        cx.notify();
+    }
+
+    /// 切换模型的输入 / 输出模态。
+    fn toggle_modality(
+        &mut self,
+        provider: &str,
+        model: &str,
+        modality: agent::model::Modality,
+        input: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(entry) = self.draft.providers.iter_mut().find(|entry| entry.name == provider)
+            && let Some(model) = entry.models.iter_mut().find(|entry| entry.name == model)
+        {
+            let list = if input {
+                &mut model.input
+            } else {
+                &mut model.output
+            };
+            // 空列表表示隐式文本；第一次切换时先落成显式列表，避免丢掉文本。
+            if list.is_empty() {
+                list.push(agent::model::Modality::Text);
+            }
+            if let Some(index) = list.iter().position(|item| *item == modality) {
+                list.remove(index);
+            } else {
+                list.push(modality);
+            }
+            if list.is_empty() {
+                list.push(agent::model::Modality::Text);
+            }
+        }
+        cx.notify();
+    }
+}
+
+/// 把额外请求体渲染为 JSON 文本。
+fn render_extra_body(body: &std::collections::BTreeMap<String, serde_json::Value>) -> String {
+    if body.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string_pretty(&body).unwrap_or_default()
+    }
+}
+
+/// 解析额外请求体；空文本表示没有，非对象会返回错误。
+fn parse_extra_body(
+    text: &str,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Default::default());
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Object(map)) => Ok(map.into_iter().collect()),
+        Ok(_) => Err("额外请求体必须是 JSON 对象".to_owned()),
+        Err(error) => Err(format!("额外请求体不是合法 JSON：{error}")),
+    }
+}
+
+/// 把请求头渲染为多行文本。
+fn render_headers(provider: &crate::config::Provider) -> String {
+    provider
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 解析 `Name: value` 行；忽略空行与没有冒号的行。
+fn parse_headers(text: &str) -> std::collections::BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+        .filter(|(name, _)| !name.is_empty())
+        .collect()
 }
 
 /// 提供商卡片之间的分隔线。
@@ -797,39 +1241,6 @@ fn provider_divider(provider: &str, cx: &App) -> AnyElement {
 }
 
 /// 带标签的表单字段：标签在上，控件在下。
-fn field(label: &str, control: impl IntoElement, cx: &App) -> impl IntoElement {
-    v_flex()
-        .gap_1()
-        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(label.to_owned()))
-        .child(control)
-}
-
-/// 输入控件外框：边框统一 2px，聚焦只改变边框颜色。
-///
-/// 组件在聚焦时会把自身边框收细为 1px 并补一圈光晕，且不可配置，
-/// 因此背景与边框改由外框绘制，控件自身不绘制表面。
-/// `cleanable` 对应组件的清除按钮。
-fn input_frame(
-    state: &Entity<InputState>,
-    id: &'static str,
-    cleanable: bool,
-    cx: &App,
-) -> impl Styled + IntoElement {
-    let focus_handle = state.read(cx).focus_handle(cx);
-
-    div()
-        .id(ElementId::Name(format!("input-frame:{id}").into()))
-        .test_support()
-        .bg(cx.theme().input_background())
-        .border_2()
-        .border_color(cx.theme().input)
-        .rounded(cx.theme().radius)
-        .track_focus(&focus_handle)
-        .focus(|style| style.border_color(cx.theme().ring))
-        // 控件默认高 2rem，外框上下各占 2px，因此控件限高 2rem − 4px，字段总高不变
-        .child(Input::new(state).id(id).cleanable(cleanable).appearance(false).max_h(rems(1.75)))
-}
-
 /// 工具选择策略的展示文本。
 fn policy_label(policy: agent::openai::ToolChoicePolicy) -> &'static str {
     match policy {

@@ -6,13 +6,14 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::{TestSupportExt as _, h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::Haloeth;
 use crate::session_store::{SessionStore, SessionSummary};
+use crate::ui::input_frame;
 
 /// 会话对话框：列表与当前会话的标题编辑。
 pub struct SessionsForm {
@@ -72,13 +73,9 @@ impl SessionsForm {
         let Some(haloeth) = self.haloeth.upgrade() else {
             return;
         };
-        let before = haloeth.read(cx).active_id().to_owned();
+        let busy = haloeth.read(cx).session.read(cx).status().is_busy();
         haloeth.update(cx, |haloeth, cx| haloeth.create_session(cx));
-        if haloeth.read(cx).active_id() == before {
-            self.error = Some("运行中不能新建会话，请先停止。".into());
-        } else {
-            self.error = None;
-        }
+        self.error = busy.then(|| "运行中不能新建会话，请先停止。".into());
         self.refresh(cx);
     }
 
@@ -246,7 +243,7 @@ impl Render for SessionsForm {
                 h_flex()
                     .items_center()
                     .gap_2()
-                    .child(Input::new(&self.rename).cleanable(true))
+                    .child(input_frame(&self.rename, "session-rename", true, cx))
                     .child(
                         Button::new("sessions-rename")
                             .outline()

@@ -27,6 +27,14 @@ impl TokenUsage {
     pub fn total(self) -> u32 {
         self.input_tokens + self.output_tokens
     }
+
+    /// 逐字段相减，避免下溢。
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self::new(
+            self.input_tokens.saturating_sub(other.input_tokens),
+            self.output_tokens.saturating_sub(other.output_tokens),
+        )
+    }
 }
 
 impl Add for TokenUsage {

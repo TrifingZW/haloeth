@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use serde_json::{Map, Value};
 
-use crate::approval::{AllowAll, ApprovalGate, ApprovalRequest};
+use crate::approval::{AllowAll, ApprovalGate, ApprovalRequest, DirectoryGrant};
 use crate::error::{AgentError, ToolError};
 use crate::memory::{
     ActionStep, FinalAnswerStep, Memory, PlanningStep, Step, TaskStep, ToolOutcome,
@@ -97,6 +97,15 @@ pub enum Activity {
         /// 计划正文。
         plan: String,
     },
+    /// 工具产出了可以在对话中展示的本地图片。
+    Images(Vec<String>),
+    /// 工具调用自身消耗的 **Token**（例如生成类模型）。
+    ToolUsage {
+        /// 模型标识。
+        model: String,
+        /// 本次消耗。
+        usage: TokenUsage,
+    },
 }
 
 /// 运行结束状态。
@@ -158,6 +167,8 @@ pub struct Agent<M> {
     planning_interval: Option<u32>,
     instructions: Option<String>,
     skills: Vec<crate::skill::Skill>,
+    /// 当前会话授权的目录；写进系统提示，让模型知道工作区边界。
+    workspace: Vec<DirectoryGrant>,
     interrupt: Interrupt,
     gate: Arc<dyn ApprovalGate>,
 }
@@ -177,6 +188,7 @@ impl<M: Model> Agent<M> {
             planning_interval: None,
             instructions: None,
             skills: Vec::new(),
+            workspace: Vec::new(),
             interrupt: Interrupt::default(),
             gate: Arc::new(AllowAll),
         })
@@ -208,6 +220,13 @@ impl<M: Model> Agent<M> {
     /// 设置已启用的 Skill；系统提示会列出它们的元数据。
     pub fn with_skills(mut self, skills: Vec<crate::skill::Skill>) -> Self {
         self.skills = skills;
+        self.refresh_system_prompt();
+        self
+    }
+
+    /// 设置当前会话授权的目录；系统提示会说明工作区与相对路径基准。
+    pub fn with_workspace(mut self, workspace: Vec<DirectoryGrant>) -> Self {
+        self.workspace = workspace;
         self.refresh_system_prompt();
         self
     }
@@ -311,6 +330,8 @@ impl<M: Model> Agent<M> {
                 self.register(Step::Planning(step), &mut on_event);
             }
 
+            // 审核模型需要看到用户的要求与之前的步骤，才能判断当前调用是否合理。
+            self.gate.set_context(self.review_context());
             let step = self.action_step(number, &mut on_event).await?;
             let finished = step.is_final_answer;
             let output = step.output.clone();
@@ -354,18 +375,30 @@ impl<M: Model> Agent<M> {
         })
     }
 
+    /// 审核模型可见的上下文：最近若干条消息，且只保留文本，避免把图片与音频整段复制。
+    fn review_context(&self) -> Vec<crate::message::Message> {
+        let mut context = self.memory.history();
+        let skip = context.len().saturating_sub(16);
+        context.drain(..skip);
+        for message in &mut context {
+            message.content.retain(|block| matches!(block, crate::message::ContentBlock::Text(_)));
+        }
+        context
+    }
+
     /// 判断当前步号是否应生成计划。
     fn should_plan(&self, number: u32) -> bool {
         self.planning_interval
             .is_some_and(|interval| number == 1 || (number - 1).is_multiple_of(interval))
     }
 
-    /// 用当前工具集与指令刷新系统提示。
+    /// 用当前工具集、指令、Skill 与工作区刷新系统提示。
     fn refresh_system_prompt(&mut self) {
-        self.memory.system_prompt = prompt::system_prompt_with_skills(
+        self.memory.system_prompt = prompt::system_prompt_with_context(
             &self.tools,
             self.instructions.as_deref(),
             &self.skills,
+            &self.workspace,
         );
     }
 
@@ -411,9 +444,18 @@ impl<M: Model> Agent<M> {
         };
 
         if calls.is_empty() {
-            step.error = Some(AgentError::Parsing {
-                reason: "the model replied without calling any tool".into(),
-            });
+            // 并非所有提供商都会遵守 `tool_choice`（思考型模型只接受 `auto`），
+            // 此时模型常常直接用文本作答。文本回复本身就是合法的最终答案，
+            // 当成解析失败会把同一轮对话重试到最大步数，日志与界面里全是错误。
+            let text = step.model_output.as_ref().map(message_text).unwrap_or_default();
+            if text.trim().is_empty() {
+                step.error = Some(AgentError::Parsing {
+                    reason: "the model replied without calling any tool".into(),
+                });
+            } else {
+                step.output = Some(Value::String(text));
+                step.is_final_answer = true;
+            }
             step.timing.finish();
             return Ok(step);
         }
@@ -428,8 +470,8 @@ impl<M: Model> Agent<M> {
         for call in calls {
             let is_final_answer = call.name == FINAL_ANSWER;
             let result = self.execute_call(number, &call, on_event).await;
-            if is_final_answer && let Ok(value) = &result {
-                step.output = Some(value.clone());
+            if is_final_answer && let Ok(output) = &result {
+                step.output = output.json().cloned();
                 step.is_final_answer = true;
             }
             step.outcomes.push(ToolOutcome {
@@ -448,7 +490,7 @@ impl<M: Model> Agent<M> {
         number: u32,
         call: &ToolCall,
         on_event: &mut F,
-    ) -> Result<Value, ToolError>
+    ) -> Result<crate::tool::ToolOutput, ToolError>
     where
         F: FnMut(Event) + Send,
     {
@@ -490,7 +532,7 @@ impl<M: Model> Agent<M> {
 
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let preview = match &result {
-            Ok(value) => preview_text(&render_value(value)),
+            Ok(output) => preview_text(&output.observation()),
             Err(error) => preview_text(&error.to_string()),
         };
         on_event(Event::Activity(Activity::ToolFinished {
@@ -500,6 +542,17 @@ impl<M: Model> Agent<M> {
             preview,
             elapsed_ms,
         }));
+        if let Ok(output) = &result {
+            if let Some(path) = displayed_image(&call.name, &call.arguments) {
+                on_event(Event::Activity(Activity::Images(vec![path])));
+            }
+            if let Some((model, usage)) = output_usage(output) {
+                on_event(Event::Activity(Activity::ToolUsage {
+                    model,
+                    usage,
+                }));
+            }
+        }
         result
     }
 
@@ -603,12 +656,52 @@ fn forward<F: FnMut(Event)>(on_event: &mut F, delta: StreamDelta) {
     }
 }
 
-/// 把工具输出渲染为观测文本；字符串直接使用，其余使用 **JSON** 文本。
-fn render_value(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
+/// 从工具输出里读取提供商报告的用量：`{"model": "...", "usage": {...}}`。
+fn output_usage(output: &crate::tool::ToolOutput) -> Option<(String, TokenUsage)> {
+    // 内容块输出把用量放在以 `__usage__` 开头的文本块里。
+    let embedded = match output {
+        crate::tool::ToolOutput::Blocks(blocks) => blocks.iter().find_map(|block| {
+            let crate::message::ContentBlock::Text(text) = block else {
+                return None;
+            };
+            let rest = text.strip_prefix("__usage__")?;
+            serde_json::from_str::<Value>(rest).ok()
+        }),
+        crate::tool::ToolOutput::Json(_) => None,
+    };
+    let value = output.json().cloned().or(embedded)?;
+    let model = value.get("model")?.as_str()?.to_owned();
+    let usage = value.get("usage")?;
+    let input = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let output_tokens = usage.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let total = usage.get("total_tokens").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let usage = if input == 0 && output_tokens == 0 && total > 0 {
+        TokenUsage::new(total, 0)
+    } else {
+        TokenUsage::new(input, output_tokens)
+    };
+    (usage.total() > 0).then_some((model, usage))
+}
+
+/// 返回工具调用可以展示的本地图片路径。
+fn displayed_image(tool: &str, arguments: &Value) -> Option<String> {
+    if !matches!(tool, "generate_image" | "show_image") {
+        return None;
     }
+    let argument = if tool == "show_image" {
+        "path"
+    } else {
+        "output_path"
+    };
+    let path = arguments.get(argument)?.as_str()?;
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp") {
+        return None;
+    }
+    std::path::Path::new(path).is_file().then(|| path.to_owned())
 }
 
 /// 活动预览的最大字符数。
@@ -628,7 +721,7 @@ fn message_text(message: &Message) -> String {
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text(text) => Some(text.as_str()),
-            ContentBlock::Image(_) => None,
+            ContentBlock::Image(_) | ContentBlock::Audio(_) => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -770,6 +863,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_text_reply_ends_the_run_as_the_final_answer() {
+        // 思考型模型在 `tool_choice: auto` 下常常直接用文本作答；
+        // 这必须是最终答案，而不是反复重试的解析错误。
+        let model = ScriptedModel::new(vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("这里是最终回答".into())],
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            usage: None,
+        }]);
+        let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
+
+        let result = agent.run("Answer.", |_| {}).await.expect("run should succeed");
+
+        assert_eq!(result.output, json!("这里是最终回答"));
+        assert_eq!(result.state, RunState::Success);
+        assert_eq!(agent.model().requests().len(), 1);
+        let steps = agent.memory().steps.clone();
+        let action = steps.iter().find_map(|step| match step {
+            Step::Action(action) => Some(action),
+            _ => None,
+        });
+        let action = action.expect("the reply should be recorded as an action step");
+        assert!(action.error.is_none());
+        assert!(action.is_final_answer);
+    }
+
+    #[tokio::test]
     async fn requests_carry_the_system_prompt_and_tool_schemas() {
         let model = ScriptedModel::new(vec![final_answer(json!(1))]);
         let mut agent = Agent::new(model, tools()).expect("agent should be constructed");
@@ -782,6 +903,23 @@ mod tests {
         let names: Vec<&str> = first.tools.iter().map(|tool| tool.function.name.as_str()).collect();
         assert_eq!(names, ["echo", FINAL_ANSWER]);
         assert_eq!(first.tool_choice, ToolChoice::Required);
+    }
+
+    #[test]
+    fn displayed_images_require_existing_image_files() {
+        let dir = std::env::temp_dir().join(format!("haloeth-image-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("a.png");
+        std::fs::write(&path, b"png").expect("file");
+
+        let arguments = json!({ "output_path": path.display().to_string() });
+        assert!(displayed_image("generate_image", &arguments).is_some());
+        let arguments = json!({ "path": path.display().to_string() });
+        assert!(displayed_image("show_image", &arguments).is_some());
+        assert!(displayed_image("shell", &arguments).is_none());
+        let arguments = json!({ "path": dir.join("a.txt").display().to_string() });
+        assert!(displayed_image("show_image", &arguments).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -812,9 +950,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_tool_call_is_reported_as_a_parsing_error() {
+    async fn empty_reply_without_tool_calls_is_a_parsing_error() {
         let model = ScriptedModel::new(vec![
-            Message::assistant("I have no tools."),
+            Message {
+                role: Role::Assistant,
+                content: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                usage: None,
+            },
             final_answer(json!("ok")),
         ]);
         let mut agent = Agent::new(model, tools()).expect("agent should be constructed");

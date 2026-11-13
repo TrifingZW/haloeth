@@ -3,21 +3,67 @@
 //! 全部文本面向模型，使用英文，并由本模块作为文本的单点来源。模板变量以函数参数传入，
 //! 不使用通用模板引擎。
 
-use crate::tool::ToolSet;
+use crate::approval::DirectoryGrant;
+use crate::tool::{Access, ToolSet};
+
+/// 渲染文件权限段落：说明用户当前授权的目录，以及没有固定工作区时应如何决策。
+pub fn workspace_section(grants: &[DirectoryGrant]) -> String {
+    if grants.is_empty() {
+        return String::from(
+            "\n\n## File permissions\n\n\
+             The user has not granted any directory for this session, and there is no fixed workspace. \
+             Decide from the user's request what is appropriate: prefer answering questions without \
+             touching files, read only when the task needs it, and ask before writing anything. \
+             File, shell and network operations may require the user's approval. Use absolute paths \
+             unless the user names a directory.",
+        );
+    }
+
+    let mut text = String::from(
+        "\n\n## File permissions\n\nThe user granted access to these directories for this session:\n",
+    );
+    for grant in grants {
+        let access = match grant.access {
+            Access::Read => "read only",
+            Access::Write => "read and write",
+        };
+        text.push_str(&format!("- {} ({access})\n", grant.path.display()));
+    }
+    text.push_str(
+        "\nPrefer these directories when a task needs files, but the user's request takes precedence: \
+         if they ask for another location, follow it and let the approval policy handle access. \
+         Relative paths resolve against the first authorized directory. Operations outside these \
+         directories are denied or require approval.",
+    );
+    text
+}
 
 /// 计划生成的停止标记。
 pub const PLAN_STOP_SEQUENCE: &str = "<end_plan>";
 
-/// 渲染系统提示（不含 Skill）。
+/// 渲染系统提示（不含 Skill 与工作区）。
 pub fn system_prompt(tools: &ToolSet, instructions: Option<&str>) -> String {
-    system_prompt_with_skills(tools, instructions, &[])
+    system_prompt_with_context(tools, instructions, &[], &[])
 }
 
-/// 渲染系统提示：循环协议、示例、工具清单、Skill 清单、规则与附加指令。
+/// 渲染系统提示：循环协议、示例、工具清单、Skill 清单、工作区、规则与附加指令。
 pub fn system_prompt_with_skills(
     tools: &ToolSet,
     instructions: Option<&str>,
     skills: &[crate::skill::Skill],
+) -> String {
+    system_prompt_with_context(tools, instructions, skills, &[])
+}
+
+/// 渲染系统提示，并告知模型当前会话授权的目录。
+///
+/// 工作区是会话级授权，不是必填项：没有授权时明确告诉模型「没有工作区」，
+/// 避免它默认某个目录可用。
+pub fn system_prompt_with_context(
+    tools: &ToolSet,
+    instructions: Option<&str>,
+    skills: &[crate::skill::Skill],
+    grants: &[DirectoryGrant],
 ) -> String {
     let mut prompt = String::from(
         "You are an expert assistant who solves tasks by calling tools. You will be given a task to solve as best you can.\n\
@@ -45,9 +91,10 @@ pub fn system_prompt_with_skills(
             prompt.push('\n');
         }
     }
+    prompt.push_str(&workspace_section(grants));
     prompt.push_str(
         "\n\nHere are the rules you should always follow to solve your task:\n\
-         1. Always provide at least one tool call in every step: a step with no tool call fails.\n\
+         1. Always provide at least one tool call in every step; a reply without any tool call ends the run and is shown to the user as your final answer.\n\
          2. Always use the right arguments for the tools: use the exact argument names declared by each tool, and pass the value itself, never a variable name.\n\
          3. Call a tool only when needed, and never re-do a tool call that you previously did with the exact same parameters.\n\
          4. Read the observations carefully before deciding the next action.\n\
@@ -207,6 +254,25 @@ mod tests {
         let prompt = system_prompt(&tool_set(), Some("Always answer in Chinese."));
 
         assert!(prompt.contains("\nAlways answer in Chinese.\n"));
+    }
+
+    #[test]
+    fn workspace_section_lists_grants_and_reports_an_empty_workspace() {
+        let grants = vec![
+            DirectoryGrant::new(std::path::PathBuf::from("/work"), Access::Write),
+            DirectoryGrant::new(std::path::PathBuf::from("/docs"), Access::Read),
+        ];
+
+        let prompt = system_prompt_with_context(&tool_set(), None, &[], &grants);
+
+        assert!(prompt.contains("## File permissions"));
+        assert!(prompt.contains("- /work (read and write)"));
+        assert!(prompt.contains("- /docs (read only)"));
+        assert!(prompt.contains("the user's request takes precedence"));
+
+        let empty = system_prompt_with_context(&tool_set(), None, &[], &[]);
+        assert!(empty.contains("there is no fixed workspace"));
+        assert!(empty.contains("prefer answering questions without"));
     }
 
     #[test]

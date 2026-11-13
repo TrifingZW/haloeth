@@ -15,6 +15,74 @@ use crate::error::ModelError;
 use crate::message::{Message, StreamDelta};
 use crate::tool::wire::WireTool;
 
+/// 模型支持的输入 / 输出模态。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Modality {
+    /// 文本。
+    Text,
+    /// 图像。
+    Image,
+    /// 音频。
+    Audio,
+    /// 视频。
+    Video,
+}
+
+impl Modality {
+    /// 界面与配置中的名称。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+        }
+    }
+
+    /// 中文展示名。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Text => "文本",
+            Self::Image => "图像",
+            Self::Audio => "音频",
+            Self::Video => "视频",
+        }
+    }
+}
+
+/// 提供方协议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Protocol {
+    /// **OpenAI** Chat Completions，兼容面最广。
+    #[default]
+    #[serde(rename = "openai-chat")]
+    OpenAiChat,
+    /// **Anthropic** Messages。
+    #[serde(rename = "anthropic-messages")]
+    AnthropicMessages,
+}
+
+impl Protocol {
+    /// 配置中的取值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "openai-chat",
+            Self::AnthropicMessages => "anthropic-messages",
+        }
+    }
+
+    /// 界面展示文本。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "OpenAI Chat",
+            Self::AnthropicMessages => "Anthropic Messages",
+        }
+    }
+}
+
 /// 工具选择策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ToolChoice {

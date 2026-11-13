@@ -21,9 +21,12 @@ fn example_skills_are_discoverable() {
     assert!(!selftest.description.is_empty(), "frontmatter description is required");
     assert!(selftest.when_to_use.contains("self test"));
     assert!(selftest.body.contains("final_answer"), "body should describe the closing step");
+    assert!(selftest.body.contains("show_image"), "body should exercise image display");
+    assert!(selftest.body.contains("generate_image"), "body should cover image generation");
 
     let resources = selftest.resources();
     assert!(resources.iter().any(|name| name == "checklist.md"), "{resources:?}");
     assert!(resources.iter().any(|name| name == "report-template.md"), "{resources:?}");
+    assert!(resources.iter().any(|name| name == "sample.png"), "{resources:?}");
     assert!(!resources.iter().any(|name| name == "SKILL.md"), "manifest is not a resource");
 }

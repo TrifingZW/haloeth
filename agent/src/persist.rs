@@ -76,7 +76,7 @@ mod tests {
                     name: "echo".into(),
                     arguments: json!({ "text": "hi" }),
                 },
-                result: Ok(json!("hi")),
+                result: Ok(json!("hi").into()),
             }],
             error: None,
             output: None,

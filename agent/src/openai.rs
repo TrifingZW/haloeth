@@ -4,6 +4,7 @@
 //! 并将增量帧转换为 [`StreamDelta`]。不使用 `reqwest` 的 `json` 特性，
 //! 请求体与响应体均经 `serde_json` 自行编解码。
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::Deserialize;
@@ -12,7 +13,7 @@ use serde_json::{Map, Value, json};
 use crate::error::ModelError;
 use crate::message::{Message, StreamDelta, ToolCallDelta, assemble, normalize};
 use crate::metrics::TokenUsage;
-use crate::model::{GenerateRequest, Model, ToolChoice};
+use crate::model::{GenerateRequest, Modality, Model, Protocol, ToolChoice};
 use crate::text::truncate;
 
 /// 服务端错误正文保留的最大长度。
@@ -25,9 +26,23 @@ const MAX_ERROR_BODY: usize = 500;
 pub async fn list_models(options: &HttpModelOptions) -> Result<Vec<String>, ModelError> {
     let url = format!("{}/models", options.base_url.trim_end_matches('/'));
     let mut builder = reqwest::Client::new().get(url);
-    if !options.api_key.is_empty() {
-        builder = builder.bearer_auth(&options.api_key);
+    match options.protocol {
+        Protocol::AnthropicMessages => {
+            if !options.api_key.is_empty() && !options.custom_has("x-api-key") {
+                builder = builder.header("x-api-key", options.api_key.as_str());
+            }
+            // 版本头与鉴权无关：用自定义头走网关时同样必须发送。
+            if !options.custom_has("anthropic-version") {
+                builder = builder.header("anthropic-version", options.anthropic_version.as_str());
+            }
+        }
+        Protocol::OpenAiChat => {
+            if !options.api_key.is_empty() && !options.custom_has("authorization") {
+                builder = builder.bearer_auth(&options.api_key);
+            }
+        }
     }
+    builder = options.apply_headers(builder);
     let response = builder.send().await.map_err(|error| ModelError::Transport {
         reason: error.to_string(),
     })?;
@@ -90,6 +105,16 @@ pub struct HttpModelOptions {
     pub stream_usage: bool,
     /// 工具选择策略；思考型模型不接受 `required`，默认发送 `auto`。
     pub tool_choice: ToolChoicePolicy,
+    /// 提供方协议。
+    pub protocol: Protocol,
+    /// 附加请求头；同名时覆盖默认头。
+    pub headers: BTreeMap<String, String>,
+    /// 生成的最大 **Token** 数；`Anthropic` 必填，`OpenAI` 不发送。
+    pub max_tokens: Option<u32>,
+    /// 模型支持的输入模态；空表示不裁剪。
+    pub input_modalities: Vec<Modality>,
+    /// `Anthropic` 协议版本头。
+    pub anthropic_version: String,
 }
 
 /// 发送给提供方的工具选择策略。
@@ -127,6 +152,11 @@ impl HttpModelOptions {
             send_stop_sequences: true,
             stream_usage: true,
             tool_choice: ToolChoicePolicy::default(),
+            protocol: Protocol::default(),
+            headers: BTreeMap::new(),
+            max_tokens: None,
+            input_modalities: Vec::new(),
+            anthropic_version: "2023-06-01".to_owned(),
         }
     }
 
@@ -159,6 +189,59 @@ impl HttpModelOptions {
         self.tool_choice = policy;
         self
     }
+
+    /// 设置提供方协议。
+    pub fn protocol(mut self, protocol: Protocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// 添加一个请求头。
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// 设置请求头集合。
+    pub fn headers(mut self, headers: BTreeMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// 设置生成的最大 **Token** 数。
+    pub fn max_tokens(mut self, tokens: u32) -> Self {
+        self.max_tokens = Some(tokens);
+        self
+    }
+
+    /// 设置模型支持的输入模态。
+    pub fn input_modalities(mut self, modalities: Vec<Modality>) -> Self {
+        self.input_modalities = modalities;
+        self
+    }
+
+    /// 设置 `Anthropic` 协议版本。
+    pub fn anthropic_version(mut self, version: impl Into<String>) -> Self {
+        self.anthropic_version = version.into();
+        self
+    }
+
+    /// 自定义头是否已经覆盖了指定名称（忽略大小写）。
+    pub(crate) fn custom_has(&self, name: &str) -> bool {
+        self.headers.keys().any(|header| header.eq_ignore_ascii_case(name))
+    }
+
+    /// 应用配置中的自定义请求头。
+    pub(crate) fn apply_headers(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = builder;
+        for (name, value) in &self.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        builder
+    }
 }
 
 impl fmt::Debug for HttpModelOptions {
@@ -171,6 +254,10 @@ impl fmt::Debug for HttpModelOptions {
             .field("send_stop_sequences", &self.send_stop_sequences)
             .field("stream_usage", &self.stream_usage)
             .field("tool_choice", &self.tool_choice)
+            .field("protocol", &self.protocol)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
+            .field("max_tokens", &self.max_tokens)
+            .field("input_modalities", &self.input_modalities)
             .finish()
     }
 }
@@ -218,7 +305,11 @@ impl HttpModel {
         body.insert("model".into(), Value::String(self.options.model_id.clone()));
         body.insert(
             "messages".into(),
-            serde_json::to_value(normalize(&request.messages)).map_err(encode)?,
+            serde_json::to_value(normalize(&crate::message::retain_modalities(
+                &request.messages,
+                &self.options.input_modalities,
+            )))
+            .map_err(encode)?,
         );
         body.insert("stream".into(), Value::Bool(true));
         if self.options.stream_usage {
@@ -269,9 +360,10 @@ impl Model for HttpModel {
             .client
             .post(self.endpoint())
             .header(reqwest::header::CONTENT_TYPE, "application/json");
-        if !self.options.api_key.is_empty() {
+        if !self.options.api_key.is_empty() && !self.options.custom_has("authorization") {
             builder = builder.bearer_auth(&self.options.api_key);
         }
+        builder = self.options.apply_headers(builder);
         let mut response =
             builder.body(payload).send().await.map_err(|error| ModelError::Transport {
                 reason: error.to_string(),
@@ -298,6 +390,14 @@ impl Model for HttpModel {
         }
 
         Ok(assemble(deltas))
+    }
+}
+
+/// 按协议构造模型。
+pub fn build_model(options: HttpModelOptions) -> Box<dyn Model> {
+    match options.protocol {
+        Protocol::OpenAiChat => Box::new(HttpModel::new(options)),
+        Protocol::AnthropicMessages => Box::new(crate::anthropic::AnthropicModel::new(options)),
     }
 }
 

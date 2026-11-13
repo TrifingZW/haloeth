@@ -47,6 +47,9 @@ pub struct SessionFile {
     /// 会话级「始终允许」规则。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<AllowRule>,
+    /// 会话级功能状态：键为 `tool:name` / `mcp:name` / `skill:name`，缺省用全局默认值。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub features: std::collections::BTreeMap<String, bool>,
     /// 显示记录。
     #[serde(default)]
     pub transcript: Vec<TranscriptEntry>,
@@ -56,6 +59,9 @@ pub struct SessionFile {
     /// 累计 **Token** 用量。
     #[serde(default)]
     pub usage: TokenUsage,
+    /// 按模型拆分的 **Token** 用量。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub usage_by_model: std::collections::BTreeMap<String, TokenUsage>,
 }
 
 impl SessionFile {
@@ -72,9 +78,11 @@ impl SessionFile {
             model,
             grants: Vec::new(),
             rules: Vec::new(),
+            features: std::collections::BTreeMap::new(),
             transcript: Vec::new(),
             context: ContextSnapshot::default(),
             usage: TokenUsage::default(),
+            usage_by_model: std::collections::BTreeMap::new(),
         }
     }
 

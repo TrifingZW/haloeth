@@ -31,6 +31,8 @@ pub enum ContentBlock {
     Text(String),
     /// 图像块。
     Image(ImageSource),
+    /// 音频块。
+    Audio(AudioSource),
 }
 
 impl ContentBlock {
@@ -50,6 +52,30 @@ impl ContentBlock {
             media_type: media_type.into(),
             data: data.into(),
         })
+    }
+
+    /// 以 `Base64` 数据构造音频块。
+    pub fn audio_base64(media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self::Audio(AudioSource {
+            media_type: media_type.into(),
+            data: data.into(),
+        })
+    }
+}
+
+/// 音频数据。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AudioSource {
+    /// 媒体类型，例如 `audio/wav`。
+    pub media_type: String,
+    /// `Base64` 编码的音频数据。
+    pub data: String,
+}
+
+impl AudioSource {
+    /// 提供方协议中的音频格式名，例如 `wav`。
+    pub fn format(&self) -> &str {
+        self.media_type.rsplit('/').next().unwrap_or("wav")
     }
 }
 
@@ -154,6 +180,20 @@ impl Message {
         Self {
             role: Role::ToolResponse,
             content: vec![ContentBlock::text(text)],
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+            usage: None,
+        }
+    }
+
+    /// 以内容块构造工具结果消息；图像与音频块会随观测一起回灌给支持多模态的模型。
+    pub fn tool_response_blocks(
+        tool_call_id: impl Into<String>,
+        content: Vec<ContentBlock>,
+    ) -> Self {
+        Self {
+            role: Role::ToolResponse,
+            content,
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
             usage: None,
@@ -319,12 +359,24 @@ pub mod wire {
         ImageUrl {
             image_url: WireImageUrl,
         },
+        InputAudio {
+            input_audio: WireInputAudio,
+        },
     }
 
     /// 图像地址载荷。
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct WireImageUrl {
         pub url: String,
+    }
+
+    /// 内联音频载荷。
+    #[derive(Debug, Clone, PartialEq, Serialize)]
+    pub struct WireInputAudio {
+        /// `Base64` 编码的音频数据。
+        pub data: String,
+        /// 音频格式，例如 `wav`。
+        pub format: String,
     }
 
     /// 工具调用。
@@ -353,26 +405,118 @@ pub mod wire {
 }
 
 use wire::{
-    WireContent, WireContentBlock, WireImageUrl, WireMessage, WireRole, WireToolCall,
-    WireToolCallKind, WireToolFunction,
+    WireContent, WireContentBlock, WireImageUrl, WireInputAudio, WireMessage, WireRole,
+    WireToolCall, WireToolCallKind, WireToolFunction,
 };
+
+/// 按模型支持的输入模态裁剪消息：不支持媒体类型时替换为一行文字说明，避免整条上下文被丢弃。
+pub fn retain_modalities(messages: &[Message], allowed: &[crate::model::Modality]) -> Vec<Message> {
+    use crate::model::Modality;
+    if allowed.is_empty() {
+        return messages.to_vec();
+    }
+    let permits = |modality: Modality| allowed.contains(&modality);
+    messages
+        .iter()
+        .map(|message| {
+            let content = message
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Image(_) if !permits(Modality::Image) => {
+                        ContentBlock::text("[image omitted: the model does not accept image input]")
+                    }
+                    ContentBlock::Audio(_) if !permits(Modality::Audio) => {
+                        ContentBlock::text("[audio omitted: the model does not accept audio input]")
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            Message {
+                content,
+                ..message.clone()
+            }
+        })
+        .collect()
+}
 
 /// 将内部消息序列投影为提供方协议消息序列。
 ///
 /// 投影规则：
 /// 1) 角色映射：系统、用户、助手角色保持不变；工具调用消息并入助手消息，工具结果消息映射为工具角色并携带调用标识符。
 /// 2) 消息合并：相邻且角色相同、且不属于工具结果的消息合并；工具结果消息因携带独立标识符而不参与合并。
-/// 3) 内容投影：仅含文本时投影为字符串，含图像时投影为内容块数组。
+/// 3) 内容投影：仅含文本时投影为字符串，含图像或音频时投影为内容块数组。
+/// 4) 工具结果中的媒体块无法进入 tool 消息，拆到紧随其后的用户消息。
 pub fn normalize(messages: &[Message]) -> Vec<WireMessage> {
     let mut output: Vec<WireMessage> = Vec::with_capacity(messages.len());
+    // 同一轮可能有多个带媒体的工具结果：先把 tool 消息全部输出，再补一条用户消息，
+    // 避免工具消息之间插入 user 破坏提供方的调用顺序。
+    let mut pending_media: Vec<ContentBlock> = Vec::new();
     for message in messages {
+        if let Some((tool, mut media)) = split_tool_media(message) {
+            output.push(tool);
+            pending_media.append(&mut media);
+            continue;
+        }
+        flush_media(&mut output, &mut pending_media);
         let projected = project(message);
         match output.last_mut() {
             Some(last) if mergeable(last, &projected) => merge(last, projected),
             _ => output.push(projected),
         }
     }
+    flush_media(&mut output, &mut pending_media);
     output
+}
+
+/// 输出挂起的媒体附件。
+fn flush_media(output: &mut Vec<WireMessage>, pending: &mut Vec<ContentBlock>) {
+    if pending.is_empty() {
+        return;
+    }
+    output.push(WireMessage {
+        role: WireRole::User,
+        content: Some(WireContent::Blocks(pending.iter().map(project_block).collect())),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    pending.clear();
+}
+
+/// 工具结果里的媒体块无法放进 `OpenAI` 的 tool 消息，需要拆到随后的用户消息中。
+fn split_tool_media(message: &Message) -> Option<(WireMessage, Vec<ContentBlock>)> {
+    if message.role != Role::ToolResponse {
+        return None;
+    }
+    let media: Vec<ContentBlock> = message
+        .content
+        .iter()
+        .filter(|block| !matches!(block, ContentBlock::Text(_)))
+        .cloned()
+        .collect();
+    if media.is_empty() {
+        return None;
+    }
+    let mut text = String::new();
+    for block in &message.content {
+        if let ContentBlock::Text(value) = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(value);
+        }
+    }
+    text.push_str(&format!(
+        "\n\n({} media attachment(s) follow in the next user message)",
+        media.len()
+    ));
+    let tool = WireMessage {
+        role: WireRole::Tool,
+        content: Some(WireContent::Text(text)),
+        tool_calls: None,
+        tool_call_id: message.tool_call_id.clone(),
+    };
+    Some((tool, media))
 }
 
 /// 将单条消息投影为提供方协议消息。
@@ -412,6 +556,12 @@ fn project_block(block: &ContentBlock) -> WireContentBlock {
         ContentBlock::Image(source) => WireContentBlock::ImageUrl {
             image_url: WireImageUrl {
                 url: source.to_url(),
+            },
+        },
+        ContentBlock::Audio(source) => WireContentBlock::InputAudio {
+            input_audio: WireInputAudio {
+                data: source.data.clone(),
+                format: source.format().to_owned(),
             },
         },
     }
@@ -570,6 +720,60 @@ mod tests {
 
         assert_eq!(wire[0].content, None);
         assert_eq!(wire[0].tool_calls, None);
+    }
+
+    #[test]
+    fn unsupported_modalities_are_replaced_with_text() {
+        let message = Message::new(
+            Role::User,
+            vec![
+                ContentBlock::text("look"),
+                ContentBlock::image_url("https://example.com/a.png"),
+                ContentBlock::audio_base64("audio/wav", "AAAA"),
+            ],
+        );
+
+        let filtered = retain_modalities(&[message], &[crate::model::Modality::Text]);
+        let text = serde_json::to_string(&filtered[0].content).expect("serialize");
+        assert!(text.contains("image omitted"));
+        assert!(text.contains("audio omitted"));
+
+        let kept = retain_modalities(
+            &[Message::new(Role::User, vec![ContentBlock::image_url("https://example.com/a.png")])],
+            &[crate::model::Modality::Text, crate::model::Modality::Image],
+        );
+        assert!(matches!(kept[0].content[0], ContentBlock::Image(_)));
+    }
+
+    #[test]
+    fn tool_media_is_split_into_a_follow_up_user_message() {
+        let messages = vec![
+            Message::user("draw it"),
+            Message::tool_calls(vec![ToolCall {
+                id: "call_1".into(),
+                name: "generate_image".into(),
+                arguments: json!({ "prompt": "cat" }),
+            }]),
+            Message::tool_response_blocks(
+                "call_1",
+                vec![
+                    ContentBlock::text("saved to /tmp/a.png"),
+                    ContentBlock::image_base64("image/png", "QUJD"),
+                ],
+            ),
+        ];
+
+        let projected = normalize(&messages);
+        let tool = projected.iter().find(|message| message.role == WireRole::Tool).expect("tool");
+        let WireContent::Text(text) = tool.content.clone().expect("content") else {
+            panic!("tool content should be text");
+        };
+        assert!(text.contains("saved to /tmp/a.png"));
+        assert!(text.contains("media attachment"));
+
+        let attachment = projected.last().expect("attachment");
+        assert_eq!(attachment.role, WireRole::User);
+        assert!(matches!(attachment.content, Some(WireContent::Blocks(_))));
     }
 
     #[test]
