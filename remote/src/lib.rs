@@ -9,6 +9,7 @@ pub mod host;
 pub mod proto;
 pub mod server;
 pub mod tls;
+pub mod web;
 
 mod conn;
 

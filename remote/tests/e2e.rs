@@ -377,6 +377,21 @@ async fn oversized_frames_are_rejected_with_the_documented_close_code() {
 }
 
 #[tokio::test]
+async fn web_client_is_served() {
+    let (_host, handle, _assets) = start(64);
+    let response = reqwest::get(format!("http://{}/", handle.addr())).await.expect("请求应当完成");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let body = response.text().await.expect("正文");
+    assert!(body.contains("Haloeth 远程"), "页面包含客户端标题");
+    assert!(body.contains("/v1"), "页面直接实现协议");
+    handle.stop();
+}
+
+#[tokio::test]
 async fn tls_clients_pin_the_fingerprint() {
     let material = remote::tls::self_signed(&["127.0.0.1".to_owned()]).expect("证书应当生成");
     let host = TestHost::new(64);

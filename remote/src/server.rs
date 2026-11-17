@@ -333,6 +333,7 @@ fn run(
             connections,
         });
         let app = Router::new()
+            .route("/", get(web_index))
             .route(WS_PATH, get(upgrade))
             .route(ASSETS_PATH, get(asset))
             .with_state(state);
@@ -363,6 +364,11 @@ fn run(
             tracing::warn!("远程服务退出：{error}");
         }
     });
+}
+
+/// 参考 Web 客户端单页。
+async fn web_index() -> Response {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], crate::web::INDEX_HTML).into_response()
 }
 
 /// WebSocket 升级入口。
