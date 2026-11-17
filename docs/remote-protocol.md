@@ -20,7 +20,7 @@
 | 编码     | 每帧一条 UTF-8 JSON 文本消息                                                 |
 | 帧上限   | 1 MiB；超限连接被关闭（4413）                                                |
 | 保活     | 服务端每 20 秒发协议层 ping；`ping` 操作供应用层保活与 RTT                   |
-| 资源端点 | `GET /v1/assets`（图片）；`POST /v1/attachments`（附件，阶段五）。见第 11 节 |
+| 资源端点 | `GET /v1/assets`（图片）；`POST /v1/attachments`（附件上传）。见第 11 节 |
 
 ## 3. 连接与鉴权
 
@@ -75,7 +75,7 @@
 | `hello`            | `{ token, client? }`     | `Welcome`               | 鉴权 + 协议版本确认；每连接仅一次                                                 |
 | `ping`             | `{}`                     | `{ "t": 1730000000 }`   | 应用层保活；`t` 为服务端 Unix 毫秒                                                |
 | `state.get`        | `{}`                     | `{ "state": AppState }` | 全量状态兜底刷新                                                                  |
-| `message.send`     | `{ text, attachments? }` | `{}`                    | 运行中返回 `busy`，`data.text` 回显原文；`attachments` 为阶段五扩展（见第 11 节） |
+| `message.send`    | `{ text, attachments? }`                 | `{}`                | 运行中返回 `busy`，`data.text` 回显原文；`attachments` 为附件标识（见第 11 节） |
 | `run.cancel`       | `{}`                     | `{}`                    | 停止当前运行，拒绝全部挂起审批                                                    |
 | `approval.resolve` | `{ id, decision }`       | `{}`                    | 幂等；重复 / 过期 id 视为成功                                                     |
 | `session.new`      | `{}`                     | `{ "id": "…" }`         | 新建空白会话并切换                                                                |
@@ -266,20 +266,21 @@ GET /v1/assets?path=<URL-encoded 绝对路径>&token=<设备令牌>
 - 仅允许拉取经 `images.appended` 公布过的路径（宿主维护有界白名单，容量 256，先进先出）。
 - 令牌置于查询串是为支持 `<img src>` 场景；设备令牌可撤销，泄露的影响限于该设备。
 
-附件上传（阶段五扩展，v1 服务端不实现）：
+附件上传：
 
 ```text
 POST /v1/attachments?token=<设备令牌>（或 Authorization: Bearer 头）
 Content-Type: multipart/form-data；字段 file 为文件内容
 → 200 { "attachment_id": "…", "mime": "…", "size": 12345 }
+→ 400 缺少 file 字段或文件为空
 → 413 单文件超过 20 MiB
 → 415 类型不被接受（MIME 按内容探测）
 ```
 
+- 接受的类型：常见图片格式，以及不含 NUL 的 UTF-8 文本；其余一律 415。
 - 附件归属当前会话，存储于应用数据目录 `attachments/{session_id}/`，不落入任何已授权目录；该目录随会话获得隐式只读授权（同 Skill 目录模式），写入仍走审批。
-- `message.send` 的可选参数 `attachments: [attachment_id]` 将附件解析为消息内容（多模态块或路径引用），随消息进入上下文。
+- `message.send` 的可选参数 `attachments: [attachment_id]` 由服务端解析为绝对路径，并把 `[附件] <路径>` 行前置到用户消息文本；模型据此按路径读取。未知标识返回 `invalid_params`。
 - 上传是经过鉴权的用户动作，写入目标为应用数据目录，不触发目录授权审批；会话删除时清理其附件。
-- v1 服务端对携带非空 `attachments` 的 `message.send` 返回 `invalid_params`。
 
 ## 12. 示例交互流
 

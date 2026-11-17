@@ -193,7 +193,7 @@ pub trait RemoteHost: Send + Sync + 'static {
 ### 5.2 服务生命周期
 
 - `RemoteServer::start(options, host)`：在专用线程上创建 Tokio 运行时并绑定监听（与 `background::Background::start` 同构：独立线程 + `tracing` 日志 + 句柄交由 `Haloeth` 持有防止 drop）。`ServerOptions` 是 `remote` 自己的配置类型（监听地址、端口、限速参数），不依赖前端配置模型。
-- 端点：`GET /v1`（WS 升级）、`GET /v1/assets`（图片资源）、`POST /v1/attachments`（附件上传，阶段五）、`GET /`（内置 Web 客户端），均见协议规范第 11 节。路径带版本号，`/v2` 可并存。
+- 端点：`GET /v1`（WS 升级）、`GET /v1/assets`（图片资源）、`POST /v1/attachments`（附件上传）、`GET /`（内置 Web 客户端），均见协议规范第 11 节。路径带版本号，`/v2` 可并存。
 - `RemoteServer::stop()`：关闭监听并等待连接排空（5 秒上限）。停用或重启服务前由桥先广播 `shutdown` 通知；偏好页开关即时生效，对应 start / stop。
 
 ### 5.3 连接状态机
@@ -302,6 +302,7 @@ last_seen = 1730000000
 - 启用开关与端口 / 绑定地址（改动即重启服务，与偏好页「即时生效」一致）。
 - 配对区：生成新设备令牌 → 渲染二维码（`qrcode` crate 生成模块矩阵，默认特性无传递依赖；GPUI `path()` 把模块绘制为矩形集）+ 手动复制串。
 - 设备列表：名称、最近在线时间、撤销按钮（`open_alert_dialog` 确认）。
+- 附件：上传与拖放的文件都复制到应用数据目录 `Haloeth/attachments/<会话>`；该目录获得会话级只读授权，消息以 `[附件] <路径>` 行引用，会话删除时清理附件。
 - 状态行：当前监听地址、已连接数；Windows 首次绑定会触发防火墙授权弹窗，页面附说明文案。
 
 主界面不加常驻入口：远程是跨会话能力，归属偏好页（与「主界面只放当前对话快速调整项」的既有分工一致）；托盘菜单不加远程项。
@@ -331,7 +332,7 @@ last_seen = 1730000000
 | 二   | `haloeth` 桥：命令泵、事件 tap、`submit_message` 抽取、配置与偏好页（含二维码、设备管理）                                                   | UI 测试覆盖命令面与通知流；README 行为章节更新       |
 | 三   | TLS：自签证书（`rcgen` + `rustls`）与二维码指纹钉扎；证书存于应用数据目录；Origin 校验、令牌限速与防火墙说明已落地 | TLS 回环测试通过；明文模式给出警告提示              |
 | 四   | 参考客户端：`remote::client`（含指纹钉扎）、`examples/remote-cli.rs` 与内置 Web 客户端（服务端 `/` 直接托管） | 第三方依据协议规范可独立接通；回环测试覆盖页面投递 |
-| 五   | 附件上传：`POST /v1/attachments` 端点、`message.send` 附件参数、附件目录隐式只读授权；桌面输入链路补齐附件能力（拖放 / 粘贴）以维持镜像语义 | 上传 → 发送 → 引用全链路测试通过；桌面与远程行为一致 |
+| 五   | 附件上传：`POST /v1/attachments`、`message.send` 附件标识解析与 `[附件]` 引用、会话级只读授权；桌面拖放复制到同一目录 | 上传 → 发送 → 引用全链路测试通过；桌面与远程行为一致 |
 
 文档随阶段更新：README「特性 / 行为」与 CLAUDE.md「架构要点」在对应阶段一并修订。
 
@@ -390,7 +391,7 @@ last_seen = 1730000000
 | 审核模式四档                    | `approval.mode`                                               | 全局配置写入                                                                        |
 | 目录授权增删                    | `grant.add` / `grant.remove`                                  | 会话级，随 `sessions.changed` / `state.changed` 同步                                |
 | 工具 / MCP / Skill 开关         | `feature.set`                                                 | 键名与 `SessionFile.features` 一致                                                  |
-| 附件上传（阶段五）              | `POST /v1/attachments` + `message.send` 的 `attachments` 参数 | 桌面输入链路需先具备同等能力（镜像语义）；附件目录隐式只读授权（同 Skill 目录模式） |
+| 附件上传                      | `POST /v1/attachments` + `message.send` 的 `attachments` 参数；桌面拖放 | 两端都复制到会话附件目录并获得只读授权；消息以 `[附件]` 行引用 |
 | 偏好设置、语音、图片查看器      | 不开放（非目标）                                              | 图片查看由客户端自行渲染（资源端点）                                                |
 
 ### 11.3 平台与并发约束核对

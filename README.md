@@ -13,6 +13,7 @@ Haloeth 是一个用 Rust 与 GPUI 编写的轻量桌面智能体。它把对话
 - **MCP 与 Skill**：MCP 支持 stdio 与 Streamable HTTP；Skill 是包含 `SKILL.md` 的目录包，系统提示只列元数据，模型按需调用 `load_skill`。
 - **语音输入与播报**：支持云端转写或系统听写，以及 Windows SAPI 或云端 TTS；可配置按住说话快捷键。
 - **远程接入**：桌面进程内置 WebSocket 服务，手机、平板等设备按 `docs/remote-protocol.md` 实现客户端即可镜像当前对话、审批与工具活动；默认关闭，配对二维码，设备令牌只存摘要且可随时撤销，可选自签 TLS 并由客户端按指纹钉扎。浏览器直接用 `http://<主机>:<端口>/` 打开内置 Web 客户端。
+- **远程附件**：客户端可上传图片与文本（单文件 20 MiB 以内），桌面直接拖入文件同样生效；两端都复制到会话附件目录并获得只读授权，消息以 `[附件] <路径>` 行引用。
 - **桌面集成**：托盘、后台运行、多会话管理、图片查看器与会话级功能开关。
 - **偏好与界面**：跨会话配置在独立窗口中即时生效，支持 JSON 导出与导入；支持跟随系统、浅色与深色配色，统一 2px 描边，输入区高度可拖动，用量按模型分列。
 
@@ -53,6 +54,7 @@ Haloeth 的数据位置如下：
 - 会话：Windows 为 `%LOCALAPPDATA%\Haloeth\sessions`；其它平台为系统本地数据目录下的 `Haloeth/sessions`。可在偏好设置中改为自定义目录。
 - 日志：Windows 为 `%APPDATA%\Haloeth\logs\haloeth.log`；其它平台为系统数据目录下的 `Haloeth/logs/haloeth.log`。
 - 远程证书：Windows 为 `%LOCALAPPDATA%\Haloeth\remote-tls`；其它平台为系统本地数据目录下的 `Haloeth/remote-tls`。
+- 远程附件：Windows 为 `%LOCALAPPDATA%\Haloeth\attachments`；其它平台为系统本地数据目录下的 `Haloeth/attachments`；按会话分目录，会话删除时清理。
 - Skill：默认读取 `~/.agents/skills`；旧版本配置目录下的 `skills` 子目录仍会读取。
 
 需要注意：
@@ -62,7 +64,7 @@ Haloeth 的数据位置如下：
 - `无审核` 模式会放行全部调用；未声明影响的工具按未知影响处理。非 Windows 平台的可用性尚未验证。
 - 审核模式、审核模型与提供商定义是全局的；会话可以保存自己的模型选择、目录授权、始终允许规则与功能开关。
 - 远程访问默认关闭；启用后监听局域网（默认 `0.0.0.0:8737`），默认明文 WebSocket，可启用自签 TLS 并由客户端按指纹钉扎；浏览器访问内置客户端时，自签 TLS 需先在浏览器中手动信任证书。跨网络访问建议配合隧道；设备令牌只保存 SHA-256 摘要，可在偏好设置「远程」中撤销。
-- 远程协议 v1 暂不含附件上传；图片资源端点只提供已公布过的路径。
+- 远程协议 v1 的 `session.resume` 仍为预留；图片资源端点只提供已公布过的路径。
 - 托盘、全局快捷键与语音播报目前仅在 Windows 上可用。语音识别可选云端模型（跨平台）或系统听写（Windows 与 macOS）。
 - MCP 只支持 tools，不支持 resources、prompts 与 OAuth。
 - 当前版本为 0.2.0，配置与会话格式仍可能调整。

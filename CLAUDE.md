@@ -200,9 +200,10 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 - 提交单点：`Haloeth::submit_message` 由 composer 回调与远程命令共用；忙碌时返回 `false`，调用方决定把文本放回输入框或回 `busy` 错误。
 - 偏好页（`settings/remote.rs`）渲染期间不读 `Haloeth`：窗口首帧发生在 `open_preferences` 的更新内，读取会触发嵌套借用断言；状态缓存在页面内，用 `window.defer` 与提交后刷新。
 - 图片：仅 `images.appended` 公布过的路径可经 `GET /v1/assets` 拉取（有界白名单）；其余文件访问仍走工具与审核链。
+- 附件：上传（`POST /v1/attachments`）与桌面拖放（主视图 `on_drop` → `Haloeth::attach_paths`）都复制到 `Haloeth/attachments/<会话>`；目录获得会话级只读授权，消息以 `[附件] <路径>` 行前置，删除会话时清理。服务端持附件标识→路径映射（256 条 FIFO），`message.send` 前解析。
 - TLS：`[remote].tls` 开启后由 `remote::tls::self_signed` 生成证书（真实配置写 `Haloeth/remote-tls`，测试写临时目录），服务改用 `wss://`，配对串追加证书指纹 `fp`；页面缓存的指纹来自桥。
 - 配置在 `[remote]`：`enabled` / `port` / `bind` / `tls` / `devices`（只存 `token_hash`）；`Haloeth::sync_remote` 是唯一同步入口（设备表 + 启停服务），偏好页每次提交后调用。
-- 未实现：附件上传（阶段五）；`session.resume` 为预留操作。
+- 未实现：`session.resume`（预留的增量续接）；其余阶段已交付。
 - 参考客户端：`remote::client`（`connect` / `connect_pinned`）、`examples/remote-cli.rs` 与 `remote/web/index.html`（`GET /` 直接托管，内联样式与脚本）；连接与页面投递均在 `remote` 的 e2e 中断言。
 
 ## 测试
