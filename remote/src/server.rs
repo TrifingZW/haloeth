@@ -452,15 +452,12 @@ async fn upgrade(
 /// 图片资源端点：只提供已公布的路径。
 async fn asset(
     State(state): State<Arc<ServerState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(query): Query<AssetQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let token = bearer(&headers).or(query.token);
-    let Some(token) = token else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    if state.host.authorize(&token).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Some(response) = authorize_http(&state, &headers, query.token.clone(), peer) {
+        return response;
     }
     let path = PathBuf::from(&query.path);
     if !state.assets.contains(&path) {
@@ -473,6 +470,29 @@ async fn asset(
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     };
     ([(header::CONTENT_TYPE, mime)], bytes).into_response()
+}
+
+/// HTTP 端点的令牌校验：失败计入来源限速，超限直接拒绝。
+fn authorize_http(
+    state: &ServerState,
+    headers: &HeaderMap,
+    query_token: Option<String>,
+    peer: SocketAddr,
+) -> Option<Response> {
+    if state.limiter.blocked(peer.ip()) {
+        return Some(StatusCode::TOO_MANY_REQUESTS.into_response());
+    }
+    let Some(token) = bearer(headers).or(query_token) else {
+        state.limiter.record_failure(peer.ip());
+        return Some(StatusCode::UNAUTHORIZED.into_response());
+    };
+    match state.host.authorize(&token) {
+        Some(_) => None,
+        None => {
+            state.limiter.record_failure(peer.ip());
+            Some(StatusCode::UNAUTHORIZED.into_response())
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -491,27 +511,25 @@ struct UploadQuery {
 /// 附件上传：`multipart/form-data`，字段名 `file`。
 async fn upload(
     State(state): State<Arc<ServerState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(query): Query<UploadQuery>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    let token = bearer(&headers).or(query.token);
-    let Some(token) = token else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    if state.host.authorize(&token).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Some(response) = authorize_http(&state, &headers, query.token.clone(), peer) {
+        return response;
     }
     let field = loop {
         match multipart.next_field().await {
             Ok(Some(field)) if field.name() == Some("file") => break field,
             Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+            Ok(None) => return StatusCode::BAD_REQUEST.into_response(),
+            Err(error) => return error.status().into_response(),
         }
     };
     let bytes: Bytes = match field.bytes().await {
         Ok(bytes) => bytes,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(error) => return error.status().into_response(),
     };
     if bytes.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();

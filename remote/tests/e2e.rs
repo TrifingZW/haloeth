@@ -613,6 +613,44 @@ async fn unknown_attachment_ids_and_bad_uploads_are_rejected() {
         .expect("请求应当完成");
     assert_eq!(too_large.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
 
+    // 超过请求体上限时仍返回 413（而不是 400）。
+    let huge = vec![b'a'; remote::proto::ATTACHMENT_LIMIT_BYTES + 2 * 1024 * 1024];
+    let over_body_limit = http
+        .post(format!("{base}/v1/attachments?token=good-token"))
+        .multipart(
+            reqwest::multipart::Form::new().part("file", reqwest::multipart::Part::bytes(huge)),
+        )
+        .send()
+        .await
+        .expect("请求应当完成");
+    assert_eq!(over_body_limit.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 超限响应会让服务端提前结束请求体；换新连接继续后续断言。
+    let http = reqwest::Client::new();
+    // 令牌失败累计到阈值后，来源被限速（HTTP 端点同样适用）。
+    for _ in 0..4 {
+        let response = http
+            .post(format!("{base}/v1/attachments?token=wrong"))
+            .multipart(
+                reqwest::multipart::Form::new()
+                    .part("file", reqwest::multipart::Part::bytes(b"hello".to_vec())),
+            )
+            .send()
+            .await
+            .expect("请求应当完成");
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    let blocked = http
+        .post(format!("{base}/v1/attachments?token=good-token"))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .part("file", reqwest::multipart::Part::bytes(b"hello".to_vec())),
+        )
+        .send()
+        .await
+        .expect("请求应当完成");
+    assert_eq!(blocked.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+
     let _ = std::fs::remove_dir_all(&host.attachment_dir);
     handle.stop();
 }
