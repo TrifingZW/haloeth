@@ -123,8 +123,7 @@ impl PreferencesWindow {
         section: PrefSection,
         cx: &mut Context<Self>,
     ) -> Self {
-        let config =
-            session.upgrade().map(|session| session.read(cx).config().clone()).unwrap_or_default();
+        let config = session.upgrade().map_or_default(|session| session.read(cx).config().clone());
         let settings = cx.new(|cx| {
             SettingsForm::new(
                 window,

@@ -254,10 +254,14 @@ impl ModelsForm {
         if self.draft.provider_named(base).is_none() {
             return base.to_owned();
         }
-        (2..)
-            .map(|index| format!("{base} {index}"))
-            .find(|name| self.draft.provider_named(name).is_none())
-            .unwrap_or_else(|| base.to_owned())
+        let mut index = 2_u32;
+        loop {
+            let candidate = format!("{base} {index}");
+            if self.draft.provider_named(&candidate).is_none() {
+                return candidate;
+            }
+            index += 1;
+        }
     }
 
     /// 请求删除提供商：删除会丢弃密钥与模型目录，先由用户确认。
@@ -432,11 +436,8 @@ impl ModelsForm {
         }
         // 即时生效不做密钥校验：允许先添加提供商，再慢慢填写密钥。
         // 测试注入的会话不写真实配置文件。
-        let persist = self
-            .session
-            .upgrade()
-            .map(|session| session.read(cx).persists_config())
-            .unwrap_or(true);
+        let persist =
+            self.session.upgrade().is_none_or(|session| session.read(cx).persists_config());
         if persist && let Err(error) = self.draft.save() {
             self.error = Some(format!("保存失败：{error}").into());
             cx.notify();
@@ -494,7 +495,7 @@ impl ModelsForm {
             .child(Button::new("models-save").primary().label("保存").on_click({
                 let form = form.clone();
                 move |_, window, cx| {
-                    if form.update(cx, |form, cx| form.save(cx)) {
+                    if form.update(cx, ModelsForm::save) {
                         window.close_dialog(cx);
                     }
                 }
@@ -558,15 +559,13 @@ impl ModelsForm {
             .expanded
             .as_deref()
             .and_then(|provider| self.draft.provider_named(provider))
-            .map(render_headers)
-            .unwrap_or_default();
+            .map_or_default(render_headers);
         self.headers.update(cx, |state, cx| state.set_value(headers, window, cx));
         let extra_body = self
             .expanded
             .as_deref()
             .and_then(|provider| self.draft.provider_named(provider))
-            .map(|provider| render_extra_body(&provider.extra_body))
-            .unwrap_or_default();
+            .map_or_default(|provider| render_extra_body(&provider.extra_body));
         self.extra_body.update(cx, |state, cx| state.set_value(extra_body, window, cx));
         cx.notify();
     }
@@ -691,8 +690,7 @@ impl ModelsForm {
 
     /// 协议选择：OpenAI Chat 或 Anthropic Messages。
     fn render_protocol_row(&self, provider: &str, cx: &mut Context<Self>) -> impl IntoElement {
-        let current =
-            self.draft.provider_named(provider).map(|entry| entry.protocol).unwrap_or_default();
+        let current = self.draft.provider_named(provider).map_or_default(|entry| entry.protocol);
         let mut row = h_flex().items_center().gap_2();
         for protocol in
             [agent::model::Protocol::OpenAiChat, agent::model::Protocol::AnthropicMessages]
@@ -741,8 +739,7 @@ impl ModelsForm {
     /// 工具选择策略：思考型提供商（如 DeepSeek）需要「自动」，否则会拒绝强制调用。
     fn render_tool_choice_row(&self, provider: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
-        let current =
-            self.draft.provider_named(provider).map(|entry| entry.tool_choice).unwrap_or_default();
+        let current = self.draft.provider_named(provider).map_or_default(|entry| entry.tool_choice);
         h_flex()
             .items_center()
             .gap_3()

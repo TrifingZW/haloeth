@@ -229,8 +229,7 @@ impl Haloeth {
         window.on_window_should_close(cx, move |window, cx| {
             let keep_running = this
                 .upgrade()
-                .map(|this| this.read(cx).session.read(cx).config().ui.run_in_background)
-                .unwrap_or(false);
+                .is_some_and(|this| this.read(cx).session.read(cx).config().ui.run_in_background);
             if keep_running {
                 window.minimize_window();
                 false
@@ -287,10 +286,10 @@ impl Haloeth {
                                 });
                             }
                             background::BackgroundEvent::TalkStart => {
-                                let _ = this.update(cx, |this, cx| this.start_hold_to_talk(cx));
+                                let _ = this.update(cx, Haloeth::start_hold_to_talk);
                             }
                             background::BackgroundEvent::TalkStop => {
-                                let _ = this.update(cx, |this, cx| this.stop_hold_to_talk(cx));
+                                let _ = this.update(cx, Haloeth::stop_hold_to_talk);
                             }
                         }
                     }
@@ -343,17 +342,14 @@ impl Haloeth {
             .load(&last)
             .ok()
             .or_else(|| store.list().first().and_then(|summary| store.load(&summary.id).ok()));
-        let mut file = match restored {
-            Some(file) => file,
-            None => {
-                let (provider, model) = session
-                    .read(cx)
-                    .config()
-                    .selection()
-                    .map(|(provider, model)| (Some(provider.to_owned()), Some(model.to_owned())))
-                    .unwrap_or((None, None));
-                store.create(provider, model).unwrap_or_else(|_| SessionFile::new(None, None))
-            }
+        let mut file = if let Some(file) = restored {
+            file
+        } else {
+            let (provider, model) =
+                session.read(cx).config().selection().map_or((None, None), |(provider, model)| {
+                    (Some(provider.to_owned()), Some(model.to_owned()))
+                });
+            store.create(provider, model).unwrap_or_else(|_| SessionFile::new(None, None))
         };
         file.suggest_title();
         conversation.update(cx, |conversation, cx| {
@@ -447,8 +443,8 @@ impl Haloeth {
 
     /// 清空会话：清空对话记录与代理记忆，保留会话标识、授权与模型
     fn clear_session(&mut self, _: &ClearSession, _window: &mut Window, cx: &mut Context<Self>) {
-        self.conversation.update(cx, |conversation, cx| conversation.clear(cx));
-        self.session.update(cx, |session, cx| session.clear_context(cx));
+        self.conversation.update(cx, Conversation::clear);
+        self.session.update(cx, Session::clear_context);
         self.save_active(cx);
     }
 
@@ -681,13 +677,10 @@ impl Haloeth {
     /// 新建空会话但不保存当前会话（删除当前会话时使用）。
     fn create_blank(&mut self, cx: &mut Context<Self>) {
         // 新会话使用通用设置里的默认模型；当前会话的临时选择不继承。
-        let (provider, model) = self
-            .session
-            .read(cx)
-            .config()
-            .selection()
-            .map(|(provider, model)| (Some(provider.to_owned()), Some(model.to_owned())))
-            .unwrap_or((None, None));
+        let (provider, model) =
+            self.session.read(cx).config().selection().map_or((None, None), |(provider, model)| {
+                (Some(provider.to_owned()), Some(model.to_owned()))
+            });
         let Ok(file) = self.store.create(provider, model) else {
             return;
         };
@@ -747,7 +740,7 @@ impl Haloeth {
                 .footer(form.update(cx, |form, cx| form.render_footer(cx).into_any_element()))
                 .on_ok({
                     let form = form.clone();
-                    move |_, _, cx| form.update(cx, |form, cx| form.save(cx))
+                    move |_, _, cx| form.update(cx, ModelsForm::save)
                 })
         });
     }
@@ -756,8 +749,7 @@ impl Haloeth {
     fn show_about(&mut self, _: &ShowAbout, window: &mut Window, cx: &mut Context<Self>) {
         let version = env!("CARGO_PKG_VERSION");
         let config_path = config::Config::path()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "未知".to_owned());
+            .map_or_else(|| "未知".to_owned(), |path| path.display().to_string());
 
         window.open_dialog(cx, move |dialog, _, cx| {
             dialog
@@ -826,13 +818,13 @@ impl Haloeth {
             cx.notify();
             return;
         }
-        self.speech.update(cx, |speech, cx| speech.start(cx));
+        self.speech.update(cx, SpeechState::start);
         self.show_main_window(cx);
     }
 
     /// 按住说话结束：停止录音，转写结果由 [`Self::apply_speech_result`] 自动发送。
     fn stop_hold_to_talk(&mut self, cx: &mut Context<Self>) {
-        self.speech.update(cx, |speech, cx| speech.stop(cx));
+        self.speech.update(cx, SpeechState::stop);
     }
 
     /// 把主窗口带到前台；最小化时平台会先还原。
@@ -945,10 +937,8 @@ impl Haloeth {
                 _ => groups.push((selection.provider, vec![selection.model])),
             }
         }
-        let label = current
-            .as_ref()
-            .map(|(_, model)| model.clone())
-            .unwrap_or_else(|| "未选择模型".to_owned());
+        let label =
+            current.as_ref().map_or_else(|| "未选择模型".to_owned(), |(_, model)| model.clone());
         let trigger = Button::new("model")
             .ghost()
             .small()
@@ -1403,8 +1393,7 @@ impl Haloeth {
         let tts = &config.audio.tts;
         let (base_url, api_key) = config
             .provider_named(tts.provider.trim())
-            .map(|provider| (provider.endpoint(), provider.api_key.clone()))
-            .unwrap_or_default();
+            .map_or_default(|provider| (provider.endpoint(), provider.api_key.clone()));
         TtsSettings {
             backend: tts.backend,
             base_url,
@@ -1416,15 +1405,14 @@ impl Haloeth {
             endpoint: tts.endpoint.clone(),
             headers: config
                 .provider_named(tts.provider.trim())
-                .map(|provider| provider.headers.clone())
-                .unwrap_or_default(),
+                .map_or_default(|provider| provider.headers.clone()),
         }
     }
 
     /// 切换录音；未配置时跳到偏好设置。
     fn toggle_microphone(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.speech.read(cx).is_available(cx) {
-            self.speech.update(cx, |speech, cx| speech.toggle(cx));
+            self.speech.update(cx, SpeechState::toggle);
         } else {
             self.open_preferences(PrefSection::Audio, window, cx);
         }
@@ -1464,7 +1452,7 @@ impl Haloeth {
                 .accessibility_label("停止")
                 .disabled(status == Status::Cancelling)
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.session.update(cx, |session, cx| session.cancel(cx));
+                    this.session.update(cx, Session::cancel);
                 }))
                 .into_any_element();
         }
@@ -1550,8 +1538,10 @@ fn status_tone(status: Status) -> Tone {
     match status {
         Status::Idle => Tone::Neutral,
         Status::Preparing | Status::Running => Tone::Accent,
-        Status::AwaitingApproval | Status::Cancelling => Tone::Warning,
-        Status::Unconfigured | Status::Unselected => Tone::Warning,
+        Status::AwaitingApproval
+        | Status::Cancelling
+        | Status::Unconfigured
+        | Status::Unselected => Tone::Warning,
         Status::Failed => Tone::Danger,
     }
 }

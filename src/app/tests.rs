@@ -29,7 +29,7 @@ impl ScriptedModel {
 
 #[async_trait::async_trait]
 impl Model for ScriptedModel {
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "scripted"
     }
 
@@ -358,8 +358,8 @@ fn runtime_events_reach_the_interface_executor(cx: &mut TestAppContext) {
 
     let (_, handle) = open_shell(cx, WINDOW_SIZE);
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<u32>();
-    let received = Rc::new(Cell::new(0_u32));
-    let sink = received.clone();
+    let delivered = Rc::new(Cell::new(0_u32));
+    let sink = delivered.clone();
 
     cx.update_window(handle, |_, window, cx| {
         cx.spawn(async move |_cx| {
@@ -379,7 +379,7 @@ fn runtime_events_reach_the_interface_executor(cx: &mut TestAppContext) {
     .expect("发送线程应当正常结束");
     cx.run_until_parked();
 
-    assert_eq!(received.get(), 7);
+    assert_eq!(delivered.get(), 7);
 }
 
 /// **Token** 计数在万位以下使用原值，以上使用千位表示
@@ -987,7 +987,7 @@ async fn usage_accumulates_per_model(cx: &mut TestAppContext) {
     });
     // 重新打开会话后用量仍然保留
     let id = cx.update(|cx| haloeth.read(cx).active_id().to_owned());
-    cx.update(|cx| haloeth.update(cx, |haloeth, cx| haloeth.save_active(cx)));
+    cx.update(|cx| haloeth.update(cx, Haloeth::save_active));
     let saved = cx.update(|cx| haloeth.read(cx).store.load(&id).expect("load"));
     assert_eq!(saved.usage.total(), 30);
     assert_eq!(saved.usage_by_model.get("m-a").map(|usage| usage.total()), Some(30));
@@ -1028,7 +1028,7 @@ async fn sessions_persist_and_switch(cx: &mut TestAppContext) {
     assert_eq!(saved.title, "第一件事", "标题取自第一条用户消息");
 
     // 新建会话后对话为空
-    cx.update(|cx| haloeth.update(cx, |haloeth, cx| haloeth.create_session(cx)));
+    cx.update(|cx| haloeth.update(cx, Haloeth::create_session));
     let second = cx.update(|cx| haloeth.read(cx).active_id().to_owned());
     assert_ne!(second, first);
     cx.update(|cx| {
@@ -1404,7 +1404,7 @@ fn new_sessions_use_the_preferred_default_model(cx: &mut TestAppContext) {
         });
     });
     cx.update_window(handle, |_, _, cx| {
-        haloeth.update(cx, |haloeth, cx| haloeth.create_session(cx));
+        haloeth.update(cx, Haloeth::create_session);
     })
     .unwrap();
     cx.update(|cx| {
@@ -1419,7 +1419,7 @@ fn creating_a_session_on_a_blank_conversation_is_a_noop(cx: &mut TestAppContext)
     let before = cx.update(|cx| haloeth.read(cx).active_id().to_owned());
 
     cx.update_window(handle, |_, _, cx| {
-        haloeth.update(cx, |haloeth, cx| haloeth.create_session(cx));
+        haloeth.update(cx, Haloeth::create_session);
     })
     .unwrap();
     cx.update(|cx| {
@@ -1813,7 +1813,7 @@ fn tool_usage_blocks_are_detected() {
                 _ => None,
             })
             .expect("usage block"),
-        _ => panic!("expected blocks"),
+        agent::tool::ToolOutput::Json(_) => panic!("expected blocks"),
     };
     let value: serde_json::Value = serde_json::from_str(&text).expect("json");
     assert_eq!(value["model"], "img-model");

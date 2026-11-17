@@ -1,4 +1,4 @@
-//! **OpenAI** 兼容后端的模型实现，实现 [`Model`] 契约。
+//! **`OpenAI`** 兼容后端的模型实现，实现 [`Model`] 契约。
 //!
 //! 该后端以 `chat/completions` 接口为契约，始终请求流式响应（**SSE**），
 //! 并将增量帧转换为 [`StreamDelta`]。不使用 `reqwest` 的 `json` 特性，
@@ -21,8 +21,12 @@ const MAX_ERROR_BODY: usize = 500;
 
 /// 拉取服务商可用的模型标识列表，请求 `GET {base_url}/models`。
 ///
-/// 解析 **OpenAI** 兼容响应 `{"data": [{"id": "..."}]}`；结果去重并按字典序排列，
+/// 解析 **`OpenAI`** 兼容响应 `{"data": [{"id": "..."}]}`；结果去重并按字典序排列，
 /// 以保证界面顺序稳定。服务商未返回任何模型时视为错误。
+///
+/// # Errors
+///
+/// 请求失败、响应无法解析或服务商未返回模型时返回 [`ModelError`]。
 pub async fn list_models(options: &HttpModelOptions) -> Result<Vec<String>, ModelError> {
     let url = format!("{}/models", options.base_url.trim_end_matches('/'));
     let mut builder = reqwest::Client::new().get(url);
@@ -142,7 +146,7 @@ impl ToolChoicePolicy {
 }
 
 impl HttpModelOptions {
-    /// 以模型标识与 **API** 密钥构造配置；接口地址默认指向 **OpenAI** 官方接口。
+    /// 以模型标识与 **API** 密钥构造配置；接口地址默认指向 **`OpenAI`** 官方接口。
     pub fn new(model_id: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
             model_id: model_id.into(),
@@ -161,66 +165,77 @@ impl HttpModelOptions {
     }
 
     /// 设置接口基地址。
+    #[must_use]
     pub fn base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
         self
     }
 
     /// 添加附加请求参数。
+    #[must_use]
     pub fn extra(mut self, key: impl Into<String>, value: Value) -> Self {
         self.extras.insert(key.into(), value);
         self
     }
 
     /// 设置是否发送停止序列。
+    #[must_use]
     pub fn send_stop_sequences(mut self, enabled: bool) -> Self {
         self.send_stop_sequences = enabled;
         self
     }
 
     /// 设置是否请求流式 **Token** 用量。
+    #[must_use]
     pub fn stream_usage(mut self, enabled: bool) -> Self {
         self.stream_usage = enabled;
         self
     }
 
     /// 设置工具选择策略。
+    #[must_use]
     pub fn tool_choice(mut self, policy: ToolChoicePolicy) -> Self {
         self.tool_choice = policy;
         self
     }
 
     /// 设置提供方协议。
+    #[must_use]
     pub fn protocol(mut self, protocol: Protocol) -> Self {
         self.protocol = protocol;
         self
     }
 
     /// 添加一个请求头。
+    #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(name.into(), value.into());
         self
     }
 
     /// 设置请求头集合。
+    #[must_use]
     pub fn headers(mut self, headers: BTreeMap<String, String>) -> Self {
         self.headers = headers;
         self
     }
 
     /// 设置生成的最大 **Token** 数。
+    #[must_use]
     pub fn max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
         self
     }
 
     /// 设置模型支持的输入模态。
+    #[must_use]
     pub fn input_modalities(mut self, modalities: Vec<Modality>) -> Self {
         self.input_modalities = modalities;
         self
     }
 
     /// 设置 `Anthropic` 协议版本。
+    #[must_use]
     pub fn anthropic_version(mut self, version: impl Into<String>) -> Self {
         self.anthropic_version = version.into();
         self
@@ -258,11 +273,12 @@ impl fmt::Debug for HttpModelOptions {
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .field("max_tokens", &self.max_tokens)
             .field("input_modalities", &self.input_modalities)
+            .field("anthropic_version", &self.anthropic_version)
             .finish()
     }
 }
 
-/// **OpenAI** 兼容后端。
+/// **`OpenAI`** 兼容后端。
 pub struct HttpModel {
     client: reqwest::Client,
     options: HttpModelOptions,
@@ -412,6 +428,10 @@ pub struct FrameDecoder {
 
 impl FrameDecoder {
     /// 追加一块数据，返回其中已完整的增量。
+    ///
+    /// # Errors
+    ///
+    /// 遇到无法解析的流式帧时返回 [`ModelError`]。
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamDelta>, ModelError> {
         self.buffer.extend_from_slice(chunk);
         let mut deltas = Vec::new();

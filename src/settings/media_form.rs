@@ -62,8 +62,7 @@ impl MediaForm {
         let body_text = current
             .body_template
             .as_ref()
-            .map(|body| serde_json::to_string_pretty(body).unwrap_or_default())
-            .unwrap_or_default();
+            .map_or_default(|body| serde_json::to_string_pretty(body).unwrap_or_default());
         let headers =
             cx.new(|cx| EditorState::new(window, cx).placeholder("Name: value，每行一个"));
         headers.update(cx, |state, cx| state.set_value(headers_text, window, cx));
@@ -162,7 +161,7 @@ impl MediaForm {
             .child(Button::new("media-form-save").primary().label("保存").on_click({
                 let form = form.clone();
                 move |_, window, cx| {
-                    if form.update(cx, |form, cx| form.save(cx)) {
+                    if form.update(cx, MediaForm::save) {
                         window.close_dialog(cx);
                     }
                 }

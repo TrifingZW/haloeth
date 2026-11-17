@@ -29,6 +29,7 @@ impl TokenUsage {
     }
 
     /// 逐字段相减，避免下溢。
+    #[must_use]
     pub fn saturating_sub(self, other: Self) -> Self {
         Self::new(
             self.input_tokens.saturating_sub(other.input_tokens),
@@ -67,7 +68,7 @@ impl Timing {
     pub fn from_duration(duration: Duration) -> Self {
         let finished = Instant::now();
         Self {
-            started: finished - duration,
+            started: finished.checked_sub(duration).unwrap_or(finished),
             finished: Some(finished),
         }
     }

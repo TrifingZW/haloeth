@@ -52,6 +52,7 @@ impl ShellTool {
     }
 
     /// 设置执行超时。
+    #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self

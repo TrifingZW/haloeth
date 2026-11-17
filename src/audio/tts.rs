@@ -151,7 +151,7 @@ fn worker(receiver: std::sync::mpsc::Receiver<Command>) {
                     };
                     unsafe {
                         let _ = voice.SetRate(settings.rate.clamp(-10, 10));
-                        let _ = voice.SetVolume(settings.volume.min(100) as u16);
+                        let _ = voice.SetVolume(u16::from(settings.volume.min(100)));
                         let _ = voice.Speak(PCWSTR::null(), SPF_PURGEBEFORESPEAK.0 as u32, None);
                         spoken = Some(HSTRING::from(text));
                         if let Some(text) = &spoken
@@ -207,7 +207,7 @@ fn worker(receiver: std::sync::mpsc::Receiver<Command>) {
     }
 }
 
-/// 调用 OpenAI 兼容的 `audio/speech`，返回 WAV 数据。
+/// 调用 `OpenAI` 兼容的 `audio/speech`，返回 WAV 数据。
 #[cfg(windows)]
 pub(crate) fn synthesize(settings: &TtsSettings, text: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::new();

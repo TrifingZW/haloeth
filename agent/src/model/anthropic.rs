@@ -1,9 +1,9 @@
 //! **Anthropic Messages** 协议后端。
 //!
-//! 与 **OpenAI Chat** 的差异集中在三处，本模块各自处理：
-//! 1) 请求体：`system` 在顶层，`tools[].input_schema`，`tool_choice` 用 `auto` / `any` / `none`；
-//! 2) 消息投影：user / assistant 交替，工具结果放进 user 的 `tool_result` 内容块；
-//! 3) 流式事件：`message_start` / `content_block_*` / `message_delta` / `message_stop`。
+//! 与 **`OpenAI` Chat** 的差异集中在三处，本模块各自处理：
+//! - 请求体：`system` 在顶层，`tools[].input_schema`，`tool_choice` 用 `auto` / `any` / `none`；
+//! - 消息投影：user / assistant 交替，工具结果放进 user 的 `tool_result` 内容块；
+//! - 流式事件：`message_start` / `content_block_*` / `message_delta` / `message_stop`。
 //!
 //! 传输与鉴权复用 [`HttpModelOptions`]：`x-api-key` 与 `anthropic-version` 是默认头，
 //! 自定义头最后应用，因此可以覆盖版本或改用网关的鉴权方式。
@@ -300,6 +300,10 @@ pub struct AnthropicDecoder {
 
 impl AnthropicDecoder {
     /// 追加一块数据，返回其中已完整的增量。
+    ///
+    /// # Errors
+    ///
+    /// 遇到无法解析的流式帧时返回 [`ModelError`]。
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamDelta>, ModelError> {
         self.buffer.extend_from_slice(chunk);
         let mut deltas = Vec::new();
@@ -401,10 +405,10 @@ impl AnthropicDecoder {
                 }))
             }
             "error" => {
-                let message = event
-                    .error
-                    .map(|error| format!("{}: {}", error.kind, error.message))
-                    .unwrap_or_else(|| data.to_owned());
+                let message = event.error.map_or_else(
+                    || data.to_owned(),
+                    |error| format!("{}: {}", error.kind, error.message),
+                );
                 Err(ModelError::Malformed {
                     reason: format!("Anthropic stream error: {message}"),
                 })

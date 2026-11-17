@@ -45,10 +45,7 @@ impl AccessForm {
 
     /// 当前会话的「始终允许」规则。
     fn rules(&self, cx: &App) -> Vec<AllowRule> {
-        self.session
-            .upgrade()
-            .map(|session| session.read(cx).always_allow().to_vec())
-            .unwrap_or_default()
+        self.session.upgrade().map_or_default(|session| session.read(cx).always_allow().to_vec())
     }
 
     /// 移除一条「始终允许」规则。
@@ -60,7 +57,7 @@ impl AccessForm {
                 session.update(cx, |session, cx| session.set_always_allow(rules, cx));
             }
             if let Some(haloeth) = self.haloeth.upgrade() {
-                haloeth.update(cx, |haloeth, cx| haloeth.save_active(cx));
+                haloeth.update(cx, Haloeth::save_active);
             }
             cx.notify();
         }
@@ -68,7 +65,7 @@ impl AccessForm {
 
     /// 当前会话的授权。
     fn grants(&self, cx: &App) -> Vec<DirectoryGrant> {
-        self.session.upgrade().map(|session| session.read(cx).grants().to_vec()).unwrap_or_default()
+        self.session.upgrade().map_or_default(|session| session.read(cx).grants().to_vec())
     }
 
     /// 写回会话并立即保存。
@@ -77,7 +74,7 @@ impl AccessForm {
             session.update(cx, |session, cx| session.set_grants(grants, cx));
         }
         if let Some(haloeth) = self.haloeth.upgrade() {
-            haloeth.update(cx, |haloeth, cx| haloeth.save_active(cx));
+            haloeth.update(cx, Haloeth::save_active);
         }
         cx.notify();
     }

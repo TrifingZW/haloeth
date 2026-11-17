@@ -94,8 +94,7 @@ impl Render for ImageViewer {
         let size = self
             .original
             .as_ref()
-            .map(|image| (image.width() as f32, image.height() as f32))
-            .unwrap_or((0., 0.));
+            .map_or((0., 0.), |image| (image.width() as f32, image.height() as f32));
         let display_width = size.0 * self.zoom;
         let display_height = size.1 * self.zoom;
 

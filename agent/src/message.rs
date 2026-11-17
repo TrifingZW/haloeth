@@ -5,6 +5,7 @@ use crate::metrics::TokenUsage;
 use serde_json::{Map, Value};
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 /// 内部对话角色。
 ///
@@ -201,6 +202,7 @@ impl Message {
     }
 
     /// 附加 **Token** 用量。
+    #[must_use]
     pub fn with_usage(mut self, usage: TokenUsage) -> Self {
         self.usage = Some(usage);
         self
@@ -236,9 +238,9 @@ pub struct ToolCallDelta {
 /// 将增量序列聚合为一条完整的助手消息。
 ///
 /// 聚合规则：
-/// 1) 文本增量按出现顺序拼接。
-/// 2) 工具调用分片按索引合并：标识符与名称取首个非空分片，参数按分片顺序拼接后解析；无法解析时保留原始文本。
-/// 3) 用量取最后一个非空值，提供方通常在末帧给出累计用量。
+/// - 文本增量按出现顺序拼接。
+/// - 工具调用分片按索引合并：标识符与名称取首个非空分片，参数按分片顺序拼接后解析；无法解析时保留原始文本。
+/// - 用量取最后一个非空值，提供方通常在末帧给出累计用量。
 ///
 /// 若分片缺失标识符或名称，聚合结果以空字符串表示，由调用方在工具调度阶段校验。
 pub fn assemble(deltas: impl IntoIterator<Item = StreamDelta>) -> Message {
@@ -315,7 +317,7 @@ fn parse_arguments(text: &str) -> Value {
     serde_json::from_str(trimmed).unwrap_or_else(|_| Value::String(text.to_owned()))
 }
 
-/// 提供方协议投影（**OpenAI** 兼容形态）。
+/// 提供方协议投影（**`OpenAI`** 兼容形态）。
 pub mod wire {
     use serde::Serialize;
 
@@ -323,20 +325,28 @@ pub mod wire {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "lowercase")]
     pub enum WireRole {
+        /// 系统指令。
         System,
+        /// 用户消息。
         User,
+        /// 模型回复。
         Assistant,
+        /// 工具结果。
         Tool,
     }
 
     /// 一条提供方协议消息。
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct WireMessage {
+        /// 消息角色。
         pub role: WireRole,
+        /// 文本或内容块；无内容时省略。
         #[serde(skip_serializing_if = "Option::is_none")]
         pub content: Option<WireContent>,
+        /// 模型请求的工具调用；无调用时省略。
         #[serde(skip_serializing_if = "Option::is_none")]
         pub tool_calls: Option<Vec<WireToolCall>>,
+        /// 该消息对应的工具调用标识；仅工具结果使用。
         #[serde(skip_serializing_if = "Option::is_none")]
         pub tool_call_id: Option<String>,
     }
@@ -345,7 +355,9 @@ pub mod wire {
     #[derive(Debug, Clone, PartialEq, Serialize)]
     #[serde(untagged)]
     pub enum WireContent {
+        /// 纯文本。
         Text(String),
+        /// 内容块数组。
         Blocks(Vec<WireContentBlock>),
     }
 
@@ -353,13 +365,19 @@ pub mod wire {
     #[derive(Debug, Clone, PartialEq, Serialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub enum WireContentBlock {
+        /// 文本块。
         Text {
+            /// 块内文本。
             text: String,
         },
+        /// 图像块。
         ImageUrl {
+            /// 图像地址载荷。
             image_url: WireImageUrl,
         },
+        /// 内联音频块。
         InputAudio {
+            /// 音频载荷。
             input_audio: WireInputAudio,
         },
     }
@@ -367,6 +385,7 @@ pub mod wire {
     /// 图像地址载荷。
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct WireImageUrl {
+        /// 图像地址或数据 URI。
         pub url: String,
     }
 
@@ -382,9 +401,12 @@ pub mod wire {
     /// 工具调用。
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct WireToolCall {
+        /// 调用标识。
         pub id: String,
+        /// 调用类型。
         #[serde(rename = "type")]
         pub kind: WireToolCallKind,
+        /// 函数载荷。
         pub function: WireToolFunction,
     }
 
@@ -392,12 +414,14 @@ pub mod wire {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "lowercase")]
     pub enum WireToolCallKind {
+        /// 函数调用。
         Function,
     }
 
     /// 工具调用的函数载荷。
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct WireToolFunction {
+        /// 函数名。
         pub name: String,
         /// 参数的 **JSON** 文本。
         pub arguments: String,
@@ -443,10 +467,10 @@ pub fn retain_modalities(messages: &[Message], allowed: &[crate::model::Modality
 /// 将内部消息序列投影为提供方协议消息序列。
 ///
 /// 投影规则：
-/// 1) 角色映射：系统、用户、助手角色保持不变；工具调用消息并入助手消息，工具结果消息映射为工具角色并携带调用标识符。
-/// 2) 消息合并：相邻且角色相同、且不属于工具结果的消息合并；工具结果消息因携带独立标识符而不参与合并。
-/// 3) 内容投影：仅含文本时投影为字符串，含图像或音频时投影为内容块数组。
-/// 4) 工具结果中的媒体块无法进入 tool 消息，拆到紧随其后的用户消息。
+/// - 角色映射：系统、用户、助手角色保持不变；工具调用消息并入助手消息，工具结果消息映射为工具角色并携带调用标识符。
+/// - 消息合并：相邻且角色相同、且不属于工具结果的消息合并；工具结果消息因携带独立标识符而不参与合并。
+/// - 内容投影：仅含文本时投影为字符串，含图像或音频时投影为内容块数组。
+/// - 工具结果中的媒体块无法进入 tool 消息，拆到紧随其后的用户消息。
 pub fn normalize(messages: &[Message]) -> Vec<WireMessage> {
     let mut output: Vec<WireMessage> = Vec::with_capacity(messages.len());
     // 同一轮可能有多个带媒体的工具结果：先把 tool 消息全部输出，再补一条用户消息，
@@ -506,10 +530,8 @@ fn split_tool_media(message: &Message) -> Option<(WireMessage, Vec<ContentBlock>
             text.push_str(value);
         }
     }
-    text.push_str(&format!(
-        "\n\n({} media attachment(s) follow in the next user message)",
-        media.len()
-    ));
+    let _ =
+        write!(text, "\n\n({} media attachment(s) follow in the next user message)", media.len());
     let tool = WireMessage {
         role: WireRole::Tool,
         content: Some(WireContent::Text(text)),

@@ -1,8 +1,8 @@
 //! 工具契约：声明式元数据、调用前参数校验、注册表与协议投影。
 //!
-//! 与 smolagents 的差异有两点，均为动作空间选择的结果：
-//! 1) 不提供代码签名式渲染器，仅保留工具调用空间的单行描述渲染。
-//! 2) 不提供惰性初始化钩子，需要延迟初始化的实现应自行使用 [`std::sync::OnceLock`]。
+//! 与 smolagents 的差异，均为动作空间选择的结果：
+//! - 不提供代码签名式渲染器，仅保留工具调用空间的单行描述渲染。
+//! - 不提供惰性初始化钩子，需要延迟初始化的实现应自行使用 [`std::sync::OnceLock`]。
 //!
 //! 执行方法返回装箱 future：**Rust** 侧的**HTTP** 工具需要异步等待，而装箱保持契约可作 trait 对象使用。
 //!
@@ -10,6 +10,7 @@
 //! 声明是否必须经过审核。`MCP` 工具等无法静态分析的来源声明为 [`ToolEffect::Unknown`]。
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -167,6 +168,7 @@ impl InputSpec {
     }
 
     /// 标记为可空。
+    #[must_use]
     pub fn nullable(mut self) -> Self {
         self.nullable = true;
         self
@@ -176,7 +178,7 @@ impl InputSpec {
 /// 工具元数据契约。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
-    /// 工具名称，须符合 [`is_valid_name`] 的规则且在注册表内唯一。
+    /// 工具名称，须符合 `is_valid_name` 的规则且在注册表内唯一。
     pub name: String,
     /// 工具描述，供模型判断何时调用。
     pub description: String,
@@ -217,42 +219,52 @@ impl ToolSpec {
     }
 
     /// 声明一个输入。
+    #[must_use]
     pub fn input(mut self, name: impl Into<String>, spec: InputSpec) -> Self {
         self.inputs.insert(name.into(), spec);
         self
     }
 
     /// 声明输出的 **JSON Schema**。
+    #[must_use]
     pub fn output_schema(mut self, schema: Value) -> Self {
         self.output_schema = Some(schema);
         self
     }
 
     /// 声明一项系统影响。
+    #[must_use]
     pub fn effect(mut self, effect: ToolEffect) -> Self {
         self.effects.push(effect);
         self
     }
 
     /// 声明审核要求。
+    #[must_use]
     pub fn approval(mut self, approval: ApprovalRequirement) -> Self {
         self.approval = approval;
         self
     }
 
     /// 使用原始参数 **JSON Schema**。
+    #[must_use]
     pub fn raw_parameters(mut self, schema: Value) -> Self {
         self.raw_parameters = Some(schema);
         self
     }
 
     /// 设置参数校验方式。
+    #[must_use]
     pub fn validation(mut self, validation: Validation) -> Self {
         self.validation = validation;
         self
     }
 
     /// 校验元数据合法性。
+    ///
+    /// # Errors
+    ///
+    /// 名称、描述或输入声明不合法时返回 [`ToolError::InvalidSpec`]。
     pub fn validate(&self) -> Result<(), ToolError> {
         let invalid = |reason: String| ToolError::InvalidSpec {
             name: self.name.clone(),
@@ -283,6 +295,10 @@ impl ToolSpec {
     }
 
     /// 校验并规范化调用参数；校验方式为 [`Validation::None`] 时原样传递对象。
+    ///
+    /// # Errors
+    ///
+    /// 严格校验失败时返回 [`ToolError::InvalidArguments`]。
     pub fn resolve(&self, arguments: &Value) -> Result<Map<String, Value>, ToolError> {
         match self.validation {
             Validation::Strict => resolve_arguments(self, arguments),
@@ -305,13 +321,14 @@ impl ToolSpec {
                 } else {
                     ""
                 };
-                description.push_str(&format!(
+                let _ = write!(
+                    description,
                     "\n    - {name} ({}): {}{optional}",
                     input.ty, input.description
-                ));
+                );
             }
         }
-        description.push_str(&format!("\n    Returns an output of type: {}", self.output_type));
+        let _ = write!(description, "\n    Returns an output of type: {}", self.output_type);
         description
     }
 }
@@ -454,6 +471,10 @@ impl ToolSet {
     }
 
     /// 注册工具；元数据不合法或名称重复时报错。
+    ///
+    /// # Errors
+    ///
+    /// 元数据不合法或名称重复时返回 [`ToolError`]。
     pub fn insert(&mut self, tool: impl Tool + 'static) -> Result<(), ToolError> {
         tool.spec().validate()?;
         let name = tool.spec().name.clone();
@@ -472,6 +493,10 @@ impl ToolSet {
     }
 
     /// 按名称查找工具、校验参数并执行。
+    ///
+    /// # Errors
+    ///
+    /// 工具不存在、参数不合法或执行失败时返回 [`ToolError`]。
     pub async fn call(&self, name: &str, arguments: &Value) -> Result<ToolOutput, ToolError> {
         let tool = self.get(name).ok_or_else(|| ToolError::UnknownTool {
             name: name.to_owned(),
@@ -514,11 +539,15 @@ impl ToolSet {
 /// 校验并规范化工具调用参数。
 ///
 /// 规范化与校验规则：
-/// 1) 参数为对象时按键校验；为标量且工具仅声明一个输入时，视为该输入的值。
-/// 2) 未声明的参数名被拒绝。
-/// 3) 缺失的参数在非可空时报错。
-/// 4) 显式为空值仅允许可空参数。
-/// 5) 类型不匹配时报错；整数放宽为数值；图像与音频输入接受字符串（地址或 `Base64` 数据）。
+/// - 参数为对象时按键校验；为标量且工具仅声明一个输入时，视为该输入的值。
+/// - 未声明的参数名被拒绝。
+/// - 缺失的参数在非可空时报错。
+/// - 显式为空值仅允许可空参数。
+/// - 类型不匹配时报错；整数放宽为数值；图像与音频输入接受字符串（地址或 `Base64` 数据）。
+///
+/// # Errors
+///
+/// 参数缺失、为空、未知或类型不匹配时返回 [`ToolError::InvalidArguments`]。
 pub fn resolve_arguments(
     spec: &ToolSpec,
     arguments: &Value,
@@ -547,9 +576,8 @@ pub fn resolve_arguments(
 
     for (name, input) in &spec.inputs {
         match provided.get(name) {
-            None if input.nullable => {}
+            None | Some(Value::Null) if input.nullable => {}
             None => return Err(invalid(format!("missing required argument '{name}'"))),
-            Some(Value::Null) if input.nullable => {}
             Some(Value::Null) => {
                 return Err(invalid(format!("argument '{name}' must not be null")));
             }
@@ -577,8 +605,10 @@ pub mod wire {
     /// 工具声明。
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct WireTool {
+        /// 工具类型。
         #[serde(rename = "type")]
         pub kind: WireToolKind,
+        /// 函数声明。
         pub function: WireFunction,
     }
 
@@ -586,13 +616,16 @@ pub mod wire {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "lowercase")]
     pub enum WireToolKind {
+        /// 函数工具。
         Function,
     }
 
     /// 函数声明。
     #[derive(Debug, Clone, PartialEq, Serialize)]
     pub struct WireFunction {
+        /// 函数名。
         pub name: String,
+        /// 面向模型的说明。
         pub description: String,
         /// 参数 **JSON Schema**：内置工具按输入声明生成，`MCP` 工具保留服务器原始模式。
         pub parameters: Value,

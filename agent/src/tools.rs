@@ -35,6 +35,10 @@ pub struct BuiltinOptions {
 }
 
 /// 装配内置工具集：网页访问、当前时间、文件、Shell 与可选搜索。
+///
+/// # Panics
+///
+/// 冻结的内置工具名称冲突时会 panic（属于编程错误）。
 pub fn builtin_tools(options: &BuiltinOptions) -> ToolSet {
     let mut tools = default_tools();
     tools.insert(ReadFileTool::new()).expect("内置工具名称固定且互不冲突");

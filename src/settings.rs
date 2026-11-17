@@ -406,11 +406,8 @@ impl SettingsForm {
             return false;
         }
         // 测试注入的会话不写真实配置文件。
-        let persist = self
-            .session
-            .upgrade()
-            .map(|session| session.read(cx).persists_config())
-            .unwrap_or(true);
+        let persist =
+            self.session.upgrade().is_none_or(|session| session.read(cx).persists_config());
         if persist && let Err(error) = self.draft.save() {
             self.error = Some(format!("保存失败：{error}").into());
             cx.notify();
@@ -420,7 +417,7 @@ impl SettingsForm {
         let config = self.draft.clone();
         self.last_saved = config.clone();
         self.session.update(cx, |session, cx| session.apply_config(config, cx)).ok();
-        self.haloeth.update(cx, |haloeth, cx| haloeth.sync_input_preferences(cx)).ok();
+        self.haloeth.update(cx, Haloeth::sync_input_preferences).ok();
         true
     }
 
@@ -457,11 +454,8 @@ impl SettingsForm {
         self.draft.audio.asr.endpoint = self.asr_endpoint.read(cx).value().trim().to_owned();
         self.draft.audio.tts.endpoint = self.tts_endpoint.read(cx).value().trim().to_owned();
 
-        let persist = self
-            .session
-            .upgrade()
-            .map(|session| session.read(cx).persists_config())
-            .unwrap_or(true);
+        let persist =
+            self.session.upgrade().is_none_or(|session| session.read(cx).persists_config());
         if persist && let Err(error) = self.draft.save() {
             self.error = Some(format!("保存失败：{error}").into());
             cx.notify();
@@ -734,7 +728,7 @@ impl SettingsForm {
             .child(Button::new("settings-save").primary().label("保存").on_click({
                 let form = form.clone();
                 move |_, window, cx| {
-                    if form.update(cx, |form, cx| form.save(cx)) {
+                    if form.update(cx, SettingsForm::save) {
                         window.close_dialog(cx);
                     }
                 }
@@ -790,10 +784,10 @@ impl SettingsForm {
                 .into_any_element();
         }
 
-        let label = current
-            .as_ref()
-            .map(|selection| format!("{} · {}", selection.provider, selection.model))
-            .unwrap_or_else(|| "无".to_owned());
+        let label = current.as_ref().map_or_else(
+            || "无".to_owned(),
+            |selection| format!("{} · {}", selection.provider, selection.model),
+        );
         let tint = if current.is_some() {
             Tone::Neutral
         } else {
@@ -1265,7 +1259,7 @@ impl SettingsForm {
             .child(
                 Button::new("tts-test").outline().border_2().xsmall().label("试听播报").on_click(
                     cx.listener(|this, _, _, cx| {
-                        let _ = this.haloeth.update(cx, |haloeth, cx| haloeth.preview_tts(cx));
+                        let _ = this.haloeth.update(cx, Haloeth::preview_tts);
                     }),
                 ),
             )
@@ -1392,7 +1386,7 @@ impl SettingsForm {
                     "测试麦克风"
                 })
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.asr.update(cx, |asr, cx| asr.toggle(cx));
+                    this.asr.update(cx, SpeechState::toggle);
                 })),
             )
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child(msg(status)))
@@ -1527,7 +1521,7 @@ impl SettingsForm {
 
     /// 调整音量。
     fn adjust_tts_volume(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let volume = self.draft.audio.tts.volume as i32 + delta;
+        let volume = i32::from(self.draft.audio.tts.volume) + delta;
         self.draft.audio.tts.volume = volume.clamp(0, 100) as u8;
         cx.notify();
     }
@@ -1916,8 +1910,7 @@ impl SettingsForm {
         let default_dir = self
             .draft
             .default_skill_dir()
-            .map(|dir| dir.display().to_string())
-            .unwrap_or_else(|| "未找到系统配置目录".to_owned());
+            .map_or_else(|| "未找到系统配置目录".to_owned(), |dir| dir.display().to_string());
 
         let dir_rows: Vec<AnyElement> = self
             .draft

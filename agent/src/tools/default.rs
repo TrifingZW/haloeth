@@ -28,6 +28,10 @@ const MAX_BODY_BYTES: usize = 2_000_000;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 构造内置工具集。
+///
+/// # Panics
+///
+/// 冻结的工具元数据不合法或名称冲突时会 panic（属于编程错误）。
 pub fn default_tools() -> ToolSet {
     let mut tools = ToolSet::new();
     tools.insert(FetchUrlTool::new()).expect("内置工具的元数据固定合法且名称互不冲突");
@@ -161,10 +165,8 @@ fn failure(reason: String) -> ToolError {
 
 /// 渲染系统时间为 `YYYY-MM-DD HH:MM:SS UTC`。
 fn render_utc(time: SystemTime) -> String {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default();
+    let seconds =
+        time.duration_since(UNIX_EPOCH).map_or_default(|duration| duration.as_secs() as i64);
     let days = seconds.div_euclid(86_400);
     let remainder = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);

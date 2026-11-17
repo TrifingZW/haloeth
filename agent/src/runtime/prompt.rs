@@ -3,6 +3,8 @@
 //! 全部文本面向模型，使用英文，并由本模块作为文本的单点来源。模板变量以函数参数传入，
 //! 不使用通用模板引擎。
 
+use std::fmt::Write as _;
+
 use crate::approval::DirectoryGrant;
 use crate::tool::{Access, ToolSet};
 
@@ -27,7 +29,7 @@ pub fn workspace_section(grants: &[DirectoryGrant]) -> String {
             Access::Read => "read only",
             Access::Write => "read and write",
         };
-        text.push_str(&format!("- {} ({access})\n", grant.path.display()));
+        let _ = writeln!(text, "- {} ({access})", grant.path.display());
     }
     text.push_str(
         "\nPrefer these directories when a task needs files, but the user's request takes precedence: \

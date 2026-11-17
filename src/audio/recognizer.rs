@@ -172,6 +172,14 @@ impl RecognitionSession for CloudSession {
     }
 }
 
+/// 云端转写响应。
+#[derive(serde::Deserialize)]
+struct Transcription {
+    /// 转写文本；缺失时为空。
+    #[serde(default)]
+    text: String,
+}
+
 /// 调用 `audio/transcriptions` 并返回文本。
 async fn transcribe(config: &CloudConfig, wav: Vec<u8>) -> Result<String, String> {
     if config.dashscope {
@@ -201,11 +209,6 @@ async fn transcribe(config: &CloudConfig, wav: Vec<u8>) -> Result<String, String
     let body = response.text().await.map_err(|error| error.to_string())?;
     if !status.is_success() {
         return Err(format!("transcription failed with status {status}: {body}"));
-    }
-    #[derive(serde::Deserialize)]
-    struct Transcription {
-        #[serde(default)]
-        text: String,
     }
     let parsed: Transcription =
         serde_json::from_str(&body).map_err(|error| format!("invalid transcription: {error}"))?;

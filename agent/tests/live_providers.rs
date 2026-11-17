@@ -88,6 +88,8 @@ async fn deepseek_search_returns_results() {
     assert!(output.observation().contains("http"));
 }
 
+const BLUE_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAN0lEQVR4nO3RMQ0AMAzEQLf8OacQ3CWbD8BHcg4Mm+7qOh340A9UiVSJVIlUiVSJVIlUiVSJMA+hxgE/8m7SpQAAAABJRU5ErkJggg==";
+
 #[tokio::test]
 #[ignore = "requires HALOETH_TEST_KEYS_FILE"]
 async fn bailian_accepts_image_input() {
@@ -97,7 +99,6 @@ async fn bailian_accepts_image_input() {
     let Some(key) = keys.get("阿里云千问平台通用") else {
         return;
     };
-    const BLUE_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAN0lEQVR4nO3RMQ0AMAzEQLf8OacQ3CWbD8BHcg4Mm+7qOh340A9UiVSJVIlUiVSJVIlUiVSJMA+hxgE/8m7SpQAAAABJRU5ErkJggg==";
     let model = build_model(
         HttpModelOptions::new("qwen3-vl-plus", key)
             .base_url("https://dashscope.aliyuncs.com/compatible-mode/v1")

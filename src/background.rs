@@ -248,7 +248,7 @@ mod windows_impl {
             });
         });
 
-        let instance = GetModuleHandleW(None).map(|module| HINSTANCE(module.0)).unwrap_or_default();
+        let instance = GetModuleHandleW(None).map_or_default(|module| HINSTANCE(module.0));
         let class = HSTRING::from("HaloethBackground");
         let window_class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -256,7 +256,7 @@ mod windows_impl {
             lpszClassName: PCWSTR(class.as_ptr()),
             ..Default::default()
         };
-        let _ = RegisterClassW(&window_class);
+        let _ = RegisterClassW(&raw const window_class);
         let hwnd = match CreateWindowExW(
             WS_EX_TOOLWINDOW,
             PCWSTR(class.as_ptr()),
@@ -287,9 +287,9 @@ mod windows_impl {
         tracing::info!("后台线程就绪，键盘钩子：{}", hook.is_some());
 
         let mut message = Default::default();
-        while GetMessageW(&mut message, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
+        while GetMessageW(&raw mut message, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&raw const message);
+            DispatchMessageW(&raw const message);
             sync_hotkey();
         }
 
@@ -368,13 +368,13 @@ mod windows_impl {
                 return false;
             }
             let mut pid = 0u32;
-            GetWindowThreadProcessId(window, Some(&mut pid));
+            GetWindowThreadProcessId(window, Some(&raw mut pid));
             pid == GetCurrentProcessId()
         }
     }
 
     fn key_down(key: VIRTUAL_KEY) -> bool {
-        unsafe { (GetAsyncKeyState(key.0 as i32) as u16 & 0x8000) != 0 }
+        unsafe { (GetAsyncKeyState(i32::from(key.0)) as u16 & 0x8000) != 0 }
     }
 
     unsafe extern "system" fn window_proc(
@@ -419,7 +419,7 @@ mod windows_impl {
         let tip: Vec<u16> = "Haloeth".encode_utf16().collect();
         let len = tip.len().min(data.szTip.len() - 1);
         data.szTip[..len].copy_from_slice(&tip[..len]);
-        let _ = Shell_NotifyIconW(NIM_ADD, &data);
+        let _ = Shell_NotifyIconW(NIM_ADD, &raw const data);
     }
 
     unsafe fn remove_tray(hwnd: HWND) {
@@ -429,7 +429,7 @@ mod windows_impl {
             uID: 1,
             ..Default::default()
         };
-        let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        let _ = Shell_NotifyIconW(NIM_DELETE, &raw const data);
     }
 
     unsafe fn show_menu(hwnd: HWND) {
@@ -486,7 +486,7 @@ mod windows_impl {
         let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("退出"));
 
         let mut point = POINT::default();
-        let _ = GetCursorPos(&mut point);
+        let _ = GetCursorPos(&raw mut point);
         let _ = SetForegroundWindow(hwnd);
         // 没有 `TPM_RETURNCMD` 时菜单只发 WM_COMMAND，而隐藏窗口没有处理它，
         // 于是所有菜单项都不会有任何反应。

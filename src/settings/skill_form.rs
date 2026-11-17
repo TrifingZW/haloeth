@@ -114,7 +114,7 @@ impl SkillForm {
             .child(Button::new("skill-form-save").primary().label("创建").on_click({
                 let form = form.clone();
                 move |_, window, cx| {
-                    if form.update(cx, |form, cx| form.save(cx)) {
+                    if form.update(cx, SkillForm::save) {
                         window.close_dialog(cx);
                     }
                 }

@@ -3,6 +3,7 @@
 //! 路径安全由审核层负责；这些工具只做内容层面的约束：
 //! 拒绝二进制文件、限制读取与列举规模、写文件时不自动创建父目录。
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use serde_json::{Map, Value};
@@ -82,7 +83,7 @@ impl Tool for ReadFileTool {
 
             let mut header = format!("{path}\nlines {}-{} of {}", start + 1, end, lines.len());
             if selected.chars().count() > MAX_READ {
-                header.push_str(&format!("\n[truncated to {MAX_READ} characters]"));
+                let _ = write!(header, "\n[truncated to {MAX_READ} characters]");
             }
             Ok(Value::String(format!("{header}\n\n{body}")).into())
         })

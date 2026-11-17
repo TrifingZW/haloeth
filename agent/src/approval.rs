@@ -5,8 +5,9 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -171,6 +172,7 @@ impl Default for ApprovalPolicy {
 
 impl ApprovalPolicy {
     /// 设置相对路径基准目录。
+    #[must_use]
     pub fn with_base_dir(mut self, base: impl Into<PathBuf>) -> Self {
         self.base_dir = Some(base.into());
         self
@@ -281,6 +283,11 @@ struct HandleInner {
     waiters: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
 }
 
+/// 获取互斥锁；锁被毒化时沿用内部值，避免一次 panic 让审批永久不可用。
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 impl ApprovalHandle {
     /// 构造句柄。
     pub fn new() -> Self {
@@ -305,13 +312,13 @@ impl ApprovalHandle {
     /// 登记一个待决审批，返回接收端。
     fn register(&self, id: &str) -> oneshot::Receiver<ApprovalDecision> {
         let (sender, receiver) = oneshot::channel();
-        self.inner.waiters.lock().expect("审批表不应被毒化").insert(id.to_owned(), sender);
+        lock(&self.inner.waiters).insert(id.to_owned(), sender);
         receiver
     }
 
     /// 回传决策；对应审批不存在或已被取消时返回 `false`。
     pub fn resolve(&self, id: &str, decision: ApprovalDecision) -> bool {
-        let waiter = self.inner.waiters.lock().expect("审批表不应被毒化").remove(id);
+        let waiter = lock(&self.inner.waiters).remove(id);
         match waiter {
             Some(sender) => sender.send(decision).is_ok(),
             None => false,
@@ -320,7 +327,7 @@ impl ApprovalHandle {
 
     /// 以拒绝解析全部挂起审批。
     pub fn deny_all(&self) {
-        let waiters = std::mem::take(&mut *self.inner.waiters.lock().expect("审批表不应被毒化"));
+        let waiters = std::mem::take(&mut *lock(&self.inner.waiters));
         for (_, sender) in waiters {
             let _ = sender.send(ApprovalDecision::Deny);
         }
@@ -357,24 +364,25 @@ impl PolicyGate {
     }
 
     /// 设置审核模型，用于 [`ApprovalMode::Model`] 的升级判断。
+    #[must_use]
     pub fn with_reviewer(self, model: Box<dyn Model>) -> Self {
-        *self.reviewer.lock().expect("审核模型不应被毒化") = Some(Arc::from(model));
+        *lock(&self.reviewer) = Some(Arc::from(model));
         self
     }
 
     /// 当前策略副本。
     pub fn policy(&self) -> ApprovalPolicy {
-        self.policy.lock().expect("策略不应被毒化").clone()
+        lock(&self.policy).clone()
     }
 
     /// 切换审核模式。
     pub fn set_mode(&self, mode: ApprovalMode) {
-        self.policy.lock().expect("策略不应被毒化").mode = mode;
+        lock(&self.policy).mode = mode;
     }
 
     /// 追加一条「始终允许」规则，立即作用于本次运行。
     pub fn add_rule(&self, rule: AllowRule) {
-        let mut policy = self.policy.lock().expect("策略不应被毒化");
+        let mut policy = lock(&self.policy);
         if !policy.rules.iter().any(|existing| existing == &rule) {
             policy.rules.push(rule);
         }
@@ -382,7 +390,7 @@ impl PolicyGate {
 
     /// 派发一个活动事件；没有接收方时忽略。
     fn emit(&self, activity: Activity) {
-        let events = self.events.lock().expect("事件发送端不应被毒化");
+        let events = lock(&self.events);
         if let Some(events) = events.as_ref() {
             let _ = events.send(Event::Activity(activity));
         }
@@ -390,7 +398,7 @@ impl PolicyGate {
 
     /// 释放事件发送端。
     fn close_events(&self) {
-        self.events.lock().expect("事件发送端不应被毒化").take();
+        lock(&self.events).take();
     }
 
     /// 记录并派发一次审批结论。
@@ -406,12 +414,12 @@ impl PolicyGate {
     /// 请求人工审批，等待回传或取消。
     async fn ask_human(&self, spec: &ToolSpec, call: &ToolCall, reason: &str) -> ApprovalDecision {
         let request = build_request(spec, call, true);
-        let receiver = self.handle.register(&request.id);
+        let waiter = self.handle.register(&request.id);
         self.emit(Activity::ApprovalRequested(request.clone()));
         let token = self.handle.token();
         let decision = tokio::select! {
-            received = receiver => received.unwrap_or(ApprovalDecision::Deny),
-            _ = token.cancelled() => ApprovalDecision::Deny,
+            answer = waiter => answer.unwrap_or(ApprovalDecision::Deny),
+            () = token.cancelled() => ApprovalDecision::Deny,
         };
         self.finish(&request.id, decision, reason)
     }
@@ -423,14 +431,14 @@ impl PolicyGate {
     async fn ask_model(&self, spec: &ToolSpec, call: &ToolCall) -> ApprovalDecision {
         let request = build_request(spec, call, false);
         let reviewer = {
-            let guard = self.reviewer.lock().expect("审核模型不应被毒化");
+            let guard = lock(&self.reviewer);
             guard.clone()
         };
         let Some(model) = reviewer else {
             return self.ask_human(spec, call, "no reviewer model configured").await;
         };
 
-        let context = self.context.lock().expect("审核上下文不应被毒化").clone();
+        let context = lock(&self.context).clone();
         let messages = reviewer_prompt(&request, &context);
 
         let request_model = GenerateRequest::new(messages).tool_choice(ToolChoice::None);
@@ -464,7 +472,7 @@ impl PolicyGate {
 impl ApprovalGate for PolicyGate {
     async fn decide(&self, spec: &ToolSpec, call: &ToolCall) -> ApprovalDecision {
         let (mode, verdict) = {
-            let policy = self.policy.lock().expect("策略不应被毒化");
+            let policy = lock(&self.policy);
             (policy.mode, evaluate(&policy, spec, &call.arguments))
         };
 
@@ -797,7 +805,7 @@ pub fn check_network(policy: &ApprovalPolicy, url: &str) -> Verdict {
         return Verdict::ask("only http and https are handled automatically");
     }
     let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = host.rsplit_once('@').map(|(_, host)| host).unwrap_or(host);
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
     let host = host.split(':').next().unwrap_or(host).to_lowercase();
     if host.is_empty() || is_private_host(&host) {
         return Verdict::ask("the target is local or private");
@@ -976,7 +984,7 @@ fn reviewer_prompt(
                 crate::message::Role::ToolResponse => "tool result",
                 crate::message::Role::System => "system",
             };
-            user.push_str(&format!("{role}: {}\n", truncate_text(&text, 600)));
+            let _ = writeln!(user, "{role}: {}", truncate_text(&text, 600));
         }
         user.push_str("</conversation>\n");
     }
@@ -986,7 +994,7 @@ fn reviewer_prompt(
         "risk": request.risk.label(),
         "arguments": request.arguments,
     });
-    user.push_str(&format!("<call>\n{call}\n</call>"));
+    let _ = write!(user, "<call>\n{call}\n</call>");
     vec![crate::message::Message::system(system), crate::message::Message::user(user)]
 }
 
@@ -1361,7 +1369,7 @@ mod tests {
 
     #[async_trait]
     impl Model for Reviewer {
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "reviewer"
         }
 

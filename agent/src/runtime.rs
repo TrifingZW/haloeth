@@ -178,6 +178,10 @@ pub struct Agent<M> {
 
 impl<M: Model> Agent<M> {
     /// 以模型与工具集构造代理；工具集缺失最终答案工具时自动注入。
+    ///
+    /// # Errors
+    ///
+    /// 注入最终答案工具失败（元数据不合法或名称冲突）时返回 [`AgentError`]。
     pub fn new(model: M, mut tools: ToolSet) -> Result<Self, AgentError> {
         if tools.get(FINAL_ANSWER).is_none() {
             tools.insert(final_answer_tool())?;
@@ -198,6 +202,7 @@ impl<M: Model> Agent<M> {
     }
 
     /// 设置审核门；不设置时全部放行。
+    #[must_use]
     pub fn with_approval_gate(mut self, gate: Arc<dyn ApprovalGate>) -> Self {
         self.gate = gate;
         self
@@ -209,18 +214,21 @@ impl<M: Model> Agent<M> {
     }
 
     /// 设置最大步数。
+    #[must_use]
     pub fn with_max_steps(mut self, max_steps: u32) -> Self {
         self.max_steps = max_steps;
         self
     }
 
     /// 设置计划间隔；零与 [`None`] 均表示不生成计划。
+    #[must_use]
     pub fn with_planning_interval(mut self, interval: Option<u32>) -> Self {
         self.planning_interval = interval.filter(|interval| *interval > 0);
         self
     }
 
     /// 设置已启用的 Skill；系统提示会列出它们的元数据。
+    #[must_use]
     pub fn with_skills(mut self, skills: Vec<crate::skill::Skill>) -> Self {
         self.skills = skills;
         self.refresh_system_prompt();
@@ -228,6 +236,7 @@ impl<M: Model> Agent<M> {
     }
 
     /// 设置当前会话授权的目录；系统提示会说明工作区与相对路径基准。
+    #[must_use]
     pub fn with_workspace(mut self, workspace: Vec<DirectoryGrant>) -> Self {
         self.workspace = workspace;
         self.refresh_system_prompt();
@@ -235,6 +244,7 @@ impl<M: Model> Agent<M> {
     }
 
     /// 设置附加指令，追加到系统提示末尾。
+    #[must_use]
     pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = Some(instructions.into());
         self.refresh_system_prompt();
@@ -304,6 +314,10 @@ impl<M: Model> Agent<M> {
     /// 运行一次任务。
     ///
     /// `on_event` 在运行过程中接收文本增量与完成的步骤，运行结束后返回结果。
+    ///
+    /// # Errors
+    ///
+    /// 模型请求、工具执行或步数上限导致的失败返回 [`AgentError`]。
     pub async fn run<F>(
         &mut self,
         task: impl Into<TaskStep>,
@@ -450,7 +464,7 @@ impl<M: Model> Agent<M> {
             // 并非所有提供商都会遵守 `tool_choice`（思考型模型只接受 `auto`），
             // 此时模型常常直接用文本作答。文本回复本身就是合法的最终答案，
             // 当成解析失败会把同一轮对话重试到最大步数，日志与界面里全是错误。
-            let text = step.model_output.as_ref().map(message_text).unwrap_or_default();
+            let text = step.model_output.as_ref().map_or_default(message_text);
             if text.trim().is_empty() {
                 step.error = Some(AgentError::Parsing {
                     reason: "the model replied without calling any tool".into(),
@@ -773,7 +787,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Model for ScriptedModel {
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "scripted"
         }
 

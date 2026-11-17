@@ -260,7 +260,7 @@ impl Render for ActivityCard {
         };
         let title = self.title.clone();
         let detail = self.detail.clone();
-        let risk = self.risk.map(|risk| risk.label());
+        let risk = self.risk.map(RiskLevel::label);
         let elapsed = self.elapsed_ms.map(|elapsed| format!("{elapsed} ms"));
         let preview = self.preview.clone();
         let copy_text = format!(
@@ -856,8 +856,7 @@ impl Conversation {
             .rposition(
                 |row| matches!(row, ChatRow::Message(message) if message.role == ChatRole::User),
             )
-            .map(|index| index + 1)
-            .unwrap_or(0);
+            .map_or(0, |index| index + 1);
         let repeated = self.rows[start..].iter().any(|row| {
             matches!(row, ChatRow::Image(card) if card.read(cx).path.to_string_lossy() == path)
         });
@@ -876,8 +875,7 @@ impl Conversation {
         for path in paths {
             let caption = std::path::Path::new(path)
                 .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.clone());
+                .map_or_else(|| path.clone(), |name| name.to_string_lossy().to_string());
             self.push_image(path.clone(), caption, cx);
         }
     }

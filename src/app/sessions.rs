@@ -74,7 +74,7 @@ impl SessionsForm {
             return;
         };
         let busy = haloeth.read(cx).session.read(cx).status().is_busy();
-        haloeth.update(cx, |haloeth, cx| haloeth.create_session(cx));
+        haloeth.update(cx, Haloeth::create_session);
         self.error = busy.then(|| "运行中不能新建会话，请先停止。".into());
         self.refresh(cx);
     }
@@ -145,7 +145,7 @@ impl SessionsForm {
             )
             .child(Button::new("sessions-new").primary().label("新建会话").on_click({
                 let form = form.clone();
-                move |_, _, cx| form.update(cx, |form, cx| form.create(cx))
+                move |_, _, cx| form.update(cx, SessionsForm::create)
             }))
     }
 }
@@ -284,7 +284,8 @@ impl Render for SessionsForm {
 
 /// 把 Unix 毫秒格式化为本地日期时间。
 fn format_time(millis: u64) -> String {
-    chrono::DateTime::from_timestamp_millis(millis as i64)
-        .map(|time| time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "未知时间".to_owned())
+    chrono::DateTime::from_timestamp_millis(millis as i64).map_or_else(
+        || "未知时间".to_owned(),
+        |time| time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(),
+    )
 }

@@ -1,6 +1,6 @@
 //! 生成类工具：AI 绘图、视频与音乐。
 //!
-//! 绘图走 **OpenAI** 兼容的 `images/generations`；视频与音乐没有统一标准，
+//! 绘图走 **`OpenAI`** 兼容的 `images/generations`；视频与音乐没有统一标准，
 //! 使用「提交任务 → 轮询状态 → 下载产物」的通用适配器，地址与字段路径可配置。
 //! 产物路径由模型在参数里给出，写入前照常走审核。
 
@@ -311,12 +311,11 @@ impl JobTool {
             }
             let value: Value = serde_json::from_str(&text)
                 .map_err(|error| execution(format!("invalid poll response: {error}")))?;
-            let status = pointer(&value, &self.options.status_path)
-                .map(|value| match value {
+            let status =
+                pointer(&value, &self.options.status_path).map_or_default(|value| match value {
                     Value::String(text) => text.clone(),
                     other => other.to_string(),
-                })
-                .unwrap_or_default();
+                });
             if status.eq_ignore_ascii_case(&self.options.done_value) {
                 return pointer(&value, &self.options.result_path)
                     .map(|value| match value {
@@ -594,9 +593,9 @@ pub fn encode_base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
         let triple = (b0 << 16) | (b1 << 8) | b2;
         output.push(TABLE[(triple >> 18) as usize & 63] as char);
         output.push(TABLE[(triple >> 12) as usize & 63] as char);
@@ -615,7 +614,10 @@ pub fn encode_base64(bytes: &[u8]) -> String {
 }
 
 /// 简易 base64 解码。
-/// 简易 base64 解码。
+///
+/// # Errors
+///
+/// 输入含非 ASCII 空白之外的非法字符时返回参数错误。
 pub fn decode_base64(text: &str) -> Result<Vec<u8>, ToolError> {
     let cleaned: Vec<u8> = text.bytes().filter(|byte| !byte.is_ascii_whitespace()).collect();
     let mut output = Vec::with_capacity(cleaned.len() / 4 * 3);
@@ -625,14 +627,14 @@ pub fn decode_base64(text: &str) -> Result<Vec<u8>, ToolError> {
         if byte == b'=' {
             break;
         }
-        let value = match byte {
+        let value = u32::from(match byte {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
             b'0'..=b'9' => byte - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
             _ => return Err(execution("invalid base64 image data")),
-        } as u32;
+        });
         buffer = (buffer << 6) | value;
         bits += 6;
         if bits >= 8 {

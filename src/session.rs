@@ -501,14 +501,12 @@ impl Session {
             return;
         };
         if self.runtime.is_none() {
-            match Runtime::new() {
-                Ok(runtime) => self.runtime = Some(runtime),
-                Err(_) => {
-                    self.status = Status::Failed;
-                    cx.notify();
-                    return;
-                }
-            }
+            let Ok(runtime) = Runtime::new() else {
+                self.status = Status::Failed;
+                cx.notify();
+                return;
+            };
+            self.runtime = Some(runtime);
         }
 
         // 审批通道：门与运行任务分持发送端，界面侧从接收端读取。
@@ -616,7 +614,7 @@ impl Session {
                 }
                 Err(_) => {
                     // 运行任务未能归还结果，此会话不再可运行（进程启用 panic=abort，实际难以触发）
-                    this.update(cx, |session, cx| session.fail(cx)).ok();
+                    this.update(cx, Session::fail).ok();
                 }
             }
         })
@@ -716,18 +714,16 @@ impl Session {
         if reviewer.model.trim().is_empty() {
             return self.model_options();
         }
-        match self.config.provider_named(reviewer.provider.trim()) {
-            Some(provider) => Some(options_of(provider, reviewer.model.trim())),
-            None => {
-                // 单独指定的提供商被删掉时退回当前模型，而不是让审核模型凭空消失。
-                tracing::warn!(
-                    "审核模型 {} · {} 已不存在，退回当前对话模型",
-                    reviewer.provider,
-                    reviewer.model
-                );
-                self.model_options()
-            }
-        }
+        let Some(provider) = self.config.provider_named(reviewer.provider.trim()) else {
+            // 单独指定的提供商被删掉时退回当前模型，而不是让审核模型凭空消失。
+            tracing::warn!(
+                "审核模型 {} · {} 已不存在，退回当前对话模型",
+                reviewer.provider,
+                reviewer.model
+            );
+            return self.model_options();
+        };
+        Some(options_of(provider, reviewer.model.trim()))
     }
 
     /// 组装本次运行的审核策略。
@@ -819,7 +815,7 @@ impl Session {
             return None;
         }
         let defaults = dashscope.then(|| dashscope_image_defaults(provider, &media.model));
-        self.media_job(provider, media, "AI 绘图", defaults)
+        Some(self.media_job(provider, media, "AI 绘图", defaults))
     }
 
     /// 视频 / 音乐任务配置。
@@ -838,7 +834,7 @@ impl Session {
         } else {
             None
         };
-        self.media_job(provider, media, kind.label(), defaults)
+        Some(self.media_job(provider, media, kind.label(), defaults))
     }
 
     /// 由配置与默认适配器组装异步任务选项。
@@ -848,7 +844,7 @@ impl Session {
         media: &crate::config::MediaToolConfig,
         name: &str,
         defaults: Option<MediaDefaults>,
-    ) -> Option<JobOptions> {
+    ) -> JobOptions {
         let mut headers = provider.headers.clone();
         for (key, value) in &media.headers {
             headers.insert(key.clone(), value.clone());
@@ -885,7 +881,7 @@ impl Session {
                     media.result_path.clone(),
                 ),
             };
-        Some(JobOptions {
+        JobOptions {
             name: name.to_owned(),
             endpoint,
             api_key: provider.api_key.clone(),
@@ -899,7 +895,7 @@ impl Session {
             interval: std::time::Duration::from_millis(media.interval_ms.max(200)),
             timeout: std::time::Duration::from_secs(media.timeout_s.max(5)),
             headers,
-        })
+        }
     }
 
     /// 由搜索设置与提供商推导搜索接口配置。
@@ -956,7 +952,7 @@ impl Session {
         self.status = Status::Idle;
         self.activity = None;
         self.last_run_ok = false;
-        self.conversation.update(cx, |conversation, cx| conversation.end_reasoning(cx));
+        self.conversation.update(cx, Conversation::end_reasoning);
         let delta = context_usage.saturating_sub(previous_context_usage);
         if delta.total() > 0 {
             let model = self
@@ -1194,9 +1190,6 @@ fn apply_activity<C: AppContext>(
                 conversation.approval_resolved(id, *decision, reason.clone(), cx);
             });
         }
-        Activity::ToolUsage {
-            ..
-        } => {}
         Activity::Images(paths) => {
             conversation.update(cx, |conversation, cx| {
                 conversation.push_images(paths, cx);
@@ -1208,7 +1201,11 @@ fn apply_activity<C: AppContext>(
         } => {
             conversation.update(cx, |conversation, cx| conversation.plan(plan.clone(), cx));
         }
-        Activity::Thinking {
+        // 这些活动只由活动卡片展示，对话区不追加文本。
+        Activity::ToolUsage {
+            ..
+        }
+        | Activity::Thinking {
             ..
         }
         | Activity::PlanStarted {

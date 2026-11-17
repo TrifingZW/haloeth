@@ -237,7 +237,7 @@ impl Render for Composer {
                             cx.notify();
                         }),
                     )
-                    .on_drag((), |_, _, _, cx| cx.new(|_| DragGhost)),
+                    .on_drag((), |(), _, _, cx| cx.new(|_| DragGhost)),
             )
             .child(
                 // 缓冲区与应用同一平面；上边界由全局 2px 边框给出，

@@ -1,6 +1,6 @@
 //! 搜索工具：封装提供商自带的独立搜索接口。
 //!
-//! 首个适配对象是 **DeepSeek** 的 `POST {base_url}/tools/search`。各家的响应字段并不统一，
+//! 首个适配对象是 **`DeepSeek`** 的 `POST {base_url}/tools/search`。各家的响应字段并不统一，
 //! 因此解析保持宽容：常见的结果数组、单个答案字段都能识别，其余情况原样返回正文。
 
 use std::time::Duration;
@@ -51,6 +51,10 @@ pub struct WebSearchTool {
 
 impl WebSearchTool {
     /// 构造工具；接口地址必须使用 http 或 https。
+    ///
+    /// # Errors
+    ///
+    /// 接口地址不是 http(s) 绝对地址时返回 [`ToolError::InvalidSpec`]。
     pub fn new(options: SearchOptions) -> Result<Self, ToolError> {
         if !(options.endpoint.starts_with("http://") || options.endpoint.starts_with("https://")) {
             return Err(ToolError::InvalidSpec {
@@ -104,8 +108,7 @@ impl Tool for WebSearchTool {
             let max_results = arguments
                 .get("max_results")
                 .and_then(Value::as_u64)
-                .map(|value| value as usize)
-                .unwrap_or(self.options.max_results)
+                .map_or(self.options.max_results, |value| value as usize)
                 .clamp(1, 20);
 
             let mut request = self

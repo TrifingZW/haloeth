@@ -52,14 +52,13 @@ impl AudioInput for SelectableMicrophone {
         let requested = self
             .session
             .upgrade()
-            .map(|session| session.read(cx).config().audio.asr.input_device.clone())
-            .unwrap_or_default();
+            .map_or_default(|session| session.read(cx).config().audio.asr.input_device.clone());
         let host = cpal::default_host();
         let device = if requested.trim().is_empty() {
             None
         } else {
             host.input_devices().ok().and_then(|mut devices| {
-                devices.find(|device| device.name().map(|name| name == requested).unwrap_or(false))
+                devices.find(|device| device.name().is_ok_and(|name| name == requested))
             })
         }
         .or_else(|| host.default_input_device())
@@ -171,7 +170,7 @@ impl Converter {
         let target_rate = format.sample_rate().max(1);
         let source_rate = source_rate.max(1);
         Self {
-            step: source_rate as f64 / target_rate as f64,
+            step: f64::from(source_rate) / f64::from(target_rate),
             position: 1.,
             previous: 0.,
             low_pass: (source_rate > target_rate)
@@ -208,7 +207,7 @@ impl Converter {
             let frac = (self.position - ix as f64) as f32;
             let next = sample((ix + 1).min(last));
             let value = sample(ix) * (1. - frac) + next * frac;
-            let value = (value.clamp(-1., 1.) * i16::MAX as f32) as i16;
+            let value = (value.clamp(-1., 1.) * f32::from(i16::MAX)) as i16;
             output.extend(std::iter::repeat_n(value, self.channels));
             self.position += self.step;
         }

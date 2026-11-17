@@ -5,6 +5,7 @@
 //!
 //! 渐进披露：系统提示只放元数据，模型需要时通过 `load_skill` 读取正文与资源清单。
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -56,7 +57,7 @@ impl Skill {
     pub fn summary(&self) -> String {
         let mut line = format!("- {}: {}", self.name, self.description);
         if !self.when_to_use.is_empty() {
-            line.push_str(&format!(" (use when: {})", self.when_to_use));
+            let _ = write!(line, " (use when: {})", self.when_to_use);
         }
         line
     }
@@ -80,6 +81,10 @@ impl Skill {
 }
 
 /// 解析 `SKILL.md`：可选的 YAML frontmatter 加正文。
+///
+/// # Errors
+///
+/// frontmatter 缺少结束标记或 YAML 无法解析时返回错误说明。
 pub fn parse_skill(text: &str) -> Result<(SkillMeta, String), String> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let trimmed = text.trim_start();
@@ -163,6 +168,10 @@ pub fn select(mut skills: Vec<Skill>, enabled: &[String]) -> Vec<Skill> {
 ///
 /// frontmatter 用 `serde_yaml_ng` 序列化，名称或描述里的冒号、引号与换行
 /// 由 YAML 规则转义，不会破坏格式。
+///
+/// # Errors
+///
+/// 创建目录或写入 `SKILL.md` 失败时返回 IO 错误。
 pub fn create_skill(
     root: &Path,
     name: &str,
@@ -190,6 +199,10 @@ pub fn create_skill(
 }
 
 /// 删除一个 Skill 目录；目录里必须有 `SKILL.md`，避免误删普通目录。
+///
+/// # Errors
+///
+/// 目录缺少 `SKILL.md` 或删除失败时返回 IO 错误。
 pub fn delete_skill(root: &Path) -> std::io::Result<()> {
     if !root.join(SKILL_FILE).is_file() {
         return Err(std::io::Error::new(
@@ -274,7 +287,7 @@ impl Tool for LoadSkillTool {
             } else {
                 text.push_str("\n\nResources:\n");
                 for resource in resources {
-                    text.push_str(&format!("- {resource}\n"));
+                    let _ = writeln!(text, "- {resource}");
                 }
             }
             Ok(Value::String(text).into())
@@ -394,7 +407,7 @@ mod tests {
         assert_eq!(meta.description, "Does: things");
         assert_eq!(meta.when_to_use, "the user asks for it");
         assert!(body.contains("Describe here"));
-        assert!(discover(std::slice::from_ref(&root)).len() == 1);
+        assert_eq!(discover(std::slice::from_ref(&root)).len(), 1);
 
         delete_skill(&dir).expect("delete");
         assert!(discover(std::slice::from_ref(&root)).is_empty());

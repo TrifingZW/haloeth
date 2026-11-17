@@ -270,11 +270,10 @@ impl McpTool {
         service: Arc<Mutex<RunningService<RoleClient, ()>>>,
     ) -> Self {
         let local = mcp_tool_name(server, &info.name);
-        let description = info
-            .description
-            .as_deref()
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("MCP tool '{}' from server '{server}'", info.name));
+        let description = info.description.as_deref().map_or_else(
+            || format!("MCP tool '{}' from server '{server}'", info.name),
+            str::to_owned,
+        );
         let input_schema = Value::Object(info.input_schema.as_ref().clone());
         let mut spec = ToolSpec::new(local, description, InputType::Any)
             .raw_parameters(input_schema)

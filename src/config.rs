@@ -388,7 +388,8 @@ impl std::fmt::Debug for Provider {
             .field("tool_choice", &self.tool_choice)
             .field("protocol", &self.protocol)
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
-            .finish()
+            .field("max_tokens", &self.max_tokens)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1164,7 +1165,7 @@ impl std::fmt::Debug for Config {
             .field("mcp_servers", &self.mcp_servers)
             .field("skills", &self.skills)
             .field("ui", &self.ui)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1321,23 +1322,15 @@ impl Config {
             self.active_model = Some(model.name.clone());
             return;
         }
-        match self
-            .providers
-            .iter()
-            .find(|provider| provider.models.iter().any(|model| model.enabled))
+        if let Some(provider) =
+            self.providers.iter().find(|provider| provider.models.iter().any(|model| model.enabled))
         {
-            Some(provider) => {
-                self.active_provider = Some(provider.name.clone());
-                self.active_model = provider
-                    .models
-                    .iter()
-                    .find(|model| model.enabled)
-                    .map(|model| model.name.clone());
-            }
-            None => {
-                self.active_provider = self.providers.first().map(|provider| provider.name.clone());
-                self.active_model = None;
-            }
+            self.active_provider = Some(provider.name.clone());
+            self.active_model =
+                provider.models.iter().find(|model| model.enabled).map(|model| model.name.clone());
+        } else {
+            self.active_provider = self.providers.first().map(|provider| provider.name.clone());
+            self.active_model = None;
         }
     }
 
@@ -1386,10 +1379,14 @@ impl Config {
         if self.provider_named(base).is_none() {
             return base.to_owned();
         }
-        (2..)
-            .map(|index| format!("{base} {index}"))
-            .find(|name| self.provider_named(name).is_none())
-            .unwrap_or_else(|| base.to_owned())
+        let mut index = 2_u32;
+        loop {
+            let candidate = format!("{base} {index}");
+            if self.provider_named(&candidate).is_none() {
+                return candidate;
+            }
+            index += 1;
+        }
     }
 
     /// 新增提供商；名称重复时报错，当前选择保持不变。

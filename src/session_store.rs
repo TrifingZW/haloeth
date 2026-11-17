@@ -142,9 +142,10 @@ impl SessionStore {
 
     /// 默认根目录：系统数据目录下的 `Haloeth/sessions`。
     pub fn default_root() -> PathBuf {
-        directories::BaseDirs::new()
-            .map(|dirs| dirs.data_local_dir().join("Haloeth").join("sessions"))
-            .unwrap_or_else(|| std::env::temp_dir().join("Haloeth").join("sessions"))
+        directories::BaseDirs::new().map_or_else(
+            || std::env::temp_dir().join("Haloeth").join("sessions"),
+            |dirs| dirs.data_local_dir().join("Haloeth").join("sessions"),
+        )
     }
 
     /// 根目录。
@@ -238,8 +239,7 @@ impl SessionStore {
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
+        .map_or_default(|duration| duration.as_millis() as u64)
 }
 
 #[cfg(test)]

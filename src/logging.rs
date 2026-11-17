@@ -2,7 +2,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -32,12 +32,12 @@ struct FileWriter(Arc<Mutex<std::fs::File>>);
 
 impl Write for FileWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut file = self.0.lock().expect("日志文件不应被毒化");
+        let mut file = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         file.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut file = self.0.lock().expect("日志文件不应被毒化");
+        let mut file = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         file.flush()
     }
 }

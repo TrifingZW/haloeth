@@ -3,7 +3,7 @@
 /// 把交错的 16 位 PCM 样本编码为 WAV。
 pub fn encode_pcm16(samples: &[i16], sample_rate: u32, channels: u16) -> Vec<u8> {
     let data_len = (samples.len() * 2) as u32;
-    let byte_rate = sample_rate * channels as u32 * 2;
+    let byte_rate = sample_rate * u32::from(channels) * 2;
     let block_align = channels * 2;
 
     let mut output = Vec::with_capacity(44 + data_len as usize);

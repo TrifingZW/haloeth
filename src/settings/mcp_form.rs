@@ -174,7 +174,7 @@ impl McpForm {
             .child(Button::new("mcp-form-save").primary().label("添加").on_click({
                 let form = form.clone();
                 move |_, window, cx| {
-                    if form.update(cx, |form, cx| form.save(cx)) {
+                    if form.update(cx, McpForm::save) {
                         window.close_dialog(cx);
                     }
                 }

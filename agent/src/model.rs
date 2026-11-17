@@ -1,10 +1,10 @@
 //! 模型抽象：屏蔽提供方差异，向编排循环提供统一的生成接口。
 //!
-//! 具体协议后端在子模块 [`openai`]（OpenAI Chat）与 [`anthropic`]（Anthropic Messages）。
+//! 具体协议后端在子模块 [`openai`]（`OpenAI` Chat）与 [`anthropic`]（Anthropic Messages）。
 //!
-//! 与 smolagents 的差异有两点：
-//! 1) 不实现从文本中解析工具调用的回退路径，仅采用提供方原生的工具调用字段。
-//! 2) 停止序列与流式用量的发送由后端配置显式控制，取代按模型名判断的兼容性开关。
+//! 与 smolagents 的差异：
+//! - 不实现从文本中解析工具调用的回退路径，仅采用提供方原生的工具调用字段。
+//! - 停止序列与流式用量的发送由后端配置显式控制，取代按模型名判断的兼容性开关。
 //!
 //! 生成接口以 `&mut dyn FnMut` 交付增量并返回装箱 future：这样 [`Model`] 保持对象安全，
 //! 会话可以用 `Box<dyn Model>` 持有生产模型，在测试中换成脚本模型。
@@ -61,7 +61,7 @@ impl Modality {
 /// 提供方协议。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Protocol {
-    /// **OpenAI** Chat Completions，兼容面最广。
+    /// **`OpenAI`** Chat Completions，兼容面最广。
     #[default]
     #[serde(rename = "openai-chat")]
     OpenAiChat,
@@ -136,18 +136,21 @@ impl GenerateRequest {
     }
 
     /// 设置可调用的工具声明。
+    #[must_use]
     pub fn tools(mut self, tools: Vec<WireTool>) -> Self {
         self.tools = tools;
         self
     }
 
     /// 设置工具选择策略。
+    #[must_use]
     pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
         self.tool_choice = choice;
         self
     }
 
     /// 设置停止序列。
+    #[must_use]
     pub fn stop_sequences(mut self, sequences: Vec<String>) -> Self {
         self.stop_sequences = sequences;
         self
@@ -199,7 +202,7 @@ mod tests {
 
     #[async_trait]
     impl Model for Echo {
-        fn model_id(&self) -> &str {
+        fn model_id(&self) -> &'static str {
             "echo"
         }
 
