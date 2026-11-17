@@ -1031,6 +1031,9 @@ pub struct RemoteConfig {
     /// 绑定地址。
     #[serde(default = "default_remote_bind")]
     pub bind: String,
+    /// 启用自签 TLS；客户端按配对信息中的指纹钉扎。
+    #[serde(default)]
+    pub tls: bool,
     /// 已配对设备；只保存令牌摘要。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<RemoteDevice>,
@@ -1042,6 +1045,7 @@ impl Default for RemoteConfig {
             enabled: false,
             port: default_remote_port(),
             bind: default_remote_bind(),
+            tls: false,
             devices: Vec::new(),
         }
     }
@@ -2095,6 +2099,7 @@ mod tests {
         config.remote.enabled = true;
         config.remote.port = 9100;
         config.remote.bind = "127.0.0.1".to_owned();
+        config.remote.tls = true;
         config.remote.devices.push(RemoteDevice {
             id: "device-1".to_owned(),
             name: "Phone".to_owned(),
@@ -2107,6 +2112,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("应当能读回配置");
         assert!(text.contains("[remote]"));
         assert!(text.contains("enabled = true"));
+        assert!(text.contains("tls = true"));
 
         let restored = read(&path).expect("应当能读回配置");
         assert_eq!(restored.remote, config.remote);

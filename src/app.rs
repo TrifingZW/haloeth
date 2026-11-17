@@ -339,7 +339,7 @@ impl Haloeth {
         this.refresh_tray(cx);
         this.spawn_remote_pump(remote_commands, cx);
         let remote_config = this.session.read(cx).config().remote.clone();
-        this.remote.sync(&remote_config);
+        this.remote.sync(&remote_config, &crate::remote::certificate_dir(persist_config));
         this
     }
 
@@ -1069,7 +1069,8 @@ impl Haloeth {
             self.session.update(cx, |session, cx| session.apply_config(config, cx));
         }
         let remote = self.session.read(cx).config().remote.clone();
-        self.remote.sync(&remote);
+        let cert_dir = crate::remote::certificate_dir(self.session.read(cx).persists_config());
+        self.remote.sync(&remote, &cert_dir);
     }
 
     /// 远程服务状态；偏好页展示用。
@@ -1080,6 +1081,11 @@ impl Haloeth {
     /// 远程连接数。
     pub(crate) fn remote_connections(&self) -> usize {
         self.remote.connections()
+    }
+
+    /// 当前自签证书指纹（仅在启用 TLS 且服务运行时有值）。
+    pub(crate) fn remote_tls_fingerprint(&self) -> Option<String> {
+        self.remote.tls_fingerprint()
     }
 
     /// 设备最近在线时间（本次进程内）。

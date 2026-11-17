@@ -28,6 +28,8 @@ pub struct RemotePage {
     token: Option<SharedString>,
     /// 服务状态缓存；渲染期间不读取 Haloeth，避免嵌套更新断言。
     status: (String, Tone),
+    /// 自签证书指纹缓存。
+    fingerprint: Option<String>,
     /// 设备最近在线缓存。
     last_seen: std::collections::HashMap<String, u64>,
     error: Option<SharedString>,
@@ -79,6 +81,7 @@ impl RemotePage {
             name,
             token: None,
             status: ("未启用".to_owned(), Tone::Neutral),
+            fingerprint: None,
             last_seen: std::collections::HashMap::new(),
             error: None,
             _subscriptions: subscriptions,
@@ -100,10 +103,16 @@ impl RemotePage {
         let Some(haloeth) = self.haloeth.upgrade() else {
             return;
         };
+        let scheme = if self.remote_config(cx).tls {
+            "wss"
+        } else {
+            "ws"
+        };
+        self.fingerprint = haloeth.read(cx).remote_tls_fingerprint();
         self.status = match haloeth.read(cx).remote_status() {
             BridgeStatus::Running(addr) => (
                 format!(
-                    "监听中：ws://{addr}/v1，当前 {} 个连接",
+                    "监听中：{scheme}://{addr}/v1，当前 {} 个连接",
                     haloeth.read(cx).remote_connections()
                 ),
                 Tone::Success,
@@ -277,6 +286,7 @@ impl Render for RemotePage {
         let muted = cx.theme().muted_foreground;
         let remote = self.remote_config(cx);
         let enabled = remote.enabled;
+        let tls = remote.tls;
         let (status, tone) = self.status.clone();
         let devices = remote.devices.clone();
 
@@ -337,7 +347,7 @@ impl Render for RemotePage {
                 div()
                     .text_sm()
                     .text_color(muted)
-                    .child("远程默认关闭。启用后监听局域网，客户端按 docs/remote-protocol.md 实现；跨网访问建议使用隧道。"),
+                    .child("远程默认关闭。启用后监听局域网，可选用自签 TLS；客户端按 docs/remote-protocol.md 实现，跨网访问建议使用隧道。"),
             )
             .child(
                 h_flex()
@@ -353,6 +363,19 @@ impl Render for RemotePage {
                         .selected(enabled)
                         .toggled(enabled)
                         .on_click(cx.listener(|this, _, _, cx| this.toggle(cx))),
+                    )
+                    .child(
+                        tinted(
+                            Button::new("remote-tls").outline().border_2().xsmall(),
+                            if tls { Tone::Success } else { Tone::Warning },
+                            cx,
+                        )
+                        .label(if tls { "传输：自签 TLS" } else { "传输：明文" })
+                        .selected(tls)
+                        .toggled(tls)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.commit(|remote| remote.tls = !remote.tls, cx);
+                        })),
                     )
                     .child(
                         div()
@@ -387,7 +410,7 @@ impl Render for RemotePage {
                 div()
                     .text_xs()
                     .text_color(muted)
-                    .child("端口 0 表示由系统分配；首次启用时 Windows 会请求防火墙权限。改动即时生效，服务会自动重启。"),
+                    .child("端口 0 表示由系统分配；首次启用时 Windows 会请求防火墙权限。改动即时生效，服务会自动重启。启用 TLS 后配对串包含证书指纹 fp，客户端据此钉扎；明文模式仅建议在受信网络使用。"),
             )
             .child(
                 h_flex()
@@ -482,19 +505,18 @@ impl Render for RemotePage {
 
 impl RemotePage {
     /// 二维码内容：自定义 scheme，原生客户端按协议文档解析。
+    ///
+    /// TLS 启用且证书就绪时追加证书指纹 `fp`，客户端据此钉扎。
     fn pairing_string(&self, token: &str, cx: &App) -> String {
         let port = self.port.read(cx).value().trim().to_owned();
-        let host = local_address().unwrap_or_else(|| "127.0.0.1".to_owned());
-        format!("haloeth://pair?host={host}&port={port}&token={token}")
+        let host = crate::remote::local_address().unwrap_or_else(|| "127.0.0.1".to_owned());
+        match &self.fingerprint {
+            Some(fingerprint) => {
+                format!("haloeth://pair?host={host}&port={port}&token={token}&fp={fingerprint}")
+            }
+            None => format!("haloeth://pair?host={host}&port={port}&token={token}"),
+        }
     }
-}
-
-/// 本机面向局域网的地址，用于二维码。
-fn local_address() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    // UDP 连接不发送数据包，只用于让系统选择出口地址。
-    socket.connect("8.8.8.8:80").ok()?;
-    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 /// 渲染二维码为矩形点阵。

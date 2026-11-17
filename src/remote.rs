@@ -139,8 +139,10 @@ pub(crate) struct RemoteBridge {
     shared: Arc<Shared>,
     server: Mutex<Option<remote::ServerHandle>>,
     status: Mutex<BridgeStatus>,
-    /// 已应用的服务端参数；用于识别端口或绑定地址变化。
-    applied: Mutex<Option<(bool, String, u16)>>,
+    /// 已应用的服务端参数；用于识别端口、绑定地址与 TLS 变化。
+    applied: Mutex<Option<(bool, String, u16, bool)>>,
+    /// 当前自签证书指纹；供配对二维码使用。
+    fingerprint: Mutex<Option<String>>,
 }
 
 impl RemoteBridge {
@@ -162,6 +164,7 @@ impl RemoteBridge {
                 server: Mutex::new(None),
                 status: Mutex::new(BridgeStatus::Disabled),
                 applied: Mutex::new(None),
+                fingerprint: Mutex::new(None),
             },
             receiver,
         )
@@ -220,8 +223,15 @@ impl RemoteBridge {
         changed
     }
 
+    /// 当前自签证书指纹。
+    pub(crate) fn tls_fingerprint(&self) -> Option<String> {
+        self.fingerprint.lock().ok().and_then(|fingerprint| fingerprint.clone())
+    }
+
     /// 应用配置：同步设备表，按需启停或重启服务。
-    pub(crate) fn sync(&self, config: &RemoteConfig) {
+    ///
+    /// `cert_dir` 为自签证书的保存目录；测试注入临时目录，避免污染真实数据目录。
+    pub(crate) fn sync(&self, config: &RemoteConfig, cert_dir: &std::path::Path) {
         if let Ok(mut devices) = self.shared.devices.lock() {
             devices.clear();
             for device in &config.devices {
@@ -229,7 +239,7 @@ impl RemoteBridge {
             }
         }
 
-        let desired = (config.enabled, config.bind.trim().to_owned(), config.port);
+        let desired = (config.enabled, config.bind.trim().to_owned(), config.port, config.tls);
         let applied = self.applied.lock().ok().and_then(|applied| applied.clone());
         if applied == Some(desired.clone()) {
             return;
@@ -237,15 +247,40 @@ impl RemoteBridge {
         self.stop_server();
         if !config.enabled {
             self.set_status(BridgeStatus::Disabled);
+            self.set_fingerprint(None);
             if let Ok(mut applied) = self.applied.lock() {
                 *applied = Some(desired);
             }
             return;
         }
 
+        let tls = if config.tls {
+            match certificate(cert_dir) {
+                Ok(material) => {
+                    self.set_fingerprint(Some(material.fingerprint.clone()));
+                    Some(remote::TlsMaterial {
+                        cert_pem: material.cert_pem,
+                        key_pem: material.key_pem,
+                    })
+                }
+                Err(error) => {
+                    self.set_status(BridgeStatus::Failed(format!("TLS 证书不可用：{error}")));
+                    self.set_fingerprint(None);
+                    if let Ok(mut applied) = self.applied.lock() {
+                        *applied = Some(desired);
+                    }
+                    return;
+                }
+            }
+        } else {
+            self.set_fingerprint(None);
+            None
+        };
+
         let options = remote::ServerOptions {
             bind: desired.1.clone(),
             port: desired.2,
+            tls,
             ..Default::default()
         };
         let host: Arc<dyn RemoteHost> = self.shared.clone();
@@ -256,10 +291,20 @@ impl RemoteBridge {
                     *server = Some(handle);
                 }
             }
-            Err(error) => self.set_status(BridgeStatus::Failed(error.to_string())),
+            Err(error) => {
+                self.set_status(BridgeStatus::Failed(error.to_string()));
+                self.set_fingerprint(None);
+            }
         }
         if let Ok(mut applied) = self.applied.lock() {
             *applied = Some(desired);
+        }
+    }
+
+    /// 更新证书指纹。
+    fn set_fingerprint(&self, fingerprint: Option<String>) {
+        if let Ok(mut current) = self.fingerprint.lock() {
+            *current = fingerprint;
         }
     }
 
@@ -579,4 +624,75 @@ pub(crate) fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or_default(|duration| duration.as_millis() as u64)
+}
+
+/// 自签证书的保存目录；测试使用临时目录。
+pub(crate) fn certificate_dir(persist_config: bool) -> std::path::PathBuf {
+    if !persist_config {
+        return std::env::temp_dir().join("haloeth-remote-tls");
+    }
+    directories::BaseDirs::new().map_or_else(
+        || std::env::temp_dir().join("Haloeth").join("remote-tls"),
+        |dirs| dirs.data_local_dir().join("Haloeth").join("remote-tls"),
+    )
+}
+
+/// 本机面向局域网的地址，用于证书 SAN 与配对信息。
+pub(crate) fn local_address() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    // UDP 连接不发送数据包，只用于让系统选择出口地址。
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+/// 读取或生成自签证书；首次启用时写入两个 PEM 文件。
+fn certificate(dir: &std::path::Path) -> Result<remote::tls::SelfSigned, String> {
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    if let (Ok(cert_pem), Ok(key_pem)) =
+        (std::fs::read_to_string(&cert_path), std::fs::read_to_string(&key_path))
+        && let Some(fingerprint) = remote::tls::fingerprint_pem(&cert_pem)
+    {
+        return Ok(remote::tls::SelfSigned {
+            cert_pem,
+            key_pem,
+            fingerprint,
+        });
+    }
+    let material = remote::tls::self_signed(&certificate_hosts())?;
+    std::fs::create_dir_all(dir).map_err(|error| format!("创建证书目录失败：{error}"))?;
+    std::fs::write(&cert_path, &material.cert_pem)
+        .map_err(|error| format!("写入证书失败：{error}"))?;
+    std::fs::write(&key_path, &material.key_pem)
+        .map_err(|error| format!("写入私钥失败：{error}"))?;
+    Ok(material)
+}
+
+/// 写入证书 SAN 的主机名与地址。
+fn certificate_hosts() -> Vec<String> {
+    let mut hosts = vec!["localhost".to_owned()];
+    if let Some(address) = local_address() {
+        hosts.push(address);
+    }
+    hosts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn certificates_persist_and_keep_their_fingerprint() {
+        let dir =
+            std::env::temp_dir().join(format!("haloeth-remote-cert-{}", uuid::Uuid::new_v4()));
+        let first = certificate(&dir).expect("首次生成应当成功");
+        let second = certificate(&dir).expect("再次读取应当成功");
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(first.cert_pem, second.cert_pem);
+        assert_eq!(
+            remote::tls::fingerprint_pem(&first.cert_pem).as_deref(),
+            Some(first.fingerprint.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

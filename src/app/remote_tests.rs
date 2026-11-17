@@ -358,6 +358,8 @@ async fn remote_preferences_page_manages_devices(cx: &mut TestAppContext) {
     cx.update_window(prefs, |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find("remote-panel").visible(), "远程分页可见");
+        window.click("remote-tls", cx);
+        window.render_frame(cx);
         window.click("remote-device-name", cx);
         window.within("remote-panel").input("iPhone", cx);
         window.click("remote-device-add", cx);
@@ -367,10 +369,11 @@ async fn remote_preferences_page_manages_devices(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     cx.update(|cx| {
-        let devices = haloeth.read(cx).session.read(cx).config().remote.devices.clone();
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].name, "iPhone");
-        assert_eq!(devices[0].token_hash.len(), 64, "只保存摘要");
+        let remote = haloeth.read(cx).session.read(cx).config().remote.clone();
+        assert!(remote.tls, "传输加密开关即时生效");
+        assert_eq!(remote.devices.len(), 1);
+        assert_eq!(remote.devices[0].name, "iPhone");
+        assert_eq!(remote.devices[0].token_hash.len(), 64, "只保存摘要");
     });
 
     cx.update_window(prefs, |_, window, cx| {
