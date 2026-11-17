@@ -435,6 +435,9 @@ pub struct Config {
     /// 生成工具设置。
     #[serde(default)]
     pub media: MediaConfig,
+    /// 远程访问设置。
+    #[serde(default, skip_serializing_if = "RemoteConfig::is_default")]
+    pub remote: RemoteConfig,
 }
 
 /// 单个功能的全局偏好。
@@ -1016,6 +1019,69 @@ pub struct StorageConfig {
     pub last_session: String,
 }
 
+/// 远程访问设置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// 是否启动远程服务。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 监听端口。
+    #[serde(default = "default_remote_port")]
+    pub port: u16,
+    /// 绑定地址。
+    #[serde(default = "default_remote_bind")]
+    pub bind: String,
+    /// 已配对设备；只保存令牌摘要。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<RemoteDevice>,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_remote_port(),
+            bind: default_remote_bind(),
+            devices: Vec::new(),
+        }
+    }
+}
+
+impl RemoteConfig {
+    /// 是否为默认值；默认配置不写入配置文件。
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// 一台已配对设备。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteDevice {
+    /// 设备标识符。
+    pub id: String,
+    /// 显示名称。
+    #[serde(default)]
+    pub name: String,
+    /// 令牌摘要（SHA-256 十六进制）。
+    pub token_hash: String,
+    /// 配对时间（Unix 毫秒）。
+    #[serde(default)]
+    pub added_at: u64,
+    /// 最近在线时间（Unix 毫秒）。
+    #[serde(default)]
+    pub last_seen: u64,
+}
+
+/// 默认监听端口。
+fn default_remote_port() -> u16 {
+    8737
+}
+
+/// 默认绑定地址。
+fn default_remote_bind() -> String {
+    "0.0.0.0".to_owned()
+}
+
 /// 审核设置。
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalConfig {
@@ -1165,6 +1231,7 @@ impl std::fmt::Debug for Config {
             .field("mcp_servers", &self.mcp_servers)
             .field("skills", &self.skills)
             .field("ui", &self.ui)
+            .field("remote", &self.remote)
             .finish_non_exhaustive()
     }
 }
@@ -1312,6 +1379,9 @@ impl Config {
 
     /// 规整当前选择：保持仍然有效的选择，否则退回当前提供商的第一个模型，再退回第一个有模型的提供商。
     pub fn normalise(&mut self) {
+        if self.remote.bind.trim().is_empty() {
+            self.remote.bind = default_remote_bind();
+        }
         self.migrate_legacy_features();
         if self.selection_is_available() {
             return;
@@ -2013,6 +2083,33 @@ mod tests {
 
         assert!(!text.contains("providers"));
         assert!(!text.contains("active_provider"));
+        assert!(!text.contains("remote"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn remote_settings_round_trip_and_keep_token_hashes() {
+        let path = temp_path("remote");
+        let mut config = Config::default();
+        config.remote.enabled = true;
+        config.remote.port = 9100;
+        config.remote.bind = "127.0.0.1".to_owned();
+        config.remote.devices.push(RemoteDevice {
+            id: "device-1".to_owned(),
+            name: "Phone".to_owned(),
+            token_hash: "a".repeat(64),
+            added_at: 1,
+            last_seen: 2,
+        });
+
+        config.save_to(&path).expect("保存应当成功");
+        let text = std::fs::read_to_string(&path).expect("应当能读回配置");
+        assert!(text.contains("[remote]"));
+        assert!(text.contains("enabled = true"));
+
+        let restored = read(&path).expect("应当能读回配置");
+        assert_eq!(restored.remote, config.remote);
 
         let _ = std::fs::remove_file(&path);
     }
