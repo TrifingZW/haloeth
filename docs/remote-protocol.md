@@ -37,7 +37,7 @@
 - 鉴权前发送任何其它帧 → 关闭 4401；令牌无效或已被撤销 → 关闭 4403。
 - 同一时刻允许多个连接（多设备），通知向全部连接扇出。
 - `Origin` 头存在时（浏览器环境）必须在宿主配置的允许列表内或与请求同源，否则拒绝升级（HTTP 403）。
-- 令牌校验失败计数按来源地址限速；超限的连接在升级阶段被拒绝（HTTP 429）。
+- 令牌校验失败计数按来源地址限速；超限的请求被拒绝（HTTP 429，WebSocket 升级与 HTTP 端点均适用）。
 - `wss://` 使用宿主生成的自签证书；客户端按配对信息中的 `fp`（证书 DER 的 SHA-256 指纹）钉扎，其余流程与明文完全一致。
 
 ## 4. 消息信封
@@ -88,6 +88,8 @@
 | `grant.remove`     | `{ path }`               | `{}`                    |                                                                                   |
 | `approval.mode`    | `{ mode }`               | `{}`                    | 全局审核模式                                                                      |
 | `session.resume`   | `{ session_id, last_seq }` | `{}`                 | 增量续接：可补齐时按原序号补发 `seq` 大于 `last_seq` 的通知（先于响应写出）；不可补齐时（会话不匹配、重启、超出保留窗口）推送当前会话快照 `transcript.reset`（`seq` 为高水位） |
+
+`grant.add` / `grant.remove` 与桌面「目录授权」等价：写入的目录进入会话授权列表，下一轮运行生效。
 
 `Welcome`：
 
@@ -268,6 +270,7 @@ POST /v1/attachments?token=<设备令牌>（或 Authorization: Bearer 头）
 Content-Type: multipart/form-data；字段 file 为文件内容
 → 200 { "attachment_id": "…", "mime": "…", "size": 12345 }
 → 400 缺少 file 字段或文件为空
+→ 401 令牌无效或已撤销
 → 413 单文件超过 20 MiB
 → 415 类型不被接受（MIME 按内容探测）
 ```

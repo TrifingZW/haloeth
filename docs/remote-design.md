@@ -120,7 +120,7 @@ Haloeth 的远程能力：桌面进程作为宿主，手机、平板等任意设
 
 选定（分层，随阶段落地）：
 
-1. v1 基线：每设备一条 256 位随机令牌，桌面端只存 SHA-256 哈希（`remote.devices`，可撤销、可轮换）；配对通过二维码（`haloeth://pair?host=…&port=…&token=…`）或手动复制；连接后首帧 `hello` 携带令牌或 `Authorization: Bearer` 头；校验失败与超时以关闭码终结，限速在升级阶段拒绝（HTTP 429）。
+1. v1 基线：每设备一条 256 位随机令牌，桌面端只存 SHA-256 哈希（`remote.devices`，可撤销、可轮换）；配对通过二维码（`haloeth://pair?host=…&port=…&token=…`）或手动复制；连接后首帧 `hello` 携带令牌或 `Authorization: Bearer` 头；校验失败与超时以关闭码终结，限速以 HTTP 429 拒绝（升级与 HTTP 端点均适用）。
 2. 传输加密：`wss://` + 运行时自签证书（`rcgen` + `rustls`），证书保存在应用数据目录 `Haloeth/remote-tls`；配对串追加证书指纹 `fp` 供客户端钉扎（TOFU，思路同 Syncthing 设备 ID）。
 3. 跨网络：明确交由隧道（Tailscale / WireGuard 自带传输加密与访问面控制），项目不提供中继。
 
@@ -254,6 +254,8 @@ TCP/HTTP 建立 → WS 升级 → [鉴权窗口 ≤10s]
 | `feature.set`                                | `Haloeth::toggle_feature` 的参数化形态                                                             |
 | `grant.add` / `grant.remove`                 | `Session::set_grants`（替换式更新）                                                                |
 | `state.get`                                  | 主线程实时读取（state DTO 组装，见 6.4）                                                           |
+| `session.resume`                             | `RemoteBridge::replay`（历史环形缓冲；写任务回放，不可补齐时回 `remote_snapshot`）                |
+| 附件上传                                     | `attachment.target`（内部）为宿主附件目录与只读授权；`message.send` 把路径改写为 `[附件]` 行     |
 
 忙语义与桌面一致：`message.send` 在运行中返回 `busy` 错误并回显文本（客户端据此恢复输入框，等价于桌面把文本放回 composer）；`session.open` / `delete` 在运行中同样拒绝。
 
