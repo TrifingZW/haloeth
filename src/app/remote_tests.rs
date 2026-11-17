@@ -463,6 +463,90 @@ async fn remote_rejects_busy_submissions_and_attachments(cx: &mut TestAppContext
             attachments: vec!["attachment-1".to_owned()],
         },
     )
-    .expect_err("附件尚未实现");
+    .expect_err("附件路径不存在");
     assert_eq!(error.code, remote::ErrorCode::InvalidParams);
+}
+
+/// 带附件的消息把路径引用到用户消息，并给附件目录补充只读授权。
+#[gpui_kit::test]
+async fn remote_message_send_with_attachments_adds_references(cx: &mut TestAppContext) {
+    let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+    cx.executor().allow_parking();
+    configure(cx, &haloeth, "local", "secret", &["m"]);
+    script_run(cx, &haloeth, vec![final_answer(serde_json::json!("done"))]);
+
+    let dir = std::env::temp_dir().join(format!("haloeth-attachment-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("临时目录");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "你好").expect("写入附件");
+
+    dispatch(
+        cx,
+        &haloeth,
+        remote::Command::MessageSend {
+            text: "看看这个".to_owned(),
+            attachments: vec![file.display().to_string()],
+        },
+    )
+    .expect("带附件的发送应当成功");
+    wait_for_status(cx, handle, "就绪").await;
+
+    cx.update(|cx| {
+        let entries = haloeth.read(cx).conversation.read(cx).snapshot(cx);
+        let user = entries
+            .iter()
+            .find_map(|entry| match entry {
+                crate::ui::conversation::TranscriptEntry::Text {
+                    role: crate::ui::conversation::ChatRole::User,
+                    text,
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("用户消息可见");
+        assert!(user.starts_with("[附件] "), "引用行在消息开头：{user}");
+        assert!(user.contains("note.txt"), "引用路径完整：{user}");
+        assert!(user.contains("看看这个"), "原文保留：{user}");
+        let grants = haloeth.read(cx).session.read(cx).grants().to_vec();
+        assert!(
+            grants.iter().any(|grant| {
+                grant.access == agent::tool::Access::Read
+                    && grant.path.file_name() == dir.file_name()
+            }),
+            "附件目录获得只读授权：{grants:?}"
+        );
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 桌面拖入文件：复制到会话附件目录并在输入框中引用。
+#[gpui_kit::test]
+fn dropping_files_attaches_them_to_the_composer(cx: &mut TestAppContext) {
+    let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
+    let dir = std::env::temp_dir().join(format!("haloeth-drop-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("临时目录");
+    let file = dir.join("shot.txt");
+    std::fs::write(&file, "截图说明").expect("写入附件");
+
+    let path = file.clone();
+    cx.update_window(handle, |_, window, cx| {
+        haloeth.update(cx, |haloeth, cx| {
+            haloeth.attach_paths(std::slice::from_ref(&path), window, cx);
+        });
+    })
+    .unwrap();
+
+    let session_id = cx.update(|cx| haloeth.read(cx).active_id().to_owned());
+    cx.update(|cx| {
+        let value = haloeth.read(cx).composer.read(cx).buffer().read(cx).value().to_string();
+        assert!(value.contains("[附件] "), "输入框包含引用：{value}");
+        assert!(value.contains("shot.txt"), "引用保留文件名：{value}");
+        let grants = haloeth.read(cx).session.read(cx).grants().to_vec();
+        assert!(
+            grants.iter().any(|grant| grant.access == agent::tool::Access::Read),
+            "附件目录获得只读授权"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(crate::remote::attachments_dir(false).join(session_id));
 }

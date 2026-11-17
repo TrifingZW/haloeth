@@ -217,11 +217,26 @@ async fn handle_request(state: &ServerState, text: &str) -> Result<ResponseFrame
         return Err(CLOSE_VERSION);
     }
     let id = frame.id;
-    let response = match Command::parse(&frame) {
-        Ok(command) => match state.host.dispatch(command).await {
-            Ok(result) => ResponseFrame::ok(id, result),
-            Err(error) => ResponseFrame::err(id, error),
+    let command = match Command::parse(&frame) {
+        Ok(command) => command,
+        Err(error) => return Ok(ResponseFrame::err(id, error)),
+    };
+    // 附件标识在服务端解析为绝对路径；宿主只需处理路径。
+    let command = match command {
+        Command::MessageSend {
+            text,
+            attachments,
+        } if !attachments.is_empty() => match state.attachments.resolve(&attachments) {
+            Ok(paths) => Command::MessageSend {
+                text,
+                attachments: paths,
+            },
+            Err(error) => return Ok(ResponseFrame::err(id, error)),
         },
+        other => other,
+    };
+    let response = match state.host.dispatch(command).await {
+        Ok(result) => ResponseFrame::ok(id, result),
         Err(error) => ResponseFrame::err(id, error),
     };
     Ok(response)

@@ -53,11 +53,13 @@ pub enum Command {
     Ping,
     /// 全量状态刷新。
     StateGet,
+    /// 服务端内部：附件上传的目标目录与隐式授权。
+    AttachmentTarget,
     /// 发送一条用户消息。
     MessageSend {
         /// 消息文本。
         text: String,
-        /// 附件标识；阶段五实现。
+        /// 附件：协议层为附件标识，服务端解析后为绝对路径。
         attachments: Vec<String>,
     },
     /// 取消当前运行。
@@ -275,6 +277,7 @@ impl Command {
             Self::Snapshot => "snapshot",
             Self::Ping => "ping",
             Self::StateGet => "state.get",
+            Self::AttachmentTarget => "attachment.target",
             Self::MessageSend {
                 ..
             } => "message.send",

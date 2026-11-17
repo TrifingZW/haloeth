@@ -22,4 +22,4 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "json", "multipart"] }

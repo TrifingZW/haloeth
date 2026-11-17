@@ -713,6 +713,10 @@ impl Haloeth {
         }
         let was_active = id == self.active.id;
         self.store.delete(id)?;
+        // 会话附件随之清理。
+        let attachments =
+            crate::remote::attachments_dir(self.session.read(cx).persists_config()).join(id);
+        let _ = std::fs::remove_dir_all(attachments);
         if was_active {
             match self.store.list().first().map(|summary| summary.id.clone()) {
                 Some(next) => match self.store.load(&next) {
@@ -876,6 +880,59 @@ impl Haloeth {
         true
     }
 
+    /// 为附件目录补充会话级只读授权；桌面与远程行为一致。
+    fn ensure_attachment_grant(&mut self, dir: &std::path::Path, cx: &mut Context<Self>) {
+        let base = std::env::current_dir().unwrap_or_default();
+        let dir = agent::approval::resolve_path(&dir.display().to_string(), &base);
+        let mut grants = self.session.read(cx).grants().to_vec();
+        if grants.iter().any(|grant| grant.path == dir) {
+            return;
+        }
+        grants.push(agent::approval::DirectoryGrant::new(dir, agent::tool::Access::Read));
+        self.session.update(cx, |session, cx| session.set_grants(grants, cx));
+        self.save_active(cx);
+        self.publish_remote_state(cx);
+    }
+
+    /// 把拖入的文件复制到会话附件目录，并在输入框中引用它们。
+    pub(crate) fn attach_paths(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let persist = self.session.read(cx).persists_config();
+        let dir = crate::remote::attachments_dir(persist).join(&self.active.id);
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            tracing::warn!("创建附件目录失败：{error}");
+            return;
+        }
+        let mut attached = Vec::new();
+        for path in paths {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let tag = uuid::Uuid::new_v4().simple().to_string();
+            let target = dir.join(format!("{}-{name}", &tag[..8]));
+            match std::fs::copy(path, &target) {
+                Ok(_) => attached.push(target.display().to_string()),
+                Err(error) => tracing::warn!("复制附件失败：{error}"),
+            }
+        }
+        if attached.is_empty() {
+            return;
+        }
+        self.ensure_attachment_grant(&dir, cx);
+        let references =
+            attached.iter().map(|path| format!("[附件] {path}")).collect::<Vec<_>>().join("\n");
+        self.composer.update(cx, |composer, cx| {
+            composer.append_text(&references, window, cx);
+        });
+    }
+
     /// 把远程命令泵挂到界面执行器；命令在顶层逐条处理。
     fn spawn_remote_pump(
         &mut self,
@@ -911,17 +968,36 @@ impl Haloeth {
             }
             Command::Ping => Ok(json!({ "t": crate::remote::now_millis() })),
             Command::StateGet => Ok(json!({ "state": self.remote_state(cx) })),
+            Command::AttachmentTarget => {
+                let persist = self.session.read(cx).persists_config();
+                let dir = crate::remote::attachments_dir(persist).join(&self.active.id);
+                std::fs::create_dir_all(&dir)
+                    .map_err(|error| RemoteError::internal(format!("创建附件目录失败：{error}")))?;
+                self.ensure_attachment_grant(&dir, cx);
+                Ok(json!({ "dir": dir.display().to_string() }))
+            }
             Command::MessageSend {
                 text,
                 attachments,
             } => {
+                let original = text.clone();
+                let mut composed = text;
                 if !attachments.is_empty() {
-                    return Err(RemoteError::invalid_params("附件上传尚未实现"));
+                    for path in &attachments {
+                        let file = std::path::Path::new(path);
+                        if !file.is_file() {
+                            return Err(RemoteError::invalid_params(format!("附件不存在：{path}")));
+                        }
+                        if let Some(parent) = file.parent() {
+                            self.ensure_attachment_grant(parent, cx);
+                        }
+                    }
+                    composed = compose_attachment_text(&original, &attachments);
                 }
-                if self.submit_message(&text, cx) {
+                if self.submit_message(&composed, cx) {
                     Ok(Value::Null)
                 } else {
-                    Err(RemoteError::busy(text))
+                    Err(RemoteError::busy(original))
                 }
             }
             Command::RunCancel => {
@@ -1909,6 +1985,16 @@ fn more_toggle(
 /// 功能清单：工具、MCP 与 Skill 的名称与启用状态。
 type FeatureRows = (Vec<(String, bool)>, Vec<(String, bool)>, Vec<(String, bool)>);
 
+/// 把附件路径作为引用行前置到用户消息；模型据此按路径读取。
+fn compose_attachment_text(text: &str, attachments: &[String]) -> String {
+    let mut composed = String::new();
+    for path in attachments {
+        composed.push_str(&format!("[附件] {path}\n"));
+    }
+    composed.push_str(text);
+    composed
+}
+
 /// 功能行映射为线上状态。
 fn feature_dtos(kind: config::FeatureKind, rows: &[(String, bool)]) -> Vec<FeatureDto> {
     let dto_kind = match kind {
@@ -2004,6 +2090,9 @@ impl Render for Haloeth {
         v_flex()
             .size_full()
             .bg(cx.theme().background)
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.attach_paths(paths.paths(), window, cx);
+            }))
             .on_action(cx.listener(Self::new_session))
             .on_action(cx.listener(Self::clear_session))
             .on_action(

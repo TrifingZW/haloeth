@@ -8,16 +8,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::conn;
 use crate::host::RemoteHost;
-use crate::proto::{ASSETS_PATH, AUTH_TIMEOUT, PING_INTERVAL, WS_PATH};
+use crate::proto::{
+    ASSETS_PATH, ATTACHMENT_LIMIT_BYTES, ATTACHMENTS_PATH, AUTH_TIMEOUT, Command, PING_INTERVAL,
+    RemoteError, WS_PATH,
+};
 
 /// TLS 材料（证书与私钥 PEM）。
 #[derive(Clone)]
@@ -108,6 +113,8 @@ pub(crate) struct ServerState {
     pub(crate) host: Arc<dyn RemoteHost>,
     /// 已公布的图片路径。
     pub(crate) assets: Arc<AssetWhitelist>,
+    /// 已上传附件的标识到路径映射。
+    pub(crate) attachments: AttachmentRegistry,
     /// 参数。
     pub(crate) options: ServerOptions,
     /// 鉴权失败限速。
@@ -116,6 +123,55 @@ pub(crate) struct ServerState {
     pub(crate) shutdown: tokio::sync::watch::Receiver<bool>,
     /// 当前连接数。
     pub(crate) connections: Arc<AtomicUsize>,
+}
+
+/// 已上传附件的标识到路径映射；先进先出淘汰。
+pub(crate) struct AttachmentRegistry {
+    capacity: usize,
+    inner: Mutex<HashMap<String, PathBuf>>,
+    order: Mutex<VecDeque<String>>,
+}
+
+impl AttachmentRegistry {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            inner: Mutex::new(HashMap::new()),
+            order: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// 登记一个附件。
+    fn insert(&self, id: String, path: PathBuf) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        inner.insert(id.clone(), path);
+        let Ok(mut order) = self.order.lock() else {
+            return;
+        };
+        order.push_back(id);
+        while order.len() > self.capacity {
+            if let Some(oldest) = order.pop_front() {
+                inner.remove(&oldest);
+            }
+        }
+    }
+
+    /// 解析附件标识为绝对路径；未知标识返回错误。
+    pub(crate) fn resolve(&self, ids: &[String]) -> Result<Vec<String>, RemoteError> {
+        let Ok(inner) = self.inner.lock() else {
+            return Err(RemoteError::internal("附件表不可用"));
+        };
+        ids.iter()
+            .map(|id| {
+                inner
+                    .get(id)
+                    .map(|path| path.display().to_string())
+                    .ok_or_else(|| RemoteError::invalid_params(format!("附件不存在：{id}")))
+            })
+            .collect()
+    }
 }
 
 /// 已公布图片路径的白名单；先进先出淘汰。
@@ -327,6 +383,7 @@ fn run(
         let state = Arc::new(ServerState {
             host,
             assets,
+            attachments: AttachmentRegistry::new(256),
             limiter: AuthLimiter::new(options.auth_failures, options.auth_window),
             options,
             shutdown: shutdown.clone(),
@@ -336,6 +393,10 @@ fn run(
             .route("/", get(web_index))
             .route(WS_PATH, get(upgrade))
             .route(ASSETS_PATH, get(asset))
+            .route(
+                ATTACHMENTS_PATH,
+                post(upload).layer(DefaultBodyLimit::max(ATTACHMENT_LIMIT_BYTES + 1024 * 1024)),
+            )
             .with_state(state);
         let _ = ready.send(Ok(local));
 
@@ -419,6 +480,97 @@ struct AssetQuery {
     path: String,
     #[serde(default)]
     token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// 附件上传：`multipart/form-data`，字段名 `file`。
+async fn upload(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<UploadQuery>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let token = bearer(&headers).or(query.token);
+    let Some(token) = token else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if state.host.authorize(&token).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let field = loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) if field.name() == Some("file") => break field,
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        }
+    };
+    let bytes: Bytes = match field.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    if bytes.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if bytes.len() > ATTACHMENT_LIMIT_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let Some(mime) = sniff_attachment(&bytes) else {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    };
+    // 目标目录由宿主提供，并已附带会话级隐式只读授权。
+    let dir = match state.host.dispatch(Command::AttachmentTarget).await {
+        Ok(value) => value.get("dir").and_then(serde_json::Value::as_str).map(PathBuf::from),
+        Err(error) => {
+            tracing::warn!("附件目录不可用：{error}");
+            None
+        }
+    };
+    let Some(dir) = dir else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if let Err(error) = tokio::fs::create_dir_all(&dir).await {
+        tracing::warn!("创建附件目录失败：{error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let path = dir.join(format!("{id}.{}", extension_for(mime)));
+    if let Err(error) = tokio::fs::write(&path, &bytes).await {
+        tracing::warn!("写入附件失败：{error}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    state.attachments.insert(id.clone(), path);
+    axum::Json(json!({
+        "attachment_id": id,
+        "mime": mime,
+        "size": bytes.len(),
+    }))
+    .into_response()
+}
+
+/// 探测附件类型：图片，或 UTF-8 文本；其它类型返回 [`None`]。
+fn sniff_attachment(bytes: &[u8]) -> Option<&'static str> {
+    if let Some(mime) = sniff_image(bytes) {
+        return Some(mime);
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    (!text.contains('\0')).then_some("text/plain")
+}
+
+/// 附件扩展名。
+fn extension_for(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => "txt",
+    }
 }
 
 /// 浏览器来源校验：同源放行，或命中显式允许列表。

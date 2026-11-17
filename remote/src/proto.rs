@@ -20,6 +20,10 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const WS_PATH: &str = "/v1";
 /// 图片资源路径。
 pub const ASSETS_PATH: &str = "/v1/assets";
+/// 附件上传路径。
+pub const ATTACHMENTS_PATH: &str = "/v1/attachments";
+/// 单文件附件上限。
+pub const ATTACHMENT_LIMIT_BYTES: usize = 20 * 1024 * 1024;
 /// 单帧上限。
 pub const MAX_FRAME_BYTES: usize = 1 << 20;
 /// 鉴权窗口。

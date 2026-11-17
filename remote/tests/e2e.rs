@@ -22,14 +22,18 @@ use remote::{
 struct TestHost {
     events: broadcast::Sender<Published>,
     commands: Mutex<Vec<Command>>,
+    attachment_dir: std::path::PathBuf,
 }
 
 impl TestHost {
     fn new(capacity: usize) -> Arc<Self> {
         let (events, _) = broadcast::channel(capacity);
+        let attachment_dir =
+            std::env::temp_dir().join(format!("haloeth-remote-upload-{}", uuid::Uuid::new_v4()));
         Arc::new(Self {
             events,
             commands: Mutex::new(Vec::new()),
+            attachment_dir,
         })
     }
 
@@ -76,6 +80,9 @@ impl RemoteHost for TestHost {
             })
             .expect("snapshot")),
             Command::Ping => Ok(json!({ "t": 1 })),
+            Command::AttachmentTarget => Ok(json!({
+                "dir": self.attachment_dir.display().to_string(),
+            })),
             other => {
                 self.commands.lock().expect("command log").push(other.clone());
                 Ok(Value::Null)
@@ -448,5 +455,104 @@ async fn tls_clients_reject_wrong_fingerprints() {
     let wrong = "0".repeat(64);
     let result = remote::client::Client::connect_pinned(&url, "good-token", &wrong).await;
     assert!(result.is_err(), "指纹不匹配不应完成握手");
+    handle.stop();
+}
+
+#[tokio::test]
+async fn uploads_are_stored_and_resolved_by_message_send() {
+    let (host, handle, _assets) = start(64);
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr());
+    let response = http
+        .post(format!("{base}/v1/attachments?token=good-token"))
+        .multipart(reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(b"print('hi')".to_vec()).file_name("note.txt"),
+        ))
+        .send()
+        .await
+        .expect("上传请求应当完成");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let value: Value = response.json().await.expect("JSON");
+    let id = value["attachment_id"].as_str().expect("附件标识").to_owned();
+    assert_eq!(value["mime"], json!("text/plain"));
+    assert_eq!(value["size"], json!(11));
+    assert!(
+        std::fs::read_dir(&host.attachment_dir).is_ok_and(|mut dir| dir.next().is_some()),
+        "附件已落盘"
+    );
+
+    let mut client =
+        remote::client::Client::connect(&url(&handle), "good-token").await.expect("握手应当成功");
+    client
+        .request("message.send", json!({ "text": "看看这个", "attachments": [id] }))
+        .await
+        .expect("发送应当成功");
+    let sent = host
+        .commands()
+        .into_iter()
+        .find_map(|command| match command {
+            Command::MessageSend {
+                text,
+                attachments,
+            } => Some((text, attachments)),
+            _ => None,
+        })
+        .expect("命令已记录");
+    assert_eq!(sent.0, "看看这个");
+    assert_eq!(sent.1.len(), 1);
+    assert!(std::path::Path::new(&sent.1[0]).is_file(), "解析为已落盘的绝对路径");
+    let _ = std::fs::remove_dir_all(&host.attachment_dir);
+    handle.stop();
+}
+
+#[tokio::test]
+async fn unknown_attachment_ids_and_bad_uploads_are_rejected() {
+    let (host, handle, _assets) = start(64);
+    let mut client =
+        remote::client::Client::connect(&url(&handle), "good-token").await.expect("握手应当成功");
+    let error = client
+        .request("message.send", json!({ "text": "x", "attachments": ["missing"] }))
+        .await
+        .expect_err("未知附件应当报错");
+    assert_eq!(error.code, remote::ErrorCode::InvalidParams);
+
+    let http = reqwest::Client::new();
+    let base = format!("http://{}", handle.addr());
+    let unauthorized = http
+        .post(format!("{base}/v1/attachments"))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .part("file", reqwest::multipart::Part::bytes(b"hello".to_vec())),
+        )
+        .send()
+        .await
+        .expect("请求应当完成");
+    assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let binary = http
+        .post(format!("{base}/v1/attachments?token=good-token"))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .part("file", reqwest::multipart::Part::bytes(vec![0u8, 1, 2, 3, 0, 255])),
+        )
+        .send()
+        .await
+        .expect("请求应当完成");
+    assert_eq!(binary.status(), reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let oversized = vec![b'a'; remote::proto::ATTACHMENT_LIMIT_BYTES + 1];
+    let too_large = http
+        .post(format!("{base}/v1/attachments?token=good-token"))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .part("file", reqwest::multipart::Part::bytes(oversized)),
+        )
+        .send()
+        .await
+        .expect("请求应当完成");
+    assert_eq!(too_large.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+
+    let _ = std::fs::remove_dir_all(&host.attachment_dir);
     handle.stop();
 }

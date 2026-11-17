@@ -637,6 +637,17 @@ pub(crate) fn certificate_dir(persist_config: bool) -> std::path::PathBuf {
     )
 }
 
+/// 会话附件的保存根目录；测试使用临时目录。
+pub(crate) fn attachments_dir(persist_config: bool) -> std::path::PathBuf {
+    if !persist_config {
+        return std::env::temp_dir().join("haloeth-remote-attachments");
+    }
+    directories::BaseDirs::new().map_or_else(
+        || std::env::temp_dir().join("Haloeth").join("attachments"),
+        |dirs| dirs.data_local_dir().join("Haloeth").join("attachments"),
+    )
+}
+
 /// 本机面向局域网的地址，用于证书 SAN 与配对信息。
 pub(crate) fn local_address() -> Option<String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;

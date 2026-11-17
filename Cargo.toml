@@ -10,7 +10,7 @@ version = "0.2.0"
 
 [workspace.dependencies]
 async-trait = "0.1.92"
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 futures-util = "0.3.31"
 gpui-kit = "0.10.0"
