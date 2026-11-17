@@ -330,6 +330,19 @@ fn tokens_are_long_random_and_verify_against_hashes() {
     assert!(remote::auth::verify("raw-secret", &remote::auth::hash_token("raw-secret")));
 }
 
+#[test]
+fn certificate_fingerprints_are_sha256_hex() {
+    let material = remote::tls::self_signed(&["127.0.0.1".to_owned()]).expect("证书应当生成");
+    assert!(material.cert_pem.contains("BEGIN CERTIFICATE"));
+    assert!(material.key_pem.contains("BEGIN PRIVATE KEY"));
+    assert_eq!(material.fingerprint.len(), 64);
+    assert!(material.fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(
+        remote::tls::fingerprint_pem(&material.cert_pem).as_deref(),
+        Some(material.fingerprint.as_str())
+    );
+}
+
 fn sample_state() -> AppStateDto {
     AppStateDto {
         active_session_id: "s1".into(),

@@ -8,7 +8,10 @@ version.workspace = true
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
+axum-server.workspace = true
 futures-util.workspace = true
+rcgen.workspace = true
+rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -19,3 +22,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["blocking"] }
+rustls.workspace = true
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }

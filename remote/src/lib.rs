@@ -8,6 +8,7 @@ pub mod client;
 pub mod host;
 pub mod proto;
 pub mod server;
+pub mod tls;
 
 mod conn;
 
@@ -15,4 +16,6 @@ pub use host::{DeviceId, Published, RemoteHost};
 pub use proto::{
     BROADCAST_CAPACITY, Command, ErrorCode, Notification, PROTOCOL_VERSION, RemoteError,
 };
-pub use server::{AssetWhitelist, RemoteServer, ServerError, ServerHandle, ServerOptions};
+pub use server::{
+    AssetWhitelist, RemoteServer, ServerError, ServerHandle, ServerOptions, TlsMaterial,
+};

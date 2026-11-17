@@ -19,6 +19,21 @@ use crate::conn;
 use crate::host::RemoteHost;
 use crate::proto::{ASSETS_PATH, AUTH_TIMEOUT, PING_INTERVAL, WS_PATH};
 
+/// TLS 材料（证书与私钥 PEM）。
+#[derive(Clone)]
+pub struct TlsMaterial {
+    /// 证书 PEM。
+    pub cert_pem: String,
+    /// 私钥 PEM。
+    pub key_pem: String,
+}
+
+impl std::fmt::Debug for TlsMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TlsMaterial(<redacted>)")
+    }
+}
+
 /// 服务端参数。
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -38,6 +53,8 @@ pub struct ServerOptions {
     pub auth_failures: u32,
     /// 鉴权失败计数窗口。
     pub auth_window: Duration,
+    /// 启用自签 TLS；`None` 为明文 `ws://`。
+    pub tls: Option<TlsMaterial>,
 }
 
 impl Default for ServerOptions {
@@ -51,6 +68,7 @@ impl Default for ServerOptions {
             queue_capacity: 1024,
             auth_failures: 5,
             auth_window: Duration::from_secs(60),
+            tls: None,
         }
     }
 }
@@ -64,6 +82,8 @@ pub enum ServerError {
     Runtime(String),
     /// 线程创建失败。
     Spawn(String),
+    /// TLS 配置无效。
+    Tls(String),
     /// 监听就绪超时。
     Timeout,
 }
@@ -74,6 +94,7 @@ impl std::fmt::Display for ServerError {
             Self::Bind(message) => write!(formatter, "监听失败：{message}"),
             Self::Runtime(message) => write!(formatter, "运行时创建失败：{message}"),
             Self::Spawn(message) => write!(formatter, "线程创建失败：{message}"),
+            Self::Tls(message) => write!(formatter, "TLS 配置无效：{message}"),
             Self::Timeout => write!(formatter, "监听就绪超时"),
         }
     }
@@ -276,13 +297,32 @@ fn run(
                     return;
                 }
             };
-        let listener = match tokio::net::TcpListener::bind(address).await {
+        let tls = match &options.tls {
+            Some(material) => match axum_server::tls_rustls::RustlsConfig::from_pem(
+                material.cert_pem.clone().into_bytes(),
+                material.key_pem.clone().into_bytes(),
+            )
+            .await
+            {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    let _ = ready.send(Err(ServerError::Tls(error.to_string())));
+                    return;
+                }
+            },
+            None => None,
+        };
+        let listener = match std::net::TcpListener::bind(address) {
             Ok(listener) => listener,
             Err(error) => {
                 let _ = ready.send(Err(ServerError::Bind(error.to_string())));
                 return;
             }
         };
+        if let Err(error) = listener.set_nonblocking(true) {
+            let _ = ready.send(Err(ServerError::Bind(error.to_string())));
+            return;
+        }
         let local = listener.local_addr().unwrap_or(address);
         let state = Arc::new(ServerState {
             host,
@@ -297,12 +337,29 @@ fn run(
             .route(ASSETS_PATH, get(asset))
             .with_state(state);
         let _ = ready.send(Ok(local));
+
+        let handle = axum_server::Handle::new();
         let mut wait = shutdown;
-        let serve = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(async move {
-                let _ = wait.changed().await;
-            });
-        if let Err(error) = serve.await {
+        let shutdown_handle = handle.clone();
+        tokio::spawn(async move {
+            let _ = wait.changed().await;
+            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+        });
+        let outcome = match tls {
+            Some(config) => {
+                axum_server::from_tcp_rustls(listener, config)
+                    .handle(handle)
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+            }
+            None => {
+                axum_server::from_tcp(listener)
+                    .handle(handle)
+                    .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+            }
+        };
+        if let Err(error) = outcome {
             tracing::warn!("远程服务退出：{error}");
         }
     });
