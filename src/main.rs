@@ -2791,6 +2791,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("haloeth-grant-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("grant dir");
+        // 临时目录可能以 8.3 短名返回；授权与路径审核都按规范化形式比较。
+        let dir = agent::approval::canonicalize_loose(&dir);
         let file = dir.join("note.txt");
         std::fs::write(&file, "hello from the granted directory").expect("fixture");
 
@@ -2886,6 +2888,8 @@ mod tests {
         let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);
         let dir = std::env::temp_dir().join(format!("haloeth-access-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("grant dir");
+        // 对话框写入的授权经过规范化，这里的期望值保持一致。
+        let dir = agent::approval::canonicalize_loose(&dir);
 
         cx.update_window(handle, |_, window, cx| {
             haloeth.update(cx, |haloeth, cx| haloeth.show_access(window, cx));
