@@ -15,12 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 按脚本返回回复的模型，用于离线端到端测试。
-struct ScriptedModel {
+pub(super) struct ScriptedModel {
     replies: Mutex<VecDeque<Message>>,
 }
 
 impl ScriptedModel {
-    fn new(replies: Vec<Message>) -> Self {
+    pub(super) fn new(replies: Vec<Message>) -> Self {
         Self {
             replies: Mutex::new(replies.into()),
         }
@@ -47,7 +47,7 @@ impl Model for ScriptedModel {
 }
 
 /// 构造一次工具调用回复。
-fn tool_call(name: &str, arguments: serde_json::Value) -> Message {
+pub(super) fn tool_call(name: &str, arguments: serde_json::Value) -> Message {
     Message {
         role: agent::message::Role::Assistant,
         content: Vec::new(),
@@ -62,12 +62,16 @@ fn tool_call(name: &str, arguments: serde_json::Value) -> Message {
 }
 
 /// 构造最终答案回复。
-fn final_answer(value: serde_json::Value) -> Message {
+pub(super) fn final_answer(value: serde_json::Value) -> Message {
     tool_call("final_answer", serde_json::json!({ "answer": value }))
 }
 
 /// 等待状态栏显示指定文本。
-async fn wait_for_status(cx: &mut TestAppContext, handle: AnyWindowHandle, status: &str) {
+pub(super) async fn wait_for_status(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+    status: &str,
+) {
     let status = status.to_owned();
     cx.wait_for(handle, Duration::from_secs(5), move |window, _| {
         window
@@ -80,7 +84,10 @@ async fn wait_for_status(cx: &mut TestAppContext, handle: AnyWindowHandle, statu
 }
 
 /// 打开真实外壳窗口，返回视图与窗口句柄
-fn open_shell(cx: &mut TestAppContext, size: Size<Pixels>) -> (Entity<Haloeth>, AnyWindowHandle) {
+pub(super) fn open_shell(
+    cx: &mut TestAppContext,
+    size: Size<Pixels>,
+) -> (Entity<Haloeth>, AnyWindowHandle) {
     cx.update(gpui_kit::init);
 
     let store = crate::session_store::SessionStore::new(
@@ -107,7 +114,7 @@ fn open_shell(cx: &mut TestAppContext, size: Size<Pixels>) -> (Entity<Haloeth>, 
 }
 
 /// 为会话重置为空配置，再配置一家提供商及其模型
-fn configure(
+pub(super) fn configure(
     cx: &mut TestAppContext,
     haloeth: &Entity<Haloeth>,
     name: &str,
@@ -167,7 +174,7 @@ async fn open_models_dialog(
 }
 
 /// 等待偏好窗口出现并完成首帧。
-async fn settle_preferences(cx: &mut TestAppContext, handle: AnyWindowHandle) {
+pub(super) async fn settle_preferences(cx: &mut TestAppContext, handle: AnyWindowHandle) {
     cx.wait_for(handle, Duration::from_secs(1), |window, _| {
         window.try_find("preferences-window").is_some()
     })
@@ -177,7 +184,10 @@ async fn settle_preferences(cx: &mut TestAppContext, handle: AnyWindowHandle) {
 }
 
 /// 读取当前偏好窗口句柄。
-fn preferences_handle(cx: &TestAppContext, haloeth: &Entity<Haloeth>) -> AnyWindowHandle {
+pub(super) fn preferences_handle(
+    cx: &TestAppContext,
+    haloeth: &Entity<Haloeth>,
+) -> AnyWindowHandle {
     haloeth
         .read_with(cx, |haloeth, _| haloeth.preferences.as_ref().map(|(handle, _)| *handle))
         .expect("the preferences window should be open")
@@ -201,7 +211,7 @@ async fn wait_for_dialog_close(cx: &mut TestAppContext, handle: AnyWindowHandle)
 }
 
 /// 等待确认对话框出现并等它结束入场动画
-async fn settle_alert(cx: &mut TestAppContext, handle: AnyWindowHandle) {
+pub(super) async fn settle_alert(cx: &mut TestAppContext, handle: AnyWindowHandle) {
     cx.wait_for(handle, Duration::from_secs(1), |window, _| window.try_find("ok").is_some()).await;
     std::thread::sleep(Duration::from_millis(200));
     cx.update_window(handle, |_, window, cx| window.render_frame(cx)).expect("the window is open");

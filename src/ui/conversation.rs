@@ -586,6 +586,15 @@ impl Conversation {
         })
     }
 
+    /// 打开中的流式消息（角色与已累积原文），供远程快照接续。
+    pub fn streaming_snapshot(&self) -> Option<(ChatRole, String)> {
+        let index = self.streaming.and_then(|id| self.index_of_message(id))?;
+        match self.rows.get(index)? {
+            ChatRow::Message(message) => Some((message.role, message.source.to_string())),
+            ChatRow::Activity(_) | ChatRow::Image(_) => None,
+        }
+    }
+
     /// 指定活动卡片的当前状态
     #[allow(dead_code)]
     pub fn activity_status(&self, id: &str, cx: &App) -> Option<ActivityStatus> {

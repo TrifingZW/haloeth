@@ -30,6 +30,7 @@ use serde_json::Value;
 use tokio::runtime::Runtime;
 
 use crate::config::{Config, FeatureKind, Provider};
+use crate::remote::{RemoteStatus, RemoteTap};
 use crate::session_store::SessionFile;
 use crate::ui::conversation::{ChatRole, Conversation};
 
@@ -118,6 +119,8 @@ pub struct Session {
     persist_config: bool,
     /// 测试注入的模型构造器
     model_builder: Option<ModelBuilder>,
+    /// 远程通知投影；`None` 时不产生通知。
+    remote_tap: Option<RemoteTap>,
 }
 
 impl Session {
@@ -148,6 +151,7 @@ impl Session {
             context: ContextSnapshot::default(),
             persist_config: true,
             model_builder: None,
+            remote_tap: None,
         }
     }
 
@@ -245,6 +249,60 @@ impl Session {
     pub fn set_model_builder(&mut self, builder: ModelBuilder, cx: &mut Context<Self>) {
         self.model_builder = Some(builder);
         cx.notify();
+    }
+
+    /// 注入远程通知投影；`None` 时不产生通知。
+    pub fn set_remote_tap(&mut self, tap: Option<RemoteTap>, cx: &mut Context<Self>) {
+        self.remote_tap = tap;
+        cx.notify();
+    }
+
+    /// 当前细粒度活动文案。
+    pub fn activity_label(&self) -> Option<&str> {
+        self.activity.as_deref()
+    }
+
+    /// 远程状态快照：状态与活动文案。
+    pub(crate) fn remote_status(&self) -> RemoteStatus {
+        RemoteStatus {
+            status: self.status,
+            activity: self.activity.clone(),
+        }
+    }
+
+    /// 把状态与活动文案变化推给远程端。
+    fn publish_remote_status(&self) {
+        if let Some(tap) = &self.remote_tap {
+            tap.status(crate::remote::status_dto(self.status), self.activity.clone());
+        }
+    }
+
+    /// 把用量推给远程端。
+    fn publish_remote_usage(&self) {
+        if let Some(tap) = &self.remote_tap {
+            tap.usage(self.usage, &self.usage_by_model);
+        }
+    }
+
+    /// 把一个运行事件投影为远程通知。
+    fn publish_remote(&self, event: &Event, before: RemoteStatus) {
+        let Some(tap) = &self.remote_tap else {
+            return;
+        };
+        let step_text = match event {
+            Event::Step(step) => render_step(step),
+            _ => None,
+        };
+        crate::remote::project_event(tap, event, step_text);
+        let after = self.remote_status();
+        if before != after {
+            tap.status(crate::remote::status_dto(after.status), after.activity);
+        }
+        if matches!(event, Event::Step(_))
+            || matches!(event, Event::Activity(agent::Activity::ToolUsage { .. }))
+        {
+            tap.usage(self.usage, &self.usage_by_model);
+        }
     }
 
     /// 当前运行状态
@@ -451,6 +509,7 @@ impl Session {
         }
         self.status = Status::Cancelling;
         cx.notify();
+        self.publish_remote_status();
     }
 
     /// 回传一次审批决定。
@@ -553,6 +612,7 @@ impl Session {
         self.activity = Some("连接中…".to_owned());
         // 工具用量跨运行累计，这里不能清零；否则每次运行结束都会少算之前的工具消耗。
         cx.notify();
+        self.publish_remote_status();
 
         let Some(runtime) = &self.runtime else {
             self.status = Status::Failed;
@@ -606,7 +666,12 @@ impl Session {
         cx.spawn(async move |this, cx| {
             while let Some(event) = receiver.recv().await {
                 apply(&conversation, &event, cx);
-                this.update(cx, |session, cx| session.handle_effect(&event, cx)).ok();
+                this.update(cx, |session, cx| {
+                    let before = session.remote_status();
+                    session.handle_effect(&event, cx);
+                    session.publish_remote(&event, before);
+                })
+                .ok();
             }
             match run.await {
                 Ok((snapshot, result)) => {
@@ -981,6 +1046,8 @@ impl Session {
             }
         }
         cx.notify();
+        self.publish_remote_status();
+        self.publish_remote_usage();
     }
 
     /// 运行任务异常结束
@@ -990,6 +1057,7 @@ impl Session {
         self.pending.clear();
         self.status = Status::Failed;
         cx.notify();
+        self.publish_remote_status();
     }
 }
 
@@ -1218,7 +1286,7 @@ fn apply_activity<C: AppContext>(
 }
 
 /// 把 JSON 参数压成一行摘要。
-fn compact(value: &Value) -> String {
+pub(crate) fn compact(value: &Value) -> String {
     let text = value.to_string();
     agent::text::truncate(&text, 400)
 }
@@ -1229,7 +1297,7 @@ const LINE_BREAK: &str = "  \n";
 /// 把一个记忆步骤渲染为对话文本；无需展示的步骤返回 [`None`]
 ///
 /// 工具调用与计划由活动卡片实时展示，这里只负责兜底答案与步骤级错误。
-fn render_step(step: &Step) -> Option<String> {
+pub(crate) fn render_step(step: &Step) -> Option<String> {
     match step {
         // 任务文本已由输入区写入对话
         Step::Task(_) => None,

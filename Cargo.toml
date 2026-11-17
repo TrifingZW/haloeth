@@ -32,11 +32,14 @@ version.workspace = true
 
 [dependencies]
 agent = { path = "agent" }
+async-trait.workspace = true
 chrono = "0.4.45"
 cpal = "0.15.3"
 directories = "6.0.0"
 gpui-kit = { workspace = true, features = ["speech"] }
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+qrcode = { version = "0.14.1", default-features = false }
+remote = { path = "remote" }
 reqwest = { workspace = true, features = ["blocking", "multipart"] }
 rfd = "0.18.0"
 serde.workspace = true

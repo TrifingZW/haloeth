@@ -11,6 +11,7 @@ use gpui_kit::prelude::{FluentBuilder as _, InteractiveElement as _};
 use gpui_kit::*;
 
 use super::models::ModelsForm;
+use super::remote::RemotePage;
 use super::{SettingsForm, SettingsTab};
 use crate::app::Haloeth;
 use crate::config::Config;
@@ -32,12 +33,21 @@ pub enum PrefSection {
     Skill,
     /// 无障碍：语音识别与播报。
     Audio,
+    /// 局域网 / 隧道下的手机与平板接入。
+    Remote,
 }
 
 impl PrefSection {
     /// 全部分区，按导航顺序。
-    pub const ALL: [Self; 6] =
-        [Self::General, Self::Models, Self::Tools, Self::Mcp, Self::Skill, Self::Audio];
+    pub const ALL: [Self; 7] = [
+        Self::General,
+        Self::Models,
+        Self::Tools,
+        Self::Mcp,
+        Self::Skill,
+        Self::Audio,
+        Self::Remote,
+    ];
 
     /// 导航图标。
     pub fn icon(self) -> gpui_kit::assets::IconName {
@@ -49,6 +59,7 @@ impl PrefSection {
             Self::Mcp => IconName::Network,
             Self::Skill => IconName::Folder,
             Self::Audio => IconName::Mic,
+            Self::Remote => IconName::Globe,
         }
     }
 
@@ -61,6 +72,7 @@ impl PrefSection {
             Self::Mcp => "MCP",
             Self::Skill => "Skill",
             Self::Audio => "无障碍",
+            Self::Remote => "远程",
         }
     }
 
@@ -73,6 +85,7 @@ impl PrefSection {
             Self::Mcp => "接入外部 MCP 服务器，为 AI 提供额外工具",
             Self::Skill => "Skill 根目录与技能包；AI 按需加载",
             Self::Audio => "语音识别（ASR）与语音播报（TTS）",
+            Self::Remote => "手机与平板通过局域网或隧道接入",
         }
     }
 
@@ -85,6 +98,7 @@ impl PrefSection {
             Self::Mcp => "mcp",
             Self::Skill => "skill",
             Self::Audio => "audio",
+            Self::Remote => "remote",
         }
     }
 
@@ -97,6 +111,7 @@ impl PrefSection {
             Self::Mcp => Some(SettingsTab::Mcp),
             Self::Skill => Some(SettingsTab::Skill),
             Self::Audio => Some(SettingsTab::Audio),
+            Self::Remote => None,
         }
     }
 }
@@ -106,6 +121,7 @@ pub struct PreferencesWindow {
     session: WeakEntity<Session>,
     settings: Entity<SettingsForm>,
     models: Entity<ModelsForm>,
+    remote: Entity<RemotePage>,
     section: PrefSection,
     /// 左侧导航是否收起为图标。
     nav_collapsed: bool,
@@ -129,13 +145,14 @@ impl PreferencesWindow {
                 window,
                 &config,
                 session.clone(),
-                haloeth,
+                haloeth.clone(),
                 section.tab().unwrap_or(SettingsTab::General),
                 true,
                 cx,
             )
         });
         let models = cx.new(|cx| ModelsForm::new(window, &config, session.clone(), true, cx));
+        let remote = cx.new(|cx| RemotePage::new(window, session.clone(), haloeth, cx));
 
         // 表单内部改动后即时保存：观察通知即可，无需每个控件都手动保存。
         let settings_observation = cx.observe(&settings, |this, _, cx| {
@@ -157,6 +174,7 @@ impl PreferencesWindow {
             session,
             settings,
             models,
+            remote,
             section,
             nav_collapsed: false,
             error: None,
@@ -184,6 +202,7 @@ impl PreferencesWindow {
         let config = self.current_config(cx).unwrap_or_default();
         self.settings.update(cx, |settings, cx| settings.reload(&config, window, cx));
         self.models.update(cx, |models, cx| models.reload_from(&config, window, cx));
+        self.remote.update(cx, |remote, cx| remote.reload_from(&config, window, cx));
         self.section = section;
         if let Some(tab) = section.tab() {
             self.settings.update(cx, |settings, cx| settings.set_tab(tab, cx));
@@ -340,6 +359,7 @@ impl PreferencesWindow {
     fn render_body(&mut self, _cx: &mut Context<Self>) -> AnyElement {
         match self.section {
             PrefSection::Models => self.models.clone().into_any_element(),
+            PrefSection::Remote => self.remote.clone().into_any_element(),
             _ => self.settings.clone().into_any_element(),
         }
     }

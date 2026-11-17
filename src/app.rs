@@ -3,6 +3,8 @@
 //! 只负责窗口级状态与动作分发；对话、输入区与配置界面由 `ui`、`settings` 模块提供。
 
 mod access;
+#[cfg(test)]
+mod remote_tests;
 mod sessions;
 #[cfg(test)]
 mod tests;
@@ -25,6 +27,7 @@ use gpui_kit::{
 };
 
 use crate::audio::{ConfiguredRecognizer, TtsService, TtsSettings};
+use crate::remote::{BridgeStatus, RemoteBridge, RemoteCommand};
 use crate::session::{Session, Status};
 use crate::session_store::{SessionFile, SessionStore};
 use crate::settings::models::ModelsForm;
@@ -35,6 +38,14 @@ use crate::ui::conversation::{ChatRole, Conversation, ConversationEvent};
 use crate::ui::image_viewer::ImageViewer;
 use crate::ui::{self, Tone, chip, tinted};
 use crate::{background, config};
+
+use agent::model::Modality;
+use remote::proto::notify::{MessageAppended, SessionsChanged, StateChanged};
+use remote::proto::{
+    AppStateDto, ChatRoleDto, Command, ErrorCode, FeatureDto, FeatureKindDto, GrantDto,
+    ModelRefDto, Notification, RemoteError, ServerInfoDto, SessionSummaryDto, SnapshotDto,
+    StreamingDto, TranscriptReset, WelcomeDto,
+};
 
 use self::access::AccessForm;
 use self::sessions::SessionsForm;
@@ -64,6 +75,8 @@ pub(crate) struct Haloeth {
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
     session: Entity<Session>,
+    /// 远程桥：命令通道、通知投影与配对设备。
+    remote: RemoteBridge,
     /// 会话目录
     store: SessionStore,
     /// 当前会话的文件元数据
@@ -117,9 +130,11 @@ impl Haloeth {
     ) -> Self {
         // 配色方案：跟随系统时读取窗口外观，系统切换时同步更新。
         ui::apply_theme(config.ui.theme, Some(window), cx);
+        let (remote, remote_commands) = RemoteBridge::new();
         let conversation = cx.new(Conversation::new);
         let session = cx.new(|_| Session::new(config, conversation.clone()));
         session.update(cx, |session, cx| session.set_config_persistence(persist_config, cx));
+        session.update(cx, |session, cx| session.set_remote_tap(Some(remote.tap()), cx));
         let send_key = session.read(cx).config().ui.send_key;
         let line_numbers = session.read(cx).config().ui.line_numbers;
         let composer = cx.new(|cx| Composer::new(window, send_key, line_numbers, cx));
@@ -141,17 +156,11 @@ impl Haloeth {
             |this, _composer, event: &ComposerEvent, window, cx| {
                 let ComposerEvent::Submit(text) = event;
                 // 运行中不接受新消息：把文本放回输入框，避免用户看到消息已发出却没被处理。
-                if this.session.read(cx).status().is_busy() {
+                if !this.submit_message(text, cx) {
                     this.composer.update(cx, |composer, cx| {
                         composer.append_text(text, window, cx);
                     });
-                    return;
                 }
-                this.conversation.update(cx, |conversation, cx| {
-                    conversation.push(ChatRole::User, text.clone(), cx);
-                });
-                this.session.update(cx, |session, cx| session.submit(text.to_string(), cx));
-                this.save_active(cx);
             },
         );
         // 审批卡片上的按钮回到会话，由会话把决定交给挂起中的审批
@@ -304,6 +313,7 @@ impl Haloeth {
             conversation,
             composer,
             session,
+            remote,
             store,
             active,
             title: initial_title,
@@ -327,6 +337,9 @@ impl Haloeth {
             _appearance_subscription: appearance_subscription,
         };
         this.refresh_tray(cx);
+        this.spawn_remote_pump(remote_commands, cx);
+        let remote_config = this.session.read(cx).config().remote.clone();
+        this.remote.sync(&remote_config);
         this
     }
 
@@ -671,6 +684,8 @@ impl Haloeth {
         });
         self.title = SharedString::from(file.title.clone());
         self.active = file;
+        self.publish_remote_reset(cx);
+        self.publish_remote_state(cx);
         self.refresh_tray(cx);
     }
 
@@ -832,8 +847,9 @@ impl Haloeth {
         let _ = self.main_window.update(cx, |_, window, _| window.activate_window());
     }
 
-    /// 把当前会话标识与标题推给托盘菜单；会话列表由后台线程在展开菜单时读取。
-    fn refresh_tray(&mut self, _cx: &mut Context<Self>) {
+    /// 把当前会话标识与标题推给托盘，并同步远程端的会话列表。
+    fn refresh_tray(&mut self, cx: &mut Context<Self>) {
+        self.publish_remote_sessions(cx);
         let Some(background) = &self.background else {
             return;
         };
@@ -841,6 +857,395 @@ impl Haloeth {
             current_id: self.active.id.clone(),
             current: self.title.to_string(),
         });
+    }
+
+    /// 提交一条用户消息；运行中返回 `false`，文本由调用方处理。
+    pub(crate) fn submit_message(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.session.read(cx).status().is_busy() {
+            return false;
+        }
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.push(ChatRole::User, text.to_owned(), cx);
+        });
+        self.session.update(cx, |session, cx| session.submit(text.to_owned(), cx));
+        self.save_active(cx);
+        self.remote.publish(Notification::MessageAppended(MessageAppended {
+            role: ChatRoleDto::User,
+            text: text.to_owned(),
+        }));
+        true
+    }
+
+    /// 把远程命令泵挂到界面执行器；命令在顶层逐条处理。
+    fn spawn_remote_pump(
+        &mut self,
+        mut commands: tokio::sync::mpsc::UnboundedReceiver<RemoteCommand>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Some((command, reply)) = commands.recv().await {
+                match this.update(cx, |haloeth, cx| haloeth.apply_remote_command(command, cx)) {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 应用一条远程命令；在界面线程上执行。
+    pub(crate) fn apply_remote_command(
+        &mut self,
+        command: Command,
+        cx: &mut Context<Self>,
+    ) -> Result<serde_json::Value, RemoteError> {
+        use serde_json::{Value, json};
+        match command {
+            Command::Welcome => {
+                Ok(serde_json::to_value(self.remote_welcome(cx)).unwrap_or(Value::Null))
+            }
+            Command::Snapshot => {
+                Ok(serde_json::to_value(self.remote_snapshot(cx)).unwrap_or(Value::Null))
+            }
+            Command::Ping => Ok(json!({ "t": crate::remote::now_millis() })),
+            Command::StateGet => Ok(json!({ "state": self.remote_state(cx) })),
+            Command::MessageSend {
+                text,
+                attachments,
+            } => {
+                if !attachments.is_empty() {
+                    return Err(RemoteError::invalid_params("附件上传尚未实现"));
+                }
+                if self.submit_message(&text, cx) {
+                    Ok(Value::Null)
+                } else {
+                    Err(RemoteError::busy(text))
+                }
+            }
+            Command::RunCancel => {
+                self.session.update(cx, |session, cx| session.cancel(cx));
+                Ok(Value::Null)
+            }
+            Command::ApprovalResolve {
+                id,
+                decision,
+            } => {
+                let decision = crate::remote::decision_from(decision);
+                self.session.update(cx, |session, cx| session.resolve_approval(&id, decision, cx));
+                self.save_active(cx);
+                Ok(Value::Null)
+            }
+            Command::SessionNew => {
+                if self.session.read(cx).status().is_busy() {
+                    return Err(RemoteError::new(ErrorCode::Busy, "运行中"));
+                }
+                self.create_session(cx);
+                Ok(json!({ "id": self.active.id }))
+            }
+            Command::SessionOpen {
+                id,
+            } => {
+                if self.session.read(cx).status().is_busy() {
+                    return Err(RemoteError::new(ErrorCode::Busy, "运行中"));
+                }
+                if id != self.active.id {
+                    let Ok(file) = self.store.load(&id) else {
+                        return Err(RemoteError::not_found(format!("会话不存在：{id}")));
+                    };
+                    self.save_active(cx);
+                    self.activate(file, cx);
+                }
+                Ok(json!({ "id": self.active.id }))
+            }
+            Command::SessionRename {
+                title,
+            } => {
+                self.rename_session(&title, cx).map_err(RemoteError::internal)?;
+                Ok(Value::Null)
+            }
+            Command::SessionDelete {
+                id,
+            } => {
+                if self.session.read(cx).status().is_busy() {
+                    return Err(RemoteError::new(ErrorCode::Busy, "运行中"));
+                }
+                self.delete_session(&id, cx).map_err(RemoteError::internal)?;
+                Ok(Value::Null)
+            }
+            Command::ModelSelect {
+                provider,
+                model,
+            } => {
+                let allowed = self
+                    .session
+                    .read(cx)
+                    .config()
+                    .models_with(&[Modality::Text], &[Modality::Text]);
+                if !allowed.iter().any(|entry| entry.provider == provider && entry.model == model) {
+                    return Err(RemoteError::unknown_model(format!("{provider}/{model}")));
+                }
+                self.session.update(cx, |session, cx| session.select_model(&provider, &model, cx));
+                self.save_active(cx);
+                self.publish_remote_state(cx);
+                Ok(Value::Null)
+            }
+            Command::FeatureSet {
+                key,
+                enabled,
+            } => {
+                let Some((prefix, name)) = key.split_once(':') else {
+                    return Err(RemoteError::unknown_feature(key));
+                };
+                let kind = match prefix {
+                    "tool" => config::FeatureKind::Tool,
+                    "mcp" => config::FeatureKind::Mcp,
+                    "skill" => config::FeatureKind::Skill,
+                    _ => return Err(RemoteError::unknown_feature(key)),
+                };
+                if name.is_empty() {
+                    return Err(RemoteError::unknown_feature(key));
+                }
+                self.session
+                    .update(cx, |session, cx| session.set_feature_state(kind, name, enabled, cx));
+                self.save_active(cx);
+                self.publish_remote_state(cx);
+                Ok(Value::Null)
+            }
+            Command::GrantAdd {
+                path,
+                access,
+            } => {
+                let base = std::env::current_dir().unwrap_or_default();
+                let path = agent::approval::resolve_path(&path, &base);
+                if !path.is_dir() {
+                    return Err(RemoteError::invalid_params(format!(
+                        "目录不存在：{}",
+                        path.display()
+                    )));
+                }
+                let access = crate::remote::access_from(access);
+                let mut grants = self.session.read(cx).grants().to_vec();
+                if let Some(existing) = grants.iter_mut().find(|grant| grant.path == path) {
+                    existing.access = access;
+                } else {
+                    grants.push(agent::approval::DirectoryGrant::new(path, access));
+                }
+                self.session.update(cx, |session, cx| session.set_grants(grants, cx));
+                self.save_active(cx);
+                self.publish_remote_state(cx);
+                Ok(Value::Null)
+            }
+            Command::GrantRemove {
+                path,
+            } => {
+                let base = std::env::current_dir().unwrap_or_default();
+                let target = agent::approval::resolve_path(&path, &base);
+                let mut grants = self.session.read(cx).grants().to_vec();
+                grants.retain(|grant| grant.path != target);
+                self.session.update(cx, |session, cx| session.set_grants(grants, cx));
+                self.save_active(cx);
+                self.publish_remote_state(cx);
+                Ok(Value::Null)
+            }
+            Command::ApprovalMode {
+                mode,
+            } => {
+                self.set_approval_mode(crate::remote::mode_from(mode), cx);
+                self.publish_remote_state(cx);
+                Ok(Value::Null)
+            }
+        }
+    }
+
+    /// 配置变更后同步远程服务与配对设备，并回收最近在线时间。
+    pub(crate) fn sync_remote(&mut self, cx: &mut Context<Self>) {
+        let mut config = self.session.read(cx).config().clone();
+        if self.remote.merge_last_seen(&mut config.remote.devices) {
+            if self.session.read(cx).persists_config() {
+                let _ = config.save();
+            }
+            self.session.update(cx, |session, cx| session.apply_config(config, cx));
+        }
+        let remote = self.session.read(cx).config().remote.clone();
+        self.remote.sync(&remote);
+    }
+
+    /// 远程服务状态；偏好页展示用。
+    pub(crate) fn remote_status(&self) -> BridgeStatus {
+        self.remote.status()
+    }
+
+    /// 远程连接数。
+    pub(crate) fn remote_connections(&self) -> usize {
+        self.remote.connections()
+    }
+
+    /// 设备最近在线时间（本次进程内）。
+    pub(crate) fn remote_last_seen(&self, device_id: &str) -> Option<u64> {
+        self.remote.last_seen(device_id)
+    }
+
+    /// 握手响应体。
+    fn remote_welcome(&self, cx: &App) -> WelcomeDto {
+        WelcomeDto {
+            protocol: remote::PROTOCOL_VERSION,
+            server: ServerInfoDto {
+                name: "haloeth".to_owned(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                platform: std::env::consts::OS.to_owned(),
+            },
+            state: self.remote_state(cx),
+            sessions: self.remote_sessions(),
+        }
+    }
+
+    /// 会话摘要列表。
+    fn remote_sessions(&self) -> Vec<SessionSummaryDto> {
+        self.store
+            .list()
+            .into_iter()
+            .map(|summary| SessionSummaryDto {
+                id: summary.id,
+                title: summary.title,
+                updated_at: summary.updated_at,
+                message_count: summary.message_count,
+            })
+            .collect()
+    }
+
+    /// 全局状态快照。
+    fn remote_state(&self, cx: &App) -> AppStateDto {
+        let session = self.session.read(cx);
+        let config = session.config();
+        AppStateDto {
+            active_session_id: self.active.id.clone(),
+            title: self.active.title.clone(),
+            status: crate::remote::status_dto(session.status()),
+            activity: session.activity_label().map(str::to_owned),
+            selection: session.selection().map(|(provider, model)| ModelRefDto {
+                provider: provider.to_owned(),
+                model: model.to_owned(),
+            }),
+            models: config
+                .models_with(&[Modality::Text], &[Modality::Text])
+                .into_iter()
+                .map(|selection| ModelRefDto {
+                    provider: selection.provider,
+                    model: selection.model,
+                })
+                .collect(),
+            features: self.remote_features(cx),
+            grants: session
+                .grants()
+                .iter()
+                .map(|grant| GrantDto {
+                    path: grant.path.display().to_string(),
+                    access: crate::remote::access_dto(grant.access),
+                })
+                .collect(),
+            approval_mode: crate::remote::mode_dto(config.approval.mode),
+            usage: crate::remote::usage_dto(session.usage(), session.usage_by_model()),
+        }
+    }
+
+    /// 功能开关；与快速面板同源。
+    fn remote_features(&self, cx: &App) -> Vec<FeatureDto> {
+        let (tools, mcp, skills) = self.feature_rows(cx);
+        let mut features = feature_dtos(config::FeatureKind::Tool, &tools);
+        features.extend(feature_dtos(config::FeatureKind::Mcp, &mcp));
+        features.extend(feature_dtos(config::FeatureKind::Skill, &skills));
+        features
+    }
+
+    /// 快速面板与远程状态共用同一份功能清单。
+    fn feature_rows(&self, cx: &App) -> FeatureRows {
+        let config = self.session.read(cx).config().clone();
+        let tools = agent::tools::builtin_tools(&agent::tools::BuiltinOptions::default());
+        let tool_rows: Vec<(String, bool)> = tools
+            .iter()
+            .map(|tool| tool.spec().name.clone())
+            .chain([
+                "web_search".to_owned(),
+                agent::tools::media::GENERATE_IMAGE.to_owned(),
+                agent::tools::media::GENERATE_VIDEO.to_owned(),
+                agent::tools::media::GENERATE_MUSIC.to_owned(),
+            ])
+            .filter(|name| config.feature_prefs.is_visible(config::FeatureKind::Tool, name))
+            .map(|name| {
+                let enabled = self.session.read(cx).feature_state(config::FeatureKind::Tool, &name);
+                (name, enabled)
+            })
+            .collect();
+        let mcp_rows: Vec<(String, bool)> = config
+            .mcp_servers
+            .iter()
+            .filter(|server| {
+                config.feature_prefs.is_visible(config::FeatureKind::Mcp, &server.name)
+            })
+            .map(|server| {
+                let enabled =
+                    self.session.read(cx).feature_state(config::FeatureKind::Mcp, &server.name);
+                (server.name.clone(), enabled)
+            })
+            .collect();
+        let skill_rows: Vec<(String, bool)> = agent::skill::discover(&config.skill_dirs())
+            .iter()
+            .filter(|skill| {
+                config.feature_prefs.is_visible(config::FeatureKind::Skill, &skill.name)
+            })
+            .map(|skill| {
+                let enabled =
+                    self.session.read(cx).feature_state(config::FeatureKind::Skill, &skill.name);
+                (skill.name.clone(), enabled)
+            })
+            .collect();
+        (tool_rows, mcp_rows, skill_rows)
+    }
+
+    /// 连接时的实时快照；`entries` 不含打开中的流式消息。
+    fn remote_snapshot(&self, cx: &App) -> SnapshotDto {
+        let conversation = self.conversation.read(cx);
+        let mut entries = conversation.snapshot(cx);
+        let streaming = conversation.streaming_snapshot();
+        if streaming.is_some() {
+            // 流式消息总是最后一行，通过 `streaming` 单独递送。
+            entries.pop();
+        }
+        SnapshotDto {
+            session_id: self.active.id.clone(),
+            entries: entries.iter().map(crate::remote::entry_dto).collect(),
+            streaming: streaming.map(|(role, text)| StreamingDto {
+                role: crate::remote::role_dto(role),
+                text,
+            }),
+            watermark: self.remote.watermark(),
+        }
+    }
+
+    /// 推送当前会话快照；会话切换与恢复时调用。
+    fn publish_remote_reset(&self, cx: &App) {
+        let snapshot = self.remote_snapshot(cx);
+        self.remote.publish(Notification::TranscriptReset(TranscriptReset {
+            session_id: snapshot.session_id,
+            entries: snapshot.entries,
+            streaming: snapshot.streaming,
+        }));
+    }
+
+    /// 推送全局状态。
+    fn publish_remote_state(&self, cx: &App) {
+        self.remote.publish(Notification::StateChanged(StateChanged {
+            state: self.remote_state(cx),
+        }));
+    }
+
+    /// 推送会话列表。
+    fn publish_remote_sessions(&self, _cx: &App) {
+        self.remote.publish(Notification::SessionsChanged(SessionsChanged {
+            summaries: self.remote_sessions(),
+        }));
     }
 
     /// 品牌标识，标题栏最左侧
@@ -998,47 +1403,8 @@ impl Haloeth {
 
     /// 左下角「更多」：快速查看与切换工具、MCP、Skill，并进入对应设置。
     fn render_more_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let config = self.session.read(cx).config().clone();
         // 快速面板只列全局「显示」的功能，状态取当前会话。
-        let tools = agent::tools::builtin_tools(&agent::tools::BuiltinOptions::default());
-        let tool_rows: Vec<(String, bool)> = tools
-            .iter()
-            .map(|tool| tool.spec().name.clone())
-            .chain([
-                "web_search".to_owned(),
-                agent::tools::media::GENERATE_IMAGE.to_owned(),
-                agent::tools::media::GENERATE_VIDEO.to_owned(),
-                agent::tools::media::GENERATE_MUSIC.to_owned(),
-            ])
-            .filter(|name| config.feature_prefs.is_visible(config::FeatureKind::Tool, name))
-            .map(|name| {
-                let enabled = self.session.read(cx).feature_state(config::FeatureKind::Tool, &name);
-                (name, enabled)
-            })
-            .collect();
-        let mcp_rows: Vec<(String, bool)> = config
-            .mcp_servers
-            .iter()
-            .filter(|server| {
-                config.feature_prefs.is_visible(config::FeatureKind::Mcp, &server.name)
-            })
-            .map(|server| {
-                let enabled =
-                    self.session.read(cx).feature_state(config::FeatureKind::Mcp, &server.name);
-                (server.name.clone(), enabled)
-            })
-            .collect();
-        let skill_rows: Vec<(String, bool)> = agent::skill::discover(&config.skill_dirs())
-            .iter()
-            .filter(|skill| {
-                config.feature_prefs.is_visible(config::FeatureKind::Skill, &skill.name)
-            })
-            .map(|skill| {
-                let enabled =
-                    self.session.read(cx).feature_state(config::FeatureKind::Skill, &skill.name);
-                (skill.name.clone(), enabled)
-            })
-            .collect();
+        let (tool_rows, mcp_rows, skill_rows) = self.feature_rows(cx);
         let tool_summary = format!(
             "工具 · {} / {} 启用 →",
             tool_rows.iter().filter(|(_, enabled)| *enabled).count(),
@@ -1534,6 +1900,27 @@ fn more_toggle(
 }
 
 /// 运行状态对应的展示色调。
+/// 功能清单：工具、MCP 与 Skill 的名称与启用状态。
+type FeatureRows = (Vec<(String, bool)>, Vec<(String, bool)>, Vec<(String, bool)>);
+
+/// 功能行映射为线上状态。
+fn feature_dtos(kind: config::FeatureKind, rows: &[(String, bool)]) -> Vec<FeatureDto> {
+    let dto_kind = match kind {
+        config::FeatureKind::Tool => FeatureKindDto::Tool,
+        config::FeatureKind::Mcp => FeatureKindDto::Mcp,
+        config::FeatureKind::Skill => FeatureKindDto::Skill,
+    };
+    rows.iter()
+        .map(|(name, enabled)| FeatureDto {
+            key: format!("{}:{name}", kind.prefix()),
+            kind: dto_kind,
+            name: name.clone(),
+            enabled: *enabled,
+        })
+        .collect()
+}
+
+/// 当前时间（Unix 毫秒）。
 fn status_tone(status: Status) -> Tone {
     match status {
         Status::Idle => Tone::Neutral,

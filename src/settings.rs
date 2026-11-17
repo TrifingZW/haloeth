@@ -9,6 +9,7 @@ pub mod mcp_form;
 pub mod media_form;
 pub mod models;
 pub mod preferences;
+pub mod remote;
 pub mod skill_form;
 
 use agent::mcp::{McpServerConfig, McpTransport};

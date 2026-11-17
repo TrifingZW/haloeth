@@ -12,6 +12,7 @@ mod audio;
 mod background;
 mod config;
 mod logging;
+mod remote;
 mod session;
 mod session_store;
 mod settings;
