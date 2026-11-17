@@ -1,10 +1,15 @@
-//! 界面通用部件：配色方案、状态色调与带色按钮。
+//! 界面层：配色方案、通用部件与展示组件。
 //!
-//! 所有按钮沿用 2px 边框约定；这里只补充颜色语义：
+//! 子模块提供对话区、输入区与图片查看器；所有按钮沿用 2px 边框约定。
+//! 这里只补充颜色语义：
 //! - 绿色：已启用 / 成功
 //! - 红色（淡）：已停用 / 取消 / 拒绝
 //! - 黄色：需要确认
 //! - 主色：当前选中
+
+pub mod composer;
+pub mod conversation;
+pub mod image_viewer;
 
 use gpui_kit::base::{TestSupportExt as _, v_flex};
 use gpui_kit::component::button::{

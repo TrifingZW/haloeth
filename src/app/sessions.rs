@@ -11,7 +11,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::Haloeth;
+use super::Haloeth;
 use crate::session_store::{SessionStore, SessionSummary};
 use crate::ui::input_frame;
 

@@ -15,9 +15,9 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Activity, Event};
 use crate::message::ToolCall;
 use crate::model::{GenerateRequest, Model, ToolChoice};
+use crate::runtime::{Activity, Event};
 use crate::tool::{Access, ApprovalRequirement, ToolEffect, ToolSpec};
 
 /// 审核模式。

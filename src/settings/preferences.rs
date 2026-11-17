@@ -10,11 +10,11 @@ use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, Title
 use gpui_kit::prelude::{FluentBuilder as _, InteractiveElement as _};
 use gpui_kit::*;
 
-use crate::Haloeth;
+use super::models::ModelsForm;
+use super::{SettingsForm, SettingsTab};
+use crate::app::Haloeth;
 use crate::config::Config;
-use crate::models::ModelsForm;
 use crate::session::Session;
-use crate::settings::{SettingsForm, SettingsTab};
 use crate::ui::{Tone, tinted};
 
 /// 偏好窗口的分区。

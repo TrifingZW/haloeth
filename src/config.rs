@@ -216,7 +216,7 @@ pub struct Provider {
     pub models: Vec<ModelEntry>,
     /// 工具选择策略；思考型提供商（如 DeepSeek）需要 `auto`。
     #[serde(default)]
-    pub tool_choice: agent::openai::ToolChoicePolicy,
+    pub tool_choice: agent::model::openai::ToolChoicePolicy,
     /// 提供方协议。
     #[serde(default)]
     pub protocol: Protocol,
@@ -353,7 +353,7 @@ impl Provider {
             base_url: base_url.into(),
             api_key: api_key.into(),
             models: Vec::new(),
-            tool_choice: agent::openai::ToolChoicePolicy::default(),
+            tool_choice: agent::model::openai::ToolChoicePolicy::default(),
             protocol: Protocol::default(),
             headers: std::collections::BTreeMap::new(),
             extra_body: std::collections::BTreeMap::new(),
@@ -1834,7 +1834,7 @@ mod tests {
         config.ui.theme = ThemePreference::Dark;
         config.ui.send_key = SendKey::SecondaryEnter;
         let mut entry = provider("deepseek", &["deepseek-flash"]);
-        entry.tool_choice = agent::openai::ToolChoicePolicy::Required;
+        entry.tool_choice = agent::model::openai::ToolChoicePolicy::Required;
         config.add_provider(entry).expect("新增应当成功");
 
         config.save_to(&path).expect("保存应当成功");
@@ -1842,7 +1842,10 @@ mod tests {
 
         assert_eq!(restored.ui.theme, ThemePreference::Dark);
         assert_eq!(restored.ui.send_key, SendKey::SecondaryEnter);
-        assert_eq!(restored.providers[0].tool_choice, agent::openai::ToolChoicePolicy::Required);
+        assert_eq!(
+            restored.providers[0].tool_choice,
+            agent::model::openai::ToolChoicePolicy::Required
+        );
         let text = std::fs::read_to_string(&path).expect("读取配置");
         assert!(text.contains("theme = \"dark\""));
         assert!(text.contains("send_key = \"secondary-enter\""));

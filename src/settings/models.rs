@@ -771,9 +771,15 @@ impl ModelsForm {
     fn cycle_tool_choice(&mut self, provider: &str, cx: &mut Context<Self>) {
         if let Some(entry) = self.draft.providers.iter_mut().find(|entry| entry.name == provider) {
             entry.tool_choice = match entry.tool_choice {
-                agent::openai::ToolChoicePolicy::Auto => agent::openai::ToolChoicePolicy::Required,
-                agent::openai::ToolChoicePolicy::Required => agent::openai::ToolChoicePolicy::Omit,
-                agent::openai::ToolChoicePolicy::Omit => agent::openai::ToolChoicePolicy::Auto,
+                agent::model::openai::ToolChoicePolicy::Auto => {
+                    agent::model::openai::ToolChoicePolicy::Required
+                }
+                agent::model::openai::ToolChoicePolicy::Required => {
+                    agent::model::openai::ToolChoicePolicy::Omit
+                }
+                agent::model::openai::ToolChoicePolicy::Omit => {
+                    agent::model::openai::ToolChoicePolicy::Auto
+                }
             };
         }
         cx.notify();
@@ -1242,11 +1248,11 @@ fn provider_divider(provider: &str, cx: &App) -> AnyElement {
 
 /// 带标签的表单字段：标签在上，控件在下。
 /// 工具选择策略的展示文本。
-fn policy_label(policy: agent::openai::ToolChoicePolicy) -> &'static str {
+fn policy_label(policy: agent::model::openai::ToolChoicePolicy) -> &'static str {
     match policy {
-        agent::openai::ToolChoicePolicy::Auto => "自动",
-        agent::openai::ToolChoicePolicy::Required => "必须",
-        agent::openai::ToolChoicePolicy::Omit => "省略",
+        agent::model::openai::ToolChoicePolicy::Auto => "自动",
+        agent::model::openai::ToolChoicePolicy::Required => "必须",
+        agent::model::openai::ToolChoicePolicy::Omit => "省略",
     }
 }
 

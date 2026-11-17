@@ -10,11 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent::approval::{AllowRule, DirectoryGrant};
 use agent::metrics::TokenUsage;
-use agent::persist::ContextSnapshot;
+use agent::runtime::persist::ContextSnapshot;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::conversation::TranscriptEntry;
+use crate::ui::conversation::TranscriptEntry;
 
 /// 会话文件格式版本。
 pub const SESSION_VERSION: u32 = 1;
@@ -98,7 +98,7 @@ impl SessionFile {
         }
         let Some(first) = self.transcript.iter().find_map(|entry| match entry {
             TranscriptEntry::Text {
-                role: crate::conversation::ChatRole::User,
+                role: crate::ui::conversation::ChatRole::User,
                 text,
             } => Some(text),
             _ => None,
@@ -245,7 +245,7 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::{ChatRole, TranscriptEntry};
+    use crate::ui::conversation::{ChatRole, TranscriptEntry};
 
     fn store(name: &str) -> SessionStore {
         let root = std::env::temp_dir().join(format!("haloeth-sessions-{name}"));

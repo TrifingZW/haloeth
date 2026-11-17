@@ -2,6 +2,10 @@
 //!
 //! 循环骨架固定，行为差异由构造配置决定：最大步数、计划间隔与附加指令。
 //! 计划步骤默认关闭，设置间隔后在第 1 步及之后每间隔步生成一次。
+//! 系统提示与上下文快照分别由子模块 [`prompt`] 与 [`persist`] 负责。
+
+pub mod persist;
+pub mod prompt;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +21,6 @@ use crate::memory::{
 use crate::message::{ContentBlock, Message, StreamDelta, ToolCall};
 use crate::metrics::{Timing, TokenUsage};
 use crate::model::{GenerateRequest, Model, ToolChoice};
-use crate::prompt;
 use crate::tool::{
     ApprovalRequirement, FunctionTool, InputSpec, InputType, Tool, ToolSet, ToolSpec,
 };
@@ -289,12 +292,12 @@ impl<M: Model> Agent<M> {
     }
 
     /// 导出上下文快照，供前端持久化。
-    pub fn snapshot(&self) -> crate::persist::ContextSnapshot {
+    pub fn snapshot(&self) -> persist::ContextSnapshot {
         self.memory.snapshot()
     }
 
     /// 从快照恢复上下文；系统提示保持不变。
-    pub fn restore_context(&mut self, snapshot: crate::persist::ContextSnapshot) {
+    pub fn restore_context(&mut self, snapshot: persist::ContextSnapshot) {
         self.memory.restore(snapshot);
     }
 

@@ -397,7 +397,7 @@ impl Model for HttpModel {
 pub fn build_model(options: HttpModelOptions) -> Box<dyn Model> {
     match options.protocol {
         Protocol::OpenAiChat => Box::new(HttpModel::new(options)),
-        Protocol::AnthropicMessages => Box::new(crate::anthropic::AnthropicModel::new(options)),
+        Protocol::AnthropicMessages => Box::new(super::anthropic::AnthropicModel::new(options)),
     }
 }
 

@@ -11,6 +11,7 @@
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use super::openai::{HttpModelOptions, ToolChoicePolicy};
 use crate::error::ModelError;
 use crate::message::{
     ContentBlock, ImageSource, Message, Role, StreamDelta, ToolCallDelta, assemble,
@@ -18,7 +19,6 @@ use crate::message::{
 };
 use crate::metrics::TokenUsage;
 use crate::model::{GenerateRequest, Model, ToolChoice};
-use crate::openai::{HttpModelOptions, ToolChoicePolicy};
 use crate::text::truncate;
 
 /// 服务端错误正文保留的最大长度。

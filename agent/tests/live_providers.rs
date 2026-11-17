@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use agent::message::{ContentBlock, Message, Role, StreamDelta};
+use agent::model::openai::{HttpModelOptions, ToolChoicePolicy, build_model};
 use agent::model::{GenerateRequest, Modality, Model, ToolChoice};
-use agent::openai::{HttpModelOptions, ToolChoicePolicy, build_model};
 use agent::tool::{FunctionTool, InputSpec, InputType, Tool, ToolSet, ToolSpec, wire::WireTool};
 use agent::tools::{SearchOptions, WebSearchTool};
 

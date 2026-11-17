@@ -12,7 +12,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::Haloeth;
+use super::Haloeth;
 use crate::session::Session;
 use crate::ui::{Tone, cancel_button, input_frame, pick_folder, tinted};
 

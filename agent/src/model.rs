@@ -1,11 +1,16 @@
 //! 模型抽象：屏蔽提供方差异，向编排循环提供统一的生成接口。
 //!
+//! 具体协议后端在子模块 [`openai`]（OpenAI Chat）与 [`anthropic`]（Anthropic Messages）。
+//!
 //! 与 smolagents 的差异有两点：
 //! 1) 不实现从文本中解析工具调用的回退路径，仅采用提供方原生的工具调用字段。
 //! 2) 停止序列与流式用量的发送由后端配置显式控制，取代按模型名判断的兼容性开关。
 //!
 //! 生成接口以 `&mut dyn FnMut` 交付增量并返回装箱 future：这样 [`Model`] 保持对象安全，
 //! 会话可以用 `Box<dyn Model>` 持有生产模型，在测试中换成脚本模型。
+
+pub mod anthropic;
+pub mod openai;
 
 use std::sync::Arc;
 

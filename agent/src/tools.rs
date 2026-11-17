@@ -1,8 +1,9 @@
-//! 内置能力：文件读写、目录列举、Shell 与提供商搜索。
+//! 内置能力：基础工具（网页与时间）、文件读写、目录列举、Shell、搜索与生成。
 //!
 //! 工具本身不限制路径：越界判断由审核层完成，这样同一套工具可以在不同会话的授权下复用。
 //! 单个工具只负责执行与自我约束（大小上限、超时、二进制拒绝）。
 
+pub mod default;
 pub mod fs;
 pub mod media;
 pub mod search;
@@ -10,6 +11,7 @@ pub mod shell;
 
 use crate::tool::ToolSet;
 
+pub use default::{CurrentTimeTool, FetchUrlTool, default_tools};
 pub use fs::{ListDirTool, ReadFileTool, WriteFileTool};
 pub use media::{ImageOptions, ImageTool, JobOptions, JobTool, ShowImageTool};
 pub use search::{SearchOptions, WebSearchTool};
@@ -34,7 +36,7 @@ pub struct BuiltinOptions {
 
 /// 装配内置工具集：网页访问、当前时间、文件、Shell 与可选搜索。
 pub fn builtin_tools(options: &BuiltinOptions) -> ToolSet {
-    let mut tools = crate::default_tools::default_tools();
+    let mut tools = default_tools();
     tools.insert(ReadFileTool::new()).expect("内置工具名称固定且互不冲突");
     tools.insert(WriteFileTool::new()).expect("内置工具名称固定且互不冲突");
     tools.insert(ListDirTool::new()).expect("内置工具名称固定且互不冲突");

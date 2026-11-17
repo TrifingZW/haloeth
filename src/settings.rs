@@ -1,9 +1,15 @@
-//! 设置对话框：跨会话的配置。
+//! 设置界面：跨会话配置面板、偏好窗口与各配置对话框。
 //!
 //! 这里只放跨对话的设置：外观、审核模型与网络策略、会话存储、MCP 服务器定义与 Skill 定义。
 //! 当前对话的审核模式、目录授权、工具开关在主界面直接操作。
 //!
 //! 与模型面板一致，编辑先落在草稿配置上，保存后才写盘并应用到会话。
+
+pub mod mcp_form;
+pub mod media_form;
+pub mod models;
+pub mod preferences;
+pub mod skill_form;
 
 use agent::mcp::{McpServerConfig, McpTransport};
 use agent::skill::{self, SKILL_FILE};
@@ -19,16 +25,17 @@ use gpui_kit::component::{
 use gpui_kit::prelude::{FluentBuilder as _, InteractiveElement as _};
 use gpui_kit::*;
 
-use crate::Haloeth;
+use crate::app::Haloeth;
 use crate::audio::{ConfiguredRecognizer, SelectableMicrophone, input_devices};
 use crate::config::{
     AudioBackend, Config, FeatureKind, MediaTool, ModelSelection, SendKey, ThemePreference,
 };
-use crate::mcp_form::McpForm;
 use crate::session::Session;
-use crate::skill_form::SkillForm;
 use crate::ui::{Tone, cancel_button, field, input_frame, pick_folder, tinted};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+
+use self::mcp_form::McpForm;
+use self::skill_form::SkillForm;
 
 /// 设置分页。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -777,11 +784,7 @@ impl SettingsForm {
             return cancel_button("default-model", "无 · 前往模型设置", cx)
                 .on_click(move |_, window, cx| {
                     let _ = haloeth.update(cx, |haloeth, cx| {
-                        haloeth.open_preferences(
-                            crate::preferences::PrefSection::Models,
-                            window,
-                            cx,
-                        )
+                        haloeth.open_preferences(preferences::PrefSection::Models, window, cx)
                     });
                 })
                 .into_any_element();
@@ -1554,11 +1557,7 @@ impl SettingsForm {
                 let haloeth = haloeth.clone();
                 window.defer(cx, move |window, cx| {
                     let _ = haloeth.update(cx, |haloeth, cx| {
-                        haloeth.open_preferences(
-                            crate::preferences::PrefSection::Models,
-                            window,
-                            cx,
-                        )
+                        haloeth.open_preferences(preferences::PrefSection::Models, window, cx)
                     });
                 });
             })
@@ -1814,8 +1813,7 @@ impl SettingsForm {
     fn open_media_form(&mut self, kind: MediaTool, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.draft.media.tool(kind).clone();
         let settings = cx.weak_entity();
-        let form =
-            cx.new(|cx| crate::media_form::MediaForm::new(window, settings, kind, current, cx));
+        let form = cx.new(|cx| media_form::MediaForm::new(window, settings, kind, current, cx));
         window.open_dialog(cx, move |dialog, _, cx| {
             dialog
                 .border_2()

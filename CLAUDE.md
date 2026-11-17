@@ -9,6 +9,63 @@ Haloeth 是一个 GPUI 桌面智能体，工作区包含两个 crate：
 
 代理内核不感知文件路径与会话文件：它只收 `ContextSnapshot`，由前端负责持久化。
 
+## 目录结构
+
+```text
+haloeth/
+├── src/                       前端（二进制）
+│   ├── main.rs                进程入口与模块声明
+│   ├── app.rs                 应用外壳：窗口、标题栏、工具栏、状态栏
+│   ├── app/                   外壳拥有的对话框与主视图测试
+│   │   ├── access.rs
+│   │   ├── sessions.rs
+│   │   └── tests.rs
+│   ├── config.rs              配置模型与读写
+│   ├── session.rs             会话运行编排
+│   ├── session_store.rs       会话文件原子读写
+│   ├── ui.rs                  主题、色调与通用小部件
+│   ├── ui/                    展示组件
+│   │   ├── composer.rs
+│   │   ├── conversation.rs
+│   │   └── image_viewer.rs
+│   ├── settings.rs            设置面板与分页
+│   ├── settings/              跨会话配置界面
+│   │   ├── models.rs
+│   │   ├── preferences.rs
+│   │   ├── mcp_form.rs
+│   │   ├── media_form.rs
+│   │   └── skill_form.rs
+│   ├── audio.rs               语音能力入口
+│   ├── audio/                 麦克风、识别、合成与 WAV
+│   ├── background.rs          托盘与全局快捷键
+│   └── logging.rs             日志
+└── agent/                     代理内核（库）
+    ├── src/
+    │   ├── lib.rs             模块声明与顶层重导出
+    │   ├── runtime.rs         动作—观测循环
+    │   ├── runtime/           提示词与上下文快照
+    │   ├── model.rs           模型抽象与模态
+    │   ├── model/             OpenAI Chat / Anthropic Messages 后端
+    │   ├── tool.rs            工具契约
+    │   ├── tools.rs           内置工具装配
+    │   ├── tools/             基础、文件、Shell、搜索与生成工具
+    │   ├── approval.rs        审核
+    │   ├── memory.rs          步骤记忆
+    │   ├── message.rs         消息模型
+    │   ├── metrics.rs         用量与计时
+    │   ├── mcp.rs             MCP 接入
+    │   ├── skill.rs           Skill 读取与目录管理
+    │   ├── error.rs           错误类型
+    │   └── text.rs            文本工具
+    └── tests/                 实网与 Skill 测试
+```
+
+- 模块采用 Rust 2018+ 布局：`<模块>.rs` 与同名目录并存，不使用 `mod.rs`。
+- `app.rs` 是主窗口外壳，`app/` 放它直接打开的对话框与主视图测试。
+- `ui.rs` 放主题、色调与通用小部件，`ui/` 放展示组件。
+- `settings.rs` 放设置面板与分页，`settings/` 放偏好窗口与各配置对话框。
+- 代理内核按 `runtime`（循环、提示、快照）、`model`（抽象与协议后端）、`tools`（工具契约与实现）分组。
+
 ## 常用命令
 
 ```sh
@@ -26,15 +83,15 @@ cargo run
 - Windows 图标由 `build.rs` + `embed-resource` 写入 `assets/icon.ico`。
 - 所有边框统一 2px：`.border_2()`、`.border_t_2()`、`.border_b_2()`；组件默认的 1px 边框要在调用处覆盖。
 - 可测试元素加 `.test_support()` 与稳定 `ElementId`；`window.find` / `within` 依赖它。
-- 偏好窗口（`src/preferences.rs`）即时生效：控件改动直接写配置，文本框通过订阅触发保存；旧的设置 / 模型对话框仅保留给测试与内部入口。
+- 偏好窗口（`src/settings/preferences.rs`）即时生效：控件改动直接写配置，文本框通过订阅触发保存；旧的设置 / 模型对话框仅保留给测试与内部入口。
 - 确认动作用 `open_alert_dialog`；Skill 删除使用 `agent::skill::delete_skill`（要求目录里存在 `SKILL.md`）。
 - 颜色语义集中在 `src/ui.rs`：`Tone`、`tinted`、`chip`、`cancel_button`。启用用绿色、停用/取消用淡红、等待用黄色、当前项用主色。
 - 表单小部件同样在 `src/ui.rs`：`field`（标签 + 控件）、`input_frame`（2px 外框输入框）、`pick_folder`（系统目录选择器）。新面板直接复用，不要各自再写一份。
 - 主界面只放当前对话需要快速调整的东西（审核模式、目录授权、工具/MCP/Skill 开关、语音按钮）；跨会话配置放「偏好设置」独立窗口。
 - 左下角「⋯」是 `Popover` 控制的常驻面板：开关项点击后不收起，点击面板外才关闭。不要改回点击即关的 `dropdown_menu`。
 - 功能启停分两层：`Config.feature_prefs`（显示 / 默认启用，隐藏即不加载）+ `SessionFile.features`（会话级覆盖）。不要再用「空列表 = 全部启用」的哨兵语义。
-- 新建 MCP / Skill 使用独立对话框（`src/mcp_form.rs`、`src/skill_form.rs`），字段纵向排列；对话框只写设置草稿，由设置面板统一保存。
-- 代理内核的公开类型尽量保持无 UI 依赖；UI 相关类型（`TranscriptEntry`、`ActivityRecord`）放在 `src/conversation.rs`。
+- 新建 MCP / Skill 使用独立对话框（`src/settings/mcp_form.rs`、`src/settings/skill_form.rs`），字段纵向排列；对话框只写设置草稿，由设置面板统一保存。
+- 代理内核的公开类型尽量保持无 UI 依赖；UI 相关类型（`TranscriptEntry`、`ActivityRecord`）放在 `src/ui/conversation.rs`。
 
 ## 架构要点
 
@@ -64,7 +121,7 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 
 ### 存储边界
 
-- `agent::persist::ContextSnapshot` 只含步骤；系统提示每次重建。
+- `agent::runtime::persist::ContextSnapshot` 只含步骤；系统提示每次重建。
 - 系统提示包含 `## File permissions` 段落：会话授权的目录随每次运行传入（`Agent::with_workspace`）。没有授权时告诉模型「没有固定工作区，按用户需求判断，写入前询问」；有授权时说明这些目录优先可用，但以用户要求为准。
 - `src/session_store.rs` 负责 `SessionFile` 的原子读写；`Conversation` 负责显示记录的导出与恢复。
 - 显示记录与执行上下文分开保存，恢复时互不补写，避免重复消息或重复上下文。
@@ -83,7 +140,7 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 - `GenerateRequest` 默认要求调用工具，但真正发送的 `tool_choice` 由 `HttpModelOptions.tool_choice` 决定：`Auto`（默认）/ `Required` / `Omit`。
 - 没有工具调用但有文本时，`action_step` 把这段文本当作最终答案（很多模型在 `auto` 下直接作答）；只有空回复才记 `Parsing` 错误。
 - 思考型模型（DeepSeek `deepseek-flash`、`deepseek-v4-pro`）只接受 `auto` 或省略；发送 `required` 会返回 400。
-- 每个提供商保存 `protocol`（`openai-chat` / `anthropic-messages`）、自定义请求头、额外请求体与 `max_tokens`；`agent::openai::build_model` 按协议构造模型，会话与审核器都走它。
+- 每个提供商保存 `protocol`（`openai-chat` / `anthropic-messages`）、自定义请求头、额外请求体与 `max_tokens`；`agent::model::openai::build_model` 按协议构造模型，会话与审核器都走它。
 - 每个模型条目带输入 / 输出模态（`text` / `image` / `audio` / `video`）；所有模型选择器用 `Config::models_with` 过滤：对话与审核 = 文本→文本，ASR = 音频→文本，TTS = 文本→音频，生成工具 = 文本→图像/视频/音频。
 - 模型请求前按 `HttpModelOptions.input_modalities` 裁剪消息；工具结果里的媒体块在 OpenAI 投影中拆到随后的用户消息，Anthropic 放进 `tool_result`。
 - 内置提供商预设见 `src/config.rs::PROVIDER_PRESETS`。
@@ -92,7 +149,7 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 
 - 语音识别用 `gpui-kit` 的 `speech` feature（`SpeechState` + `SelectableMicrophone`，支持设备选择），`src/audio/recognizer.rs` 实现云端转写或系统听写；百炼自动走原生 `multimodal-generation` + Base64 音频。
 - 语音播报在专用线程执行：Windows SAPI（`windows` crate）或云端语音 + `PlaySound`；百炼自动使用原生 Qwen TTS 并下载 WAV。`TtsService` 只接收「朗读 / 停止」命令；偏好页提供麦克风测试与试听。
-- 生成工具在 `agent/src/tools/media.rs`：绘图默认走 OpenAI 兼容 `images/generations`；百炼（DashScope）自动切换为原生异步任务（`X-DashScope-Async` + `/api/v1/tasks/{{id}}`）；视频 / 音乐使用可配置的「提交 → 轮询 → 下载」适配器，`src/media_form.rs` 提供高级设置。产物路径由模型参数给出并走写审核。
+- 生成工具在 `agent/src/tools/media.rs`：绘图默认走 OpenAI 兼容 `images/generations`；百炼（DashScope）自动切换为原生异步任务（`X-DashScope-Async` + `/api/v1/tasks/{{id}}`）；视频 / 音乐使用可配置的「提交 → 轮询 → 下载」适配器，`src/settings/media_form.rs` 提供高级设置。产物路径由模型参数给出并走写审核。
 - 生成工具默认隐藏且默认禁用；未配置可用模型时工具页只显示「未配置模型」，点击跳到模型页。
 - 后台能力在 `src/background.rs`：独立线程跑隐藏窗口 + 托盘 + 低级键盘钩子（`WH_KEYBOARD_LL`，因为 `RegisterHotKey` 收不到松开）；事件经通道由界面线程的轮询任务取出。
 - **事件处理必须在实体更新之外完成**：在 `this.update(...)` 里再 `this.update(...)` 会 panic（`cannot update ... while it is already being updated`），托盘「偏好设置」就是这样崩的。轮询任务先 `take_background_events()`，再在顶层用 `cx.update_window` / `this.update` 分别处理每个事件。
@@ -101,7 +158,7 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 - 托盘菜单里的会话列表由 `Haloeth::refresh_tray` 推给后台线程（`TrayState`）；「当前对话」是子菜单，勾选当前会话，点击其它会话即切换。
 - 按住说话：`TalkStart` 置 `auto_submit_speech`，`SpeechEvent::Final` 经 `Haloeth::apply_speech_result` 直接提交；手动点麦克风只追加到输入框。快捷键在偏好里点「录制」按下组合键写入（`SettingsForm::capture_hotkey`）。
 - 日志在 `src/logging.rs`，写到应用数据目录的 `Haloeth/logs/haloeth.log`；`logging::init()` 在 `main` 里调用一次。
-- `show_image` 把本地图片显示到对话；`Activity::Images` 携带本地路径，`src/image_viewer.rs` 用 `RenderImage` 渲染，支持旋转 / 镜像 / 滚轮缩放 / 左键拖动，窗口与图片默认居中。
+- `show_image` 把本地图片显示到对话；`Activity::Images` 携带本地路径，`src/ui/image_viewer.rs` 用 `RenderImage` 渲染，支持旋转 / 镜像 / 滚轮缩放 / 左键拖动，窗口与图片默认居中。
 - 多模态实测：DeepSeek / 百炼 / 智谱的文本与工具循环、百炼视觉输入、智谱 CogView 与百炼万相图片生成；真实密钥只通过 `HALOETH_TEST_KEYS_FILE` 传入 ignored 测试，不写入仓库。
 
 ### MCP

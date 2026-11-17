@@ -3,7 +3,7 @@
 //! 设置 `DEEPSEEK_API_KEY` 后运行：
 //! `cargo test -p agent --test live_deepseek -- --ignored`
 
-use agent::openai::{HttpModel, HttpModelOptions};
+use agent::model::openai::{HttpModel, HttpModelOptions};
 use agent::tools::{BuiltinOptions, builtin_tools};
 use agent::{Agent, RunState};
 

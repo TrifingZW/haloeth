@@ -19,9 +19,9 @@ use agent::mcp::McpServerConfig;
 use agent::memory::Step;
 use agent::metrics::Timing;
 use agent::metrics::TokenUsage;
+use agent::model::openai::{HttpModelOptions, list_models};
 use agent::model::{Model, ModelBuilder};
-use agent::openai::{HttpModelOptions, list_models};
-use agent::persist::ContextSnapshot;
+use agent::runtime::persist::ContextSnapshot;
 use agent::skill::{self, LoadSkillTool, Skill};
 use agent::tools::{BuiltinOptions, ImageOptions, JobOptions, SearchOptions, builtin_tools};
 use agent::{Agent, Event, Interrupt, RunResult, RunState};
@@ -30,8 +30,8 @@ use serde_json::Value;
 use tokio::runtime::Runtime;
 
 use crate::config::{Config, FeatureKind, Provider};
-use crate::conversation::{ChatRole, Conversation};
 use crate::session_store::SessionFile;
+use crate::ui::conversation::{ChatRole, Conversation};
 
 /// 会话运行状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,7 +517,7 @@ impl Session {
         let mut gate =
             PolicyGate::new(self.approval_policy(), handle.clone(), Some(sender.clone()));
         if let Some(reviewer_options) = self.reviewer_options() {
-            gate = gate.with_reviewer(agent::openai::build_model(reviewer_options));
+            gate = gate.with_reviewer(agent::model::openai::build_model(reviewer_options));
         }
         let gate = Arc::new(gate);
 
@@ -564,7 +564,7 @@ impl Session {
         let run = runtime.handle().spawn(async move {
             let model: Box<dyn Model> = match model_builder {
                 Some(builder) => builder(),
-                None => agent::openai::build_model(model_options),
+                None => agent::model::openai::build_model(model_options),
             };
             let tools = prepare_tools(&options, &servers, &skills).await;
             let mut agent = match Agent::new(model, tools) {
@@ -1367,7 +1367,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn blocking_reason_follows_the_session_model(cx: &mut gpui_kit::TestAppContext) {
-        let conversation = cx.update(|cx| cx.new(crate::conversation::Conversation::new));
+        let conversation = cx.update(|cx| cx.new(crate::ui::conversation::Conversation::new));
         cx.update(|_| {
             let mut config = Config::default();
             config.add_provider(provider("a", &["m-a"], "key")).expect("a");
@@ -1402,7 +1402,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn reloading_a_session_keeps_tool_usage(cx: &mut gpui_kit::TestAppContext) {
-        let conversation = cx.update(|cx| cx.new(crate::conversation::Conversation::new));
+        let conversation = cx.update(|cx| cx.new(crate::ui::conversation::Conversation::new));
         let mut file = crate::session_store::SessionFile::new(None, None);
         // 上下文里模型用了 10 个 Token，总量是 30，其余 20 来自生成类工具。
         file.context.steps.push(Step::Action(ActionStep {
@@ -1438,7 +1438,7 @@ mod tests {
 
     #[gpui_kit::test]
     fn dashscope_image_uses_the_async_job(cx: &mut gpui_kit::TestAppContext) {
-        let conversation = cx.update(|cx| cx.new(crate::conversation::Conversation::new));
+        let conversation = cx.update(|cx| cx.new(crate::ui::conversation::Conversation::new));
         cx.update(|_| {
             let mut config = Config::default();
             let mut provider = Provider::new(
