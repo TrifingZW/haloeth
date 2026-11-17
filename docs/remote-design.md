@@ -120,7 +120,7 @@ Haloeth 的远程能力：桌面进程作为宿主，手机、平板等任意设
 
 选定（分层，随阶段落地）：
 
-1. v1 基线：每设备一条 256 位随机令牌，桌面端只存 SHA-256 哈希（`remote.devices`，可撤销、可轮换）；配对通过二维码（`haloeth://pair?host=…&port=…&token=…`）或手动复制；连接后首帧 `hello` 携带令牌或 `Authorization: Bearer` 头；校验失败、超时、限速均以关闭码终结。
+1. v1 基线：每设备一条 256 位随机令牌，桌面端只存 SHA-256 哈希（`remote.devices`，可撤销、可轮换）；配对通过二维码（`haloeth://pair?host=…&port=…&token=…`）或手动复制；连接后首帧 `hello` 携带令牌或 `Authorization: Bearer` 头；校验失败与超时以关闭码终结，限速在升级阶段拒绝（HTTP 429）。
 2. 传输加密（阶段三）：`wss://` + 运行时自签证书（`rcgen` + `rustls`），二维码追加证书 SPKI 指纹 `fp` 供客户端钉扎（TOFU，思路同 Syncthing 设备 ID）。
 3. 跨网络：明确交由隧道（Tailscale / WireGuard 自带传输加密与访问面控制），项目不提供中继。
 
@@ -156,6 +156,7 @@ haloeth/
 ├── agent/                     不改动（内核不感知远程）
 └── src/
     ├── remote.rs              新增：宿主桥（见第 6 节）
+    ├── app/remote_tests.rs    新增：远程桥与偏好页的界面测试
     └── settings/remote.rs     新增：偏好页「远程」分页
 ```
 
@@ -191,7 +192,7 @@ pub trait RemoteHost: Send + Sync + 'static {
 
 - `RemoteServer::start(options, host)`：在专用线程上创建 Tokio 运行时并绑定监听（与 `background::Background::start` 同构：独立线程 + `tracing` 日志 + 句柄交由 `Haloeth` 持有防止 drop）。`ServerOptions` 是 `remote` 自己的配置类型（监听地址、端口、限速参数），不依赖前端配置模型。
 - 端点：`GET /v1`（WS 升级）、`GET /v1/assets`（图片资源）、`POST /v1/attachments`（附件上传，阶段五），均见协议规范第 11 节。路径带版本号，`/v2` 可并存。
-- `RemoteServer::stop()`：广播 `shutdown` 通知 → 关闭监听 → 等待连接排空（5 秒上限）。偏好页开关即时生效，对应 start / stop。
+- `RemoteServer::stop()`：关闭监听并等待连接排空（5 秒上限）。停用或重启服务前由桥先广播 `shutdown` 通知；偏好页开关即时生效，对应 start / stop。
 
 ### 5.3 连接状态机
 
@@ -232,7 +233,7 @@ TCP/HTTP 建立 → WS 升级 → [鉴权窗口 ≤10s]
 
 ### 6.2 命令泵
 
-`Haloeth::new_with_store` 中（`persist_config` 为真时，与托盘启动同条件）创建 `RemoteBridge`：
+创建 `RemoteBridge`（桥本身不创建系统资源，测试可同样驱动命令通道）；服务线程只在配置启用时启动：
 
 1. 建 `mpsc::channel<(Command, oneshot::Sender<Result<Value, RemoteError>>)>`；
 2. 实现 `RemoteHost`：`dispatch` 将命令与 oneshot 发送端写入通道，await oneshot；
@@ -261,8 +262,8 @@ TCP/HTTP 建立 → WS 升级 → [鉴权窗口 ≤10s]
 - 事件投影：泵循环内在 `apply` / `handle_effect` 之后调用 `tap.publish(&event, …)`。映射是纯函数：`Delta → message.delta`、`Step → message.completed`（文本由 `render_step` 计算，同一函数两个消费者）、`Activity` 各变体 → 对应通知（覆盖矩阵见 11.1）。
 - 状态投影：`Status` 变更收敛到单一 `set_status` 辅助方法后统一发布 `status.changed`（现有赋值散布在 `submit` 入口、`handle_effect`、`finish` / `fail`、`cancel`；收敛后发布点唯一）。
 - 用量投影：`Event::Step` 的步骤用量、`Activity::ToolUsage` 与 `finish` 的校准结果统一发布 `usage.changed`（总量随步骤累计，分模型在运行结束校准，与状态栏胶囊同源）。
-- 快照投影：`Haloeth::activate` / `restore_session` 推 `transcript.reset`；`refresh_tray` 内顺带发布 `sessions.changed`（`refresh_tray` 的全部调用点与会话列表变化的时机一致：保存、切换、新建、重命名、删除）。
-- 序号分配：通知在发布时由桥分配单调递增的 `seq`（服务进程生命周期内）；`transcript.reset` 携带合成时的计数器高水位（不消耗计数器值），客户端据此重置游标（协议规范第 4 节）。
+- 快照投影：`Haloeth::activate` 推 `transcript.reset`（启动时的初始状态由连接快照提供）；`refresh_tray` 内顺带发布 `sessions.changed`（`refresh_tray` 的全部调用点与会话列表变化的时机一致：保存、切换、新建、重命名、删除）。
+- 序号分配：通知在发布时由桥分配单调递增的 `seq`（服务进程生命周期内）；连接建立时合成的 `transcript.reset` 携带计数器高水位（不消耗计数器值），会话切换时推送的 `transcript.reset` 按普通通知分配序号。客户端据此重置游标（协议规范第 4 节）。
 
 transcript.reset 的 entries 取自 `Conversation::snapshot(cx)` 的实时快照而非 `SessionFile`：重连可能发生在运行中，落盘文件滞后于流式中的会话；同时携带 `streaming` 字段（`Conversation` 的 `streaming` 消息与已累积 `source`），客户端可完整接续正在输出的消息。
 
@@ -315,6 +316,7 @@ last_seen = 1730000000
 - `ScriptedModel` + `Session::set_model_builder`：远程 `message.send` → 断言对话区出现用户消息与 scripted 回复、通知流出现 `message.appended` / `message.delta` / `message.completed` / `status.changed`。
 - 审批回环：`ApprovalMode::Manual` 下远程收到 `approval.requested` → `approval.resolve` → `Activity::ApprovalResolved` 回流到通知流与对话卡片；双端同时 resolve 只生效一次。
 - 重连接续：运行中触发 `transcript.reset`，断言 `streaming` 字段与后续 `message.delta` 无缝续接。
+- `src/app/remote_tests.rs`：命令泵、通知流、审批回环、会话切换快照、功能开关 / 授权 / 模型选择与偏好页设备管理。
 
 每阶段收尾执行全量验证：`cargo test --workspace`、`cargo clippy --workspace --all-targets`、`cargo fmt --all --check`。
 
@@ -324,7 +326,7 @@ last_seen = 1730000000
 | ---- | ------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
 | 一   | `remote` crate：proto 类型、`RemoteHost`、服务与连接状态机、参考客户端、wire/e2e 测试                                                       | 全部测试通过；协议规范与实现逐条对应                 |
 | 二   | `haloeth` 桥：命令泵、事件 tap、`submit_message` 抽取、配置与偏好页（含二维码、设备管理）                                                   | UI 测试覆盖命令面与通知流；README 行为章节更新       |
-| 三   | 安全加固：TLS（自签 + 指纹钉扎进二维码）、Origin 校验、令牌限速、防火墙说明文案                                                             | `wss://` 回环测试；明文模式给出警告提示              |
+| 三   | TLS：自签证书（`rcgen` + `rustls`）与二维码指纹钉扎；Origin 校验、令牌限速与防火墙说明已随服务端与偏好页落地                             | `wss://` 回环测试；明文模式给出警告提示              |
 | 四   | 参考客户端：`examples/remote-cli.rs`（基于 `remote::client`）与最小 Web 客户端（axum 静态托管，验证「任意客户端」目标）                     | 第三方依据协议规范可独立接通                         |
 | 五   | 附件上传：`POST /v1/attachments` 端点、`message.send` 附件参数、附件目录隐式只读授权；桌面输入链路补齐附件能力（拖放 / 粘贴）以维持镜像语义 | 上传 → 发送 → 引用全链路测试通过；桌面与远程行为一致 |
 
@@ -334,7 +336,7 @@ last_seen = 1730000000
 
 | 风险                                         | 对策                                                                 |
 | -------------------------------------------- | -------------------------------------------------------------------- |
-| GPUI 嵌套实体更新 panic                      | 泵任务顶层 `this.update`，逐命令处理；与后台事件轮询同构（既有验证） |
+| GPUI 嵌套实体更新 panic                      | 泵任务顶层 `this.update`，逐命令处理；偏好页不在渲染期间读取 Haloeth，状态经缓存与 `window.defer` 刷新 |
 | 双 Tokio 运行时并存（Session 运行时 + 远程） | 各自线程、无共享非 `Send` 状态；`Background` 线程已是先例            |
 | 审批双端竞态                                 | `ApprovalHandle` 单次唤醒；第二次 resolve 为幂等 no-op，响应仍 200   |
 | 运行中重连丢流式文本                         | `transcript.reset` 取实时快照并携带 `streaming` 缓冲                 |

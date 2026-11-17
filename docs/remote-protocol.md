@@ -35,7 +35,8 @@
 
 - 鉴权前发送任何其它帧 → 关闭 4401；令牌无效或已被撤销 → 关闭 4403。
 - 同一时刻允许多个连接（多设备），通知向全部连接扇出。
-- `Origin` 头存在时（浏览器环境）必须在宿主配置的允许列表内，否则拒绝升级。
+- `Origin` 头存在时（浏览器环境）必须在宿主配置的允许列表内或与请求同源，否则拒绝升级（HTTP 403）。
+- 令牌校验失败计数按来源地址限速；超限的连接在升级阶段被拒绝（HTTP 429）。
 
 ## 4. 消息信封
 
@@ -61,7 +62,7 @@
 - 客户端消息全部是请求（必须携带 `id`）；服务端消息分为响应（有 `id`）与通知（无 `id`）。
 - `params` 与 `result` 缺省为 `{}`；未知字段必须忽略（前向兼容）。
 - 响应与通知两类消息之间不保证先后（服务端各自异步写出）；同一类消息内部保序。客户端不得依赖响应与通知的相对顺序。
-- `seq` 仅出现在通知信封：宿主发布时分配，服务进程生命周期内严格递增，重启后重新计数。`transcript.reset` 的 `seq` 为合成该快照时的计数器高水位，不消耗计数器值。
+- `seq` 仅出现在通知信封：宿主发布时分配，服务进程生命周期内严格递增，重启后重新计数。连接建立时合成的 `transcript.reset` 携带计数器高水位（不消耗计数器值）；会话切换时推送的 `transcript.reset` 按普通通知分配序号。
 - 客户端维护游标（已见最大 `seq`）；丢弃 `seq` 不大于游标的通知，其效果已包含在快照内或已处理。游标用于预留操作 `session.resume`（见第 5 节）。
 - 服务端无法识别的操作名 → 失败响应 `unknown_op`；通知方向无法识别的 `op` 直接丢弃。
 
@@ -207,7 +208,7 @@
 6. `tool.finished` / `approval.resolved`：按 `call_id` / `id` 更新对应卡片的状态、预览、耗时。
 7. `approval.requested`：新增审批卡片；`manual` 为真时状态 `pending`（等待人工），否则 `running`（审核模型判定中）。
 8. `images.appended` / `plan.appended`：追加图片行 / 计划卡片。
-9. `transcript.reset`：整体替换行列表与流式消息（`streaming` 为 `{ role, text }` 或 `null`，非空时恢复为打开中的流式消息），并将 `seq` 游标重置为该通知的 `seq`（快照高水位）。
+9. `transcript.reset`：整体替换行列表与流式消息（`streaming` 为 `{ role, text }` 或 `null`，非空时恢复为打开中的流式消息），并将 `seq` 游标重置为该通知的 `seq`（连接时的快照水位或普通事件序号）。
 10. `status.changed` / `usage.changed` / `sessions.changed` / `state.changed`：覆盖对应状态槽。
 11. `seq` 去重：丢弃 `seq` 不大于游标的通知；游标由更大的 `seq` 与 `transcript.reset` 推进（见第 4 节）。
 
@@ -225,9 +226,8 @@
 | `unknown_model`   | 模型组合不可用                                |
 | `unknown_feature` | 功能键不存在                                  |
 | `unknown_op`      | 操作名无法识别                                |
-| `invalid_params`  | 参数缺失或类型错误                            |
-| `rate_limited`    | 触发限速                                      |
-| `internal`        | 宿主内部错误（含错误描述，不泄露路径等细节）  |
+| `invalid_params`   | 参数缺失或类型错误                           |
+| `internal`         | 宿主内部错误（含错误描述，不泄露路径等细节） |
 
 连接关闭码（WebSocket close code）：
 
@@ -277,6 +277,7 @@ Content-Type: multipart/form-data；字段 file 为文件内容
 - 附件归属当前会话，存储于应用数据目录 `attachments/{session_id}/`，不落入任何已授权目录；该目录随会话获得隐式只读授权（同 Skill 目录模式），写入仍走审批。
 - `message.send` 的可选参数 `attachments: [attachment_id]` 将附件解析为消息内容（多模态块或路径引用），随消息进入上下文。
 - 上传是经过鉴权的用户动作，写入目标为应用数据目录，不触发目录授权审批；会话删除时清理其附件。
+- v1 服务端对携带非空 `attachments` 的 `message.send` 返回 `invalid_params`。
 
 ## 12. 示例交互流
 
