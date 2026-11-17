@@ -303,9 +303,7 @@ impl RemoteBridge {
                 Err(error) => {
                     self.set_status(BridgeStatus::Failed(format!("TLS 证书不可用：{error}")));
                     self.set_fingerprint(None);
-                    if let Ok(mut applied) = self.applied.lock() {
-                        *applied = Some(desired);
-                    }
+                    // 不记录 applied：修复证书后下一次同步重试。
                     return;
                 }
             }
@@ -321,19 +319,22 @@ impl RemoteBridge {
             ..Default::default()
         };
         let host: Arc<dyn RemoteHost> = self.shared.clone();
-        match remote::RemoteServer::start(options, host, self.shared.assets.clone()) {
+        let started = match remote::RemoteServer::start(options, host, self.shared.assets.clone()) {
             Ok(handle) => {
                 self.set_status(BridgeStatus::Running(handle.addr()));
                 if let Ok(mut server) = self.server.lock() {
                     *server = Some(handle);
                 }
+                true
             }
             Err(error) => {
                 self.set_status(BridgeStatus::Failed(error.to_string()));
                 self.set_fingerprint(None);
+                false
             }
-        }
-        if let Ok(mut applied) = self.applied.lock() {
+        };
+        // 失败时不记录 applied：端口释放或证书修复后下一次同步重试。
+        if started && let Ok(mut applied) = self.applied.lock() {
             *applied = Some(desired);
         }
     }

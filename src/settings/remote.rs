@@ -28,6 +28,8 @@ pub struct RemotePage {
     token: Option<SharedString>,
     /// 服务状态缓存；渲染期间不读取 Haloeth，避免嵌套更新断言。
     status: (String, Tone),
+    /// 运行中的实际监听入口（主机与端口）；端口 0 时供配对使用。
+    endpoint: Option<(String, u16)>,
     /// 自签证书指纹缓存。
     fingerprint: Option<String>,
     /// 设备最近在线缓存。
@@ -81,6 +83,7 @@ impl RemotePage {
             name,
             token: None,
             status: ("未启用".to_owned(), Tone::Neutral),
+            endpoint: None,
             fingerprint: None,
             last_seen: std::collections::HashMap::new(),
             error: None,
@@ -110,15 +113,30 @@ impl RemotePage {
         };
         self.fingerprint = haloeth.read(cx).remote_tls_fingerprint();
         self.status = match haloeth.read(cx).remote_status() {
-            BridgeStatus::Running(addr) => (
-                format!(
-                    "监听中：{scheme}://{addr}/v1，当前 {} 个连接",
-                    haloeth.read(cx).remote_connections()
-                ),
-                Tone::Success,
-            ),
-            BridgeStatus::Failed(error) => (format!("启动失败：{error}"), Tone::Danger),
-            BridgeStatus::Disabled => ("未启用".to_owned(), Tone::Neutral),
+            BridgeStatus::Running(addr) => {
+                // 状态行展示实际监听地址；配对使用对外地址与实际端口。
+                let host = if addr.ip().is_loopback() {
+                    "127.0.0.1".to_owned()
+                } else {
+                    crate::remote::local_address().unwrap_or_else(|| addr.ip().to_string())
+                };
+                self.endpoint = Some((host, addr.port()));
+                (
+                    format!(
+                        "监听中：{scheme}://{addr}/v1，当前 {} 个连接",
+                        haloeth.read(cx).remote_connections()
+                    ),
+                    Tone::Success,
+                )
+            }
+            BridgeStatus::Failed(error) => {
+                self.endpoint = None;
+                (format!("启动失败：{error}"), Tone::Danger)
+            }
+            BridgeStatus::Disabled => {
+                self.endpoint = None;
+                ("未启用".to_owned(), Tone::Neutral)
+            }
         };
         let mut last_seen = std::collections::HashMap::new();
         if let Some(session) = self.session.upgrade() {
@@ -508,8 +526,13 @@ impl RemotePage {
     ///
     /// TLS 启用且证书就绪时追加证书指纹 `fp`，客户端据此钉扎。
     fn pairing_string(&self, token: &str, cx: &App) -> String {
-        let port = self.port.read(cx).value().trim().to_owned();
-        let host = crate::remote::local_address().unwrap_or_else(|| "127.0.0.1".to_owned());
+        let (host, port) = match &self.endpoint {
+            Some((host, port)) => (host.clone(), port.to_string()),
+            None => (
+                crate::remote::local_address().unwrap_or_else(|| "127.0.0.1".to_owned()),
+                self.port.read(cx).value().trim().to_owned(),
+            ),
+        };
         match &self.fingerprint {
             Some(fingerprint) => {
                 format!("haloeth://pair?host={host}&port={port}&token={token}&fp={fingerprint}")

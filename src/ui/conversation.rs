@@ -586,13 +586,22 @@ impl Conversation {
         })
     }
 
-    /// 打开中的流式消息（角色与已累积原文），供远程快照接续。
-    pub fn streaming_snapshot(&self) -> Option<(ChatRole, String)> {
-        let index = self.streaming.and_then(|id| self.index_of_message(id))?;
-        match self.rows.get(index)? {
-            ChatRow::Message(message) => Some((message.role, message.source.to_string())),
-            ChatRow::Activity(_) | ChatRow::Image(_) => None,
+    /// 导出远程快照：显示记录去掉打开中的流式消息，并单独返回它。
+    ///
+    /// 行与记录一一对应，因此按流式消息的行号剔除；思考卡片等后续行不受影响。
+    pub fn remote_snapshot(&self, cx: &App) -> (Vec<TranscriptEntry>, Option<(ChatRole, String)>) {
+        let mut entries = self.snapshot(cx);
+        let Some(index) = self.streaming.and_then(|id| self.index_of_message(id)) else {
+            return (entries, None);
+        };
+        let Some(ChatRow::Message(message)) = self.rows.get(index) else {
+            return (entries, None);
+        };
+        let streaming = (message.role, message.source.to_string());
+        if index < entries.len() {
+            entries.remove(index);
         }
+        (entries, Some(streaming))
     }
 
     /// 指定活动卡片的当前状态
@@ -1057,7 +1066,10 @@ impl Render for Conversation {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityStatus, ChatRole, ChatRow, Conversation, TranscriptEntry, presentation};
+    use super::{
+        ActivityStatus, ChatRole, ChatRow, Conversation, THINKING_TITLE, TranscriptEntry,
+        presentation,
+    };
     use gpui_kit::AppContext as _;
     use gpui_kit::TestAppContext;
     use gpui_kit::component::bubble::BubbleVariant;
@@ -1149,6 +1161,31 @@ mod tests {
                 panic!("expected an activity row");
             };
             assert_eq!(card.read(cx).status(), ActivityStatus::Ok);
+        });
+    }
+
+    /// 远程快照按行号剔除流式消息；其后的思考卡片保持完整。
+    #[gpui_kit::test]
+    fn remote_snapshot_keeps_rows_after_the_streaming_message(cx: &mut TestAppContext) {
+        let conversation = cx.update(|cx| cx.new(Conversation::new));
+
+        cx.update(|cx| {
+            conversation.update(cx, |conversation, cx| {
+                conversation.push(ChatRole::User, "任务", cx);
+                conversation.stream(ChatRole::Assistant, "前半", cx);
+                conversation.reasoning("想一下", cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let conversation = conversation.read(cx);
+            let (entries, streaming) = conversation.remote_snapshot(cx);
+            assert_eq!(entries.len(), 2, "用户消息与思考卡片保留");
+            assert!(matches!(
+                &entries[1],
+                TranscriptEntry::Activity(record) if record.title == THINKING_TITLE
+            ));
+            assert_eq!(streaming, Some((ChatRole::Assistant, "前半".to_owned())));
         });
     }
 }

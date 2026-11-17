@@ -406,7 +406,7 @@ async fn remote_preferences_page_manages_devices(cx: &mut TestAppContext) {
     });
 }
 
-/// 运行中拒绝新消息与会话切换，附件参数尚未实现。
+/// 运行中拒绝新消息与会话切换，附件路径不存在时拒绝。
 #[gpui_kit::test]
 async fn remote_rejects_busy_submissions_and_attachments(cx: &mut TestAppContext) {
     let (haloeth, handle) = open_shell(cx, WINDOW_SIZE);

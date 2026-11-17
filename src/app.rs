@@ -1303,13 +1303,7 @@ impl Haloeth {
 
     /// 连接时的实时快照；`entries` 不含打开中的流式消息。
     fn remote_snapshot(&self, cx: &App) -> SnapshotDto {
-        let conversation = self.conversation.read(cx);
-        let mut entries = conversation.snapshot(cx);
-        let streaming = conversation.streaming_snapshot();
-        if streaming.is_some() {
-            // 流式消息总是最后一行，通过 `streaming` 单独递送。
-            entries.pop();
-        }
+        let (entries, streaming) = self.conversation.read(cx).remote_snapshot(cx);
         SnapshotDto {
             session_id: self.active.id.clone(),
             entries: entries.iter().map(crate::remote::entry_dto).collect(),
