@@ -1,28 +1,27 @@
 [package]
 name = "agent"
-version.workspace = true
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+version.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["process", "io-util", "time", "macros", "sync"] }
+async-trait.workspace = true
+content_inspector = "0.2.4"
+dunce = "1.0.5"
+http = "1"
 reqwest.workspace = true
+rmcp = { workspace = true, features = ["client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+scraper = "0.29.0"
 serde.workspace = true
 serde_json.workspace = true
-rmcp = { version = "3.9.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
-async-trait = "0.1.92"
 serde_yaml_ng = "0.10.0"
-scraper = "0.29.0"
-content_inspector = "0.2.4"
 shell-words = "1.1.1"
-dunce = "1.0.5"
-tracing = "0.1.44"
-uuid = { version = "1.29.2", features = ["v4", "serde"] }
+tokio = { workspace = true, features = ["io-util", "macros", "process", "sync", "time"] }
 tokio-util = "0.7.20"
-http = "1"
+tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-rmcp = { version = "3.9.0", default-features = false, features = ["server", "transport-async-rw", "client"] }
-tempfile = "3.27.0"
+rmcp = { workspace = true, features = ["client", "server", "transport-async-rw"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
