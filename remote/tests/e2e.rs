@@ -377,9 +377,8 @@ async fn oversized_frames_are_rejected_with_the_documented_close_code() {
 }
 
 #[tokio::test]
-async fn tls_clients_pin_the_self_signed_certificate() {
-    let material = remote::tls::self_signed(&["127.0.0.1".to_owned(), "localhost".to_owned()])
-        .expect("证书应当生成");
+async fn tls_clients_pin_the_fingerprint() {
+    let material = remote::tls::self_signed(&["127.0.0.1".to_owned()]).expect("证书应当生成");
     let host = TestHost::new(64);
     let assets = Arc::new(AssetWhitelist::new(8));
     let handle = RemoteServer::start(
@@ -397,45 +396,21 @@ async fn tls_clients_pin_the_self_signed_certificate() {
     )
     .expect("TLS 服务应当启动");
 
-    // 把自签证书当成唯一根证书：等价于客户端按指纹钉扎。
-    let mut roots = rustls::RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(material.cert_pem.as_bytes());
-    let cert =
-        rustls_pemfile::certs(&mut cursor).next().expect("证书应当存在").expect("证书应当可解析");
-    roots.add(cert).expect("加入根证书");
-    let config =
-        rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(config));
     let url = format!("wss://127.0.0.1:{}/v1", handle.addr().port());
-    let (mut socket, _) =
-        tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector))
+    let mut client =
+        remote::client::Client::connect_pinned(&url, "good-token", &material.fingerprint)
             .await
-            .expect("TLS 连接应当成功");
-
-    socket
-        .send(Message::Text(
-            json!({ "v": 1, "id": 1, "op": "hello", "params": { "token": "good-token" } })
-                .to_string()
-                .into(),
-        ))
-        .await
-        .expect("发送 hello");
-    let mut authenticated = false;
-    while let Some(Ok(message)) = socket.next().await {
-        if let Message::Text(text) = message {
-            let value: Value = serde_json::from_str(text.as_str()).expect("JSON");
-            if value.get("ok").and_then(Value::as_bool) == Some(true) {
-                authenticated = true;
-                break;
-            }
-        }
-    }
-    assert!(authenticated, "TLS 握手与鉴权应当完成");
+            .expect("指纹钉扎后应当连接成功");
+    assert_eq!(client.welcome()["protocol"], json!(1));
+    let (seq, notification) =
+        client.next_notification().await.expect("应当读到快照").expect("连接保持打开");
+    assert_eq!(seq, 7, "连接后的快照使用计数器高水位");
+    assert!(matches!(notification, Notification::TranscriptReset(_)));
     handle.stop();
 }
 
 #[tokio::test]
-async fn tls_servers_reject_clients_that_do_not_trust_the_certificate() {
+async fn tls_clients_reject_wrong_fingerprints() {
     let material = remote::tls::self_signed(&["127.0.0.1".to_owned()]).expect("证书应当生成");
     let host = TestHost::new(64);
     let assets = Arc::new(AssetWhitelist::new(8));
@@ -455,7 +430,8 @@ async fn tls_servers_reject_clients_that_do_not_trust_the_certificate() {
     .expect("TLS 服务应当启动");
 
     let url = format!("wss://127.0.0.1:{}/v1", handle.addr().port());
-    let result = tokio_tungstenite::connect_async(url).await;
-    assert!(result.is_err(), "未钉扎的客户端不应完成握手");
+    let wrong = "0".repeat(64);
+    let result = remote::client::Client::connect_pinned(&url, "good-token", &wrong).await;
+    assert!(result.is_err(), "指纹不匹配不应完成握手");
     handle.stop();
 }

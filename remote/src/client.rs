@@ -6,7 +6,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::proto::{Notification, NotificationFrame, PROTOCOL_VERSION, RemoteError, ResponseFrame};
 
@@ -51,8 +51,30 @@ pub struct Client {
 impl Client {
     /// 建立连接并完成 `hello`；返回时已收到 welcome 与首条快照。
     pub async fn connect(url: &str, token: &str) -> Result<Self, ClientError> {
+        Self::connect_with(url, token, None).await
+    }
+
+    /// 建立 `wss://` 连接，并只接受指纹匹配的服务器证书。
+    pub async fn connect_pinned(
+        url: &str,
+        token: &str,
+        fingerprint: &str,
+    ) -> Result<Self, ClientError> {
+        let config = crate::tls::pinned_client_config(fingerprint).map_err(ClientError::Connect)?;
+        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config));
+        Self::connect_with(url, token, Some(connector)).await
+    }
+
+    /// 带传输配置的连接；`None` 为明文 `ws://`。
+    async fn connect_with(
+        url: &str,
+        token: &str,
+        connector: Option<tokio_tungstenite::Connector>,
+    ) -> Result<Self, ClientError> {
         let (socket, _response) =
-            connect_async(url).await.map_err(|error| ClientError::Connect(error.to_string()))?;
+            tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector)
+                .await
+                .map_err(|error| ClientError::Connect(error.to_string()))?;
         let mut client = Self {
             socket,
             next_id: 1,
