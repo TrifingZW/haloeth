@@ -150,7 +150,8 @@ haloeth/
 │   │   ├── conn.rs            每连接状态机：鉴权、分发、扇出、背压
 │   │   ├── auth.rs            令牌生成与哈希校验
 │   │   ├── tls.rs             自签证书生成与指纹计算
-│   │   └── client.rs          参考客户端（回环测试与 CLI 示例复用）
+│   │   └── client.rs          参考客户端（含指纹钉扎）
+│   ├── web/index.html         内置参考 Web 客户端（内联样式与脚本）
 │   └── tests/
 │       ├── wire.rs            线格式黄金快照（防意外破坏兼容性）
 │       └── e2e.rs             回环连接：hello → 命令 → 通知断言
@@ -192,7 +193,7 @@ pub trait RemoteHost: Send + Sync + 'static {
 ### 5.2 服务生命周期
 
 - `RemoteServer::start(options, host)`：在专用线程上创建 Tokio 运行时并绑定监听（与 `background::Background::start` 同构：独立线程 + `tracing` 日志 + 句柄交由 `Haloeth` 持有防止 drop）。`ServerOptions` 是 `remote` 自己的配置类型（监听地址、端口、限速参数），不依赖前端配置模型。
-- 端点：`GET /v1`（WS 升级）、`GET /v1/assets`（图片资源）、`POST /v1/attachments`（附件上传，阶段五），均见协议规范第 11 节。路径带版本号，`/v2` 可并存。
+- 端点：`GET /v1`（WS 升级）、`GET /v1/assets`（图片资源）、`POST /v1/attachments`（附件上传，阶段五）、`GET /`（内置 Web 客户端），均见协议规范第 11 节。路径带版本号，`/v2` 可并存。
 - `RemoteServer::stop()`：关闭监听并等待连接排空（5 秒上限）。停用或重启服务前由桥先广播 `shutdown` 通知；偏好页开关即时生效，对应 start / stop。
 
 ### 5.3 连接状态机
@@ -329,7 +330,7 @@ last_seen = 1730000000
 | 一   | `remote` crate：proto 类型、`RemoteHost`、服务与连接状态机、参考客户端、wire/e2e 测试                                                       | 全部测试通过；协议规范与实现逐条对应                 |
 | 二   | `haloeth` 桥：命令泵、事件 tap、`submit_message` 抽取、配置与偏好页（含二维码、设备管理）                                                   | UI 测试覆盖命令面与通知流；README 行为章节更新       |
 | 三   | TLS：自签证书（`rcgen` + `rustls`）与二维码指纹钉扎；证书存于应用数据目录；Origin 校验、令牌限速与防火墙说明已落地 | TLS 回环测试通过；明文模式给出警告提示              |
-| 四   | 参考客户端：`examples/remote-cli.rs`（基于 `remote::client`）与最小 Web 客户端（axum 静态托管，验证「任意客户端」目标）                     | 第三方依据协议规范可独立接通                         |
+| 四   | 参考客户端：`remote::client`（含指纹钉扎）、`examples/remote-cli.rs` 与内置 Web 客户端（服务端 `/` 直接托管） | 第三方依据协议规范可独立接通；回环测试覆盖页面投递 |
 | 五   | 附件上传：`POST /v1/attachments` 端点、`message.send` 附件参数、附件目录隐式只读授权；桌面输入链路补齐附件能力（拖放 / 粘贴）以维持镜像语义 | 上传 → 发送 → 引用全链路测试通过；桌面与远程行为一致 |
 
 文档随阶段更新：README「特性 / 行为」与 CLAUDE.md「架构要点」在对应阶段一并修订。

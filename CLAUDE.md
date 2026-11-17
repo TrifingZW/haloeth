@@ -51,8 +51,10 @@ haloeth/
 │   │   ├── conn.rs            每连接状态机：鉴权、分发、扇出、背压
 │   │   ├── auth.rs            令牌生成与哈希校验
 │   │   ├── tls.rs             自签证书生成与指纹计算
-│   │   └── client.rs          参考客户端
+│   │   ├── client.rs          参考客户端
+│   │   └── web.rs             内置 Web 客户端入口（web/index.html）
 │   └── tests/                 wire（黄金快照）与 e2e（回环连接）
+├── examples/remote-cli.rs     参考命令行客户端
 └── agent/                     代理内核（库）
     ├── src/
     │   ├── lib.rs             模块声明与顶层重导出
@@ -201,6 +203,7 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 - TLS：`[remote].tls` 开启后由 `remote::tls::self_signed` 生成证书（真实配置写 `Haloeth/remote-tls`，测试写临时目录），服务改用 `wss://`，配对串追加证书指纹 `fp`；页面缓存的指纹来自桥。
 - 配置在 `[remote]`：`enabled` / `port` / `bind` / `tls` / `devices`（只存 `token_hash`）；`Haloeth::sync_remote` 是唯一同步入口（设备表 + 启停服务），偏好页每次提交后调用。
 - 未实现：附件上传（阶段五）；`session.resume` 为预留操作。
+- 参考客户端：`remote::client`（`connect` / `connect_pinned`）、`examples/remote-cli.rs` 与 `remote/web/index.html`（`GET /` 直接托管，内联样式与脚本）；连接与页面投递均在 `remote` 的 e2e 中断言。
 
 ## 测试
 
