@@ -75,6 +75,32 @@ cargo run
 
 真实模型密钥通过 `HALOETH_TEST_KEYS_FILE` 传给被忽略的实网测试，不写入仓库。
 
+## 参与贡献
+
+欢迎参与改进。功能建议、问题反馈与代码改动都可以通过 Issue 或 Pull Request 提出；参与前请阅读仓库的 `CODE_OF_CONDUCT.md`。
+
+1. 复刻（Fork）本仓库
+2. 创建功能分支（`git checkout -b feature/your-feature`）
+3. 提交改动（`git commit -m 'Add your feature'`）
+4. 推送分支（`git push origin feature/your-feature`）
+5. 发起 Pull Request
+
+如果只是想提出建议，也可以直接创建带 `enhancement` 标签的 Issue。
+
+### 贡献者
+
+<a href="https://github.com/TrifingZW/haloeth/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=TrifingZW/haloeth" alt="贡献者" />
+</a>
+
 ## 许可
 
-仓库内的 `LICENSE` 为 MIT；`Cargo.toml` 将包声明为 `MIT OR Apache-2.0`。
+本项目采用双许可，可在 MIT 与 Apache-2.0 之间选择。仓库根目录的 [`LICENSE-MIT`](LICENSE-MIT) 与 [`LICENSE-APACHE`](LICENSE-APACHE) 分别为对应许可文本；`Cargo.toml` 中的包声明为 `MIT OR Apache-2.0`。
+
+## 联系
+
+维护者：TrifingZW
+
+- 邮箱：<TrifingZW@gmail.com>
+- 仓库：[https://github.com/TrifingZW/haloeth](https://github.com/TrifingZW/haloeth)
+- 问题反馈：优先使用仓库的 Issues
