@@ -19,7 +19,9 @@ haloeth/
 │   ├── app/                   外壳拥有的对话框与主视图测试
 │   │   ├── access.rs
 │   │   ├── sessions.rs
+│   │   ├── remote_tests.rs
 │   │   └── tests.rs
+│   ├── remote.rs              远程桥：宿主实现、命令泵、事件投影与配对设备
 │   ├── config.rs              配置模型与读写
 │   ├── session.rs             会话运行编排
 │   ├── session_store.rs       会话文件原子读写
@@ -34,11 +36,22 @@ haloeth/
 │   │   ├── preferences.rs
 │   │   ├── mcp_form.rs
 │   │   ├── media_form.rs
+│   │   ├── remote.rs
 │   │   └── skill_form.rs
 │   ├── audio.rs               语音能力入口
 │   ├── audio/                 麦克风、识别、合成与 WAV
 │   ├── background.rs          托盘与全局快捷键
 │   └── logging.rs             日志
+├── remote/                    远程接入（库，零 GPUI 依赖）
+│   ├── src/
+│   │   ├── lib.rs             模块声明与重导出
+│   │   ├── proto.rs           协议常量；proto/ 放信封、操作与线上 DTO
+│   │   ├── host.rs            RemoteHost 契约与广播信箱
+│   │   ├── server.rs          axum 路由、WS 升级、资源白名单与优雅停机
+│   │   ├── conn.rs            每连接状态机：鉴权、分发、扇出、背压
+│   │   ├── auth.rs            令牌生成与哈希校验
+│   │   └── client.rs          参考客户端
+│   └── tests/                 wire（黄金快照）与 e2e（回环连接）
 └── agent/                     代理内核（库）
     ├── src/
     │   ├── lib.rs             模块声明与顶层重导出
@@ -175,6 +188,18 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 - 系统提示只列元数据；`load_skill` 返回正文与资源清单。
 - Skill 目录隐式只读授权；默认目录是 `~/.agents/skills`，旧的 `%APPDATA%/Haloeth/skills` 仍会读取。
 
+### 远程
+
+- crate 边界：`remote` 只放协议与服务（不依赖 GPUI 与 `agent`），`src/remote.rs` 是宿主桥，代理内核完全不感知远程。
+- 两条通道：命令经 `tokio mpsc` 交给界面线程的泵任务（`cx.spawn` + 顶层 `this.update`，与后台事件轮询同构）；通知经 `tokio broadcast` 回服务线程。无接收者时 `send` 直接返回错误，可忽略。
+- 通知序号：桥在发布时分配 `seq`；连接建立时合成的 `transcript.reset` 携带计数器高水位（不消耗计数），会话切换时推送的按普通通知计数。客户端按游标去重。
+- 发布点：运行事件在 `Session::submit` 的泵中逐条投影（`Session` 持有 `remote_tap`）；状态与用量在 `Session` 内发布；`transcript.reset` 在 `Haloeth::activate`；`sessions.changed` 挂在 `refresh_tray`（其调用点即会话列表变化时机）；停用或重启服务前由桥广播 `shutdown`。
+- 提交单点：`Haloeth::submit_message` 由 composer 回调与远程命令共用；忙碌时返回 `false`，调用方决定把文本放回输入框或回 `busy` 错误。
+- 偏好页（`settings/remote.rs`）渲染期间不读 `Haloeth`：窗口首帧发生在 `open_preferences` 的更新内，读取会触发嵌套借用断言；状态缓存在页面内，用 `window.defer` 与提交后刷新。
+- 图片：仅 `images.appended` 公布过的路径可经 `GET /v1/assets` 拉取（有界白名单）；其余文件访问仍走工具与审核链。
+- 配置在 `[remote]`：`enabled` / `port` / `bind` / `devices`（只存 `token_hash`）；`Haloeth::sync_remote` 是唯一同步入口（设备表 + 启停服务），偏好页每次提交后调用。
+- 未实现：TLS 与附件上传（阶段三 / 五）；`session.resume` 为预留操作。
+
 ## 测试
 
 - 纯逻辑：`#[test]`；异步：`#[tokio::test]`；UI：`#[gpui_kit::test]`。
@@ -182,6 +207,7 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 - 需要真实运行代理时，用 `ScriptedModel` + `Session::set_model_builder` 离线完成。
 - 跨 Tokio 运行时的事件测试先调用 `cx.executor().allow_parking()`。
 - MCP 测试用 `rmcp` 的 server feature 与 `tokio::io::duplex` 进程内对端。
+- 远程：`remote` crate 的 `wire`（黄金快照）与 `e2e`（回环连接）；UI 侧 `app/remote_tests.rs` 直接驱动桥的命令通道并订阅通知流。
 
 ## 已知边界
 
