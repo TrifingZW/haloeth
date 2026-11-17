@@ -88,7 +88,7 @@ Haloeth 的远程能力：桌面进程作为宿主，手机、平板等任意设
 - 独立二进制（无头守护进程）：会话编排目前驻留在 GPUI 实体（`Session` / `Haloeth` / `Conversation`），抽出无头形态需要把编排层重构出实体系统，重构成本超出 v1 范围，且当前没有独立运行的需求。`RemoteHost` 契约不依赖 GPUI 类型，未来实现无头宿主时 `remote` crate 可原样复用，仅需在 `haloeth` 之外另行实现宿主——这是保留的演进方向。
 - 独立进程 + IPC：镜像语义要求与桌面实体同进程，IPC 会增加一层转发，不提供对应收益。
 
-体积注意：`axum` 引入 hyper 服务端栈；现有 `reqwest` 已带 hyper 客户端栈，增量主要是 tower / axum 本体。若 release 体积超出预算，备选是改用 `tokio-tungstenite` 实现最小服务（不含路由与静态资源能力），决策依据为实现期的体积测量。
+体积注意：`axum` 引入 hyper 服务端栈；现有 `reqwest` 已带 hyper 客户端栈，增量主要是 tower / axum 本体。TLS 额外引入 `axum-server`、`rustls` 与 `rcgen`。若 release 体积超出预算，备选是改用 `tokio-tungstenite` 实现最小服务（不含路由与静态资源能力），决策依据为实现期的体积测量。
 
 ### 3.3 交互语义：镜像模式
 
@@ -127,7 +127,7 @@ Haloeth 的远程能力：桌面进程作为宿主，手机、平板等任意设
 理由与核对：
 
 - 与项目现状一致：配置明文、无沙箱是已声明边界；令牌哈希存储避免新增明文秘密面。
-- 纯 `ws://` 局域网存在嗅探风险，这是 v1 的已声明边界（README「行为」同风格），阶段三的 TLS + 指纹钉扎予以收敛。
+- 纯 `ws://` 局域网存在嗅探风险；可通过 `[remote].tls` 启用自签 TLS 与指纹钉扎收敛它（README「行为」同步声明默认值）。
 - 浏览器 `Origin` 校验 + 令牌不进 URL（除资源端点的 `<img>` 场景，见协议规范第 11 节）阻断跨站 WS 劫持。
 - 命令面继承桌面审核链：远程端发出的消息同样经过四档审批，不构成审核绕过。
 
@@ -150,12 +150,14 @@ haloeth/
 │   │   ├── conn.rs            每连接状态机：鉴权、分发、扇出、背压
 │   │   ├── auth.rs            令牌生成与哈希校验
 │   │   ├── tls.rs             自签证书生成与指纹计算
-│   │   └── client.rs          参考客户端（含指纹钉扎）
+│   │   ├── client.rs          参考客户端（含指纹钉扎）
+│   │   └── web.rs             内置 Web 客户端入口（嵌入页面）
 │   ├── web/index.html         内置参考 Web 客户端（内联样式与脚本）
 │   └── tests/
 │       ├── wire.rs            线格式黄金快照（防意外破坏兼容性）
 │       └── e2e.rs             回环连接：hello → 命令 → 通知断言
 ├── agent/                     不改动（内核不感知远程）
+├── examples/remote-cli.rs     参考命令行客户端
 └── src/
     ├── remote.rs              新增：宿主桥（见第 6 节）
     ├── app/remote_tests.rs    新增：远程桥与偏好页的界面测试
@@ -349,7 +351,7 @@ last_seen = 1730000000
 | 审批双端竞态                                 | `ApprovalHandle` 单次唤醒；第二次 resolve 为幂等 no-op，响应仍 200   |
 | 运行中重连丢流式文本                         | `transcript.reset` 取实时快照并携带 `streaming` 缓冲                 |
 | 广播积压 / 慢客户端                          | 有界队列 + 4429 断开 + 全量重同步恢复                                |
-| release 体积（axum 栈）                      | 实现期测量；超预算则改用 `tokio-tungstenite` 最小服务（3.2 备选）    |
+| release 体积（axum + axum-server / rustls 栈） | 实现期测量；超预算则改用 `tokio-tungstenite` 最小服务（3.2 备选） |
 | 局域网明文嗅探                               | 默认明文可改为自签 TLS（`[remote].tls`）+ 指纹钉扎；跨网推荐隧道 |
 | Windows 防火墙首次弹窗                       | 偏好页说明文案；绑定地址可配置规避                                   |
 | 令牌泄露                                     | 每设备独立、可撤销、可轮换；只存哈希                                 |
