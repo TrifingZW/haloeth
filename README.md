@@ -1,137 +1,80 @@
 # Haloeth
 
-轻量桌面智能体：随时呼出、完成具体任务。当前版本 0.2.0。界面基于 GPUI，代理内核独立成 `agent` crate。
+Haloeth 是一个用 Rust 与 GPUI 编写的轻量桌面智能体。它把对话、工具调用、审核与语音能力放在同一个窗口中，并将界面与代理内核分离，便于各自演进。
 
-## 功能
+## 特性
 
-- **对话式代理**：工具调用的「动作—观测」循环，流式输出、思考过程、实时活动时间线。
-- **偏好设置窗口**：独立的可缩放窗口，左侧导航可收起为图标，改动即时生效，支持配置导出 / 导入 JSON。
-- **输入区**：上方工具条放置审核 / 目录 / 模型 / 语音按钮；输入框可拖动调整高度，可选显示行号。
-- **用量**：状态栏显示总 Token，悬停可按模型查看各自用量。
-- **主界面快速设置**：左下角「⋯」展开常驻面板，可连续切换工具、MCP、Skill，点击面板外才收起；面板只显示全局「显示」的功能。
-- **全局 / 会话开关**：偏好里设置功能是否显示与默认启用；会话内的启停只影响当前会话。
-- **多会话**：自动保存、切换、重命名、删除；默认存放在系统数据目录，Windows 可自定义。
-- **配色**：跟随系统 / 浅色 / 深色，在设置中切换；状态与开关用颜色区分（绿色启用、淡红停用/取消）。
-- **按键偏好**：默认 `Enter` 发送、`Shift+Enter` 换行；也可切换为 `Ctrl+Enter` 发送、`Enter` 换行。
-- **工具**：读写文件、列目录、Shell、网页访问、当前时间；提供商搜索接口封装为 `web_search`（DeepSeek `POST /tools/search`）。
-- **四档审核**：手动 / 规则自动 / 模型自动 / 无审核；目录可指定只读或读写，授权之外的操作升级给人工或审核模型。
-- **文件权限感知**：会话授权的目录会写入系统提示，模型知道自己是否有固定工作区以及每个目录的权限。
-- **多协议多模态模型**：每个模型声明输入 / 输出模态（文本、图像、音频、视频），所有模型选择器按用途过滤；支持 OpenAI Chat 与 Anthropic Messages，可自定义请求头与额外请求体。
-- **语音**：麦克风转写（云端模型或 Windows 听写，可选输入设备）与回复播报（Windows SAPI 或云端语音）；百炼使用原生 Qwen ASR/TTS，偏好页可直接测试麦克风与试听。
-- **后台运行**：关闭主窗口后缩到系统托盘继续运行；托盘菜单可「显示界面 / 当前对话（子菜单切换） / 偏好设置 / 退出」。
-- **按住说话**：默认 `Ctrl+V` 全局按住录音，松开后转写并自动发送；快捷键在偏好里点「录制」按下组合键即可设置。
-- **通用提示词**：偏好里填写的提示词会附加到每个对话的系统提示。
-- **日志**：写入应用数据目录的 `Haloeth/logs/haloeth.log`，偏好里可一键打开目录。
-- **生成工具**：AI 绘图（OpenAI 兼容 `images/generations`，百炼自动使用原生异步任务）、视频与音乐（可配置的异步任务适配器，工具页可打开高级设置填写请求体、轮询与结果路径）；已实测智谱 CogView 与百炼万相。
-- **图片展示**：AI 可通过 `show_image` 把本地图片直接显示在对话里，点击打开独立查看窗口（旋转、镜像、滚轮缩放、左键拖动平移）。
-- **开箱即用预设**：百炼预设会自动配置 `qwen3-asr-flash` / `qwen3-tts-flash` / 万相绘图与视频；智谱、OpenAI 预设也会带上图像或语音模型。
-- **MCP**：基于官方 [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)，支持 stdio 与 Streamable HTTP；在独立对话框中新建。
-- **Skill**：Claude 风格目录包（`SKILL.md` + 可选资源），默认读取 `~/.agents/skills`；可新建与删除。
+- **独立的代理内核**：`agent` crate 只处理消息、工具、模型与编排循环，不感知界面；`haloeth` 负责界面、会话存储与运行编排。
+- **对话式执行**：思考过程、工具调用、审批与计划以活动卡片呈现，最终答复按 Markdown 流式写入。
+- **四档审核**：手动审核、规则自动、模型自动与无审核，默认规则自动。目录授权跟随会话；调用超出授权范围时不会被直接拒绝，规则模式转交用户确认，模型模式交给审核模型（未配置审核模型时回退用户确认）。
+- **多提供商与多协议**：内置 OpenAI Chat 与 Anthropic Messages 两种协议，可按提供商附加请求头与额外请求体、选择工具调用策略；提供 OpenAI、Anthropic、DeepSeek、Gemini、OpenRouter、硅基流动、百炼、智谱、Moonshot 与本地 Ollama / vLLM 预设。
+- **按模态筛选模型**：每个模型声明输入与输出模态，对话、审核、语音与生成工具各自只显示匹配的模型。
+- **内置工具**：默认提供 `current_time`、`fetch_url`、`read_file`、`write_file`、`list_dir`、`shell` 与 `show_image`，代理循环还会注入用于收尾的 `final_answer`；配置搜索接口或生成模型后，还会注册 `web_search`、`generate_image`、`generate_video` 与 `generate_music`；生成类工具默认隐藏且停用，可在工具页启用。
+- **MCP 与 Skill**：MCP 支持 stdio 与 Streamable HTTP；Skill 是包含 `SKILL.md` 的目录包，系统提示只列元数据，模型按需调用 `load_skill`。
+- **语音输入与播报**：支持云端转写或系统听写，以及 Windows SAPI 或云端 TTS；可配置按住说话快捷键。
+- **桌面集成**：托盘、后台运行、多会话管理、图片查看器与会话级功能开关。
+- **偏好与界面**：跨会话配置在独立窗口中即时生效，支持 JSON 导出与导入；支持跟随系统、浅色与深色配色，统一 2px 描边，输入区高度可拖动，用量按模型分列。
 
-## 构建与运行
+## 架构
 
-需要 Rust 1.85+（edition 2024）。Windows 构建会把 `assets/icon.ico` 写入可执行文件。
+工作区包含两个 crate：
+
+| crate     | 职责                                                   |
+| --------- | ------------------------------------------------------ |
+| `haloeth` | GPUI 界面、会话文件、配置、语音、后台线程与运行编排    |
+| `agent`   | 消息模型、工具契约、模型后端、审核、记忆、MCP 与 Skill |
+
+一次运行的链路如下：
+
+```text
+Composer 提交 → Conversation 写入用户消息 → Session::submit
+  → 构建模型 → prepare_tools（内置 + MCP + Skill）→ Agent::run
+  → Event → UI 执行器 → 对话与状态栏
+  → finish：快照写回会话 → 状态变化触发自动保存
+```
+
+代理内核不负责持久化：会话文件由前端读写，运行上下文通过 `ContextSnapshot` 恢复。系统提示在每次运行时重建，内容包含当前工具、Skill 元数据与会话授权的目录。
+
+## 开始使用
+
+1. 运行 `cargo run`，在「偏好设置 → 模型」中添加提供商与 API 密钥，并启用至少一个模型。
+2. 在输入框上方选择模型，按 Enter 发送（可在偏好设置中改为 Ctrl+Enter，macOS 为 ⌘+Enter）。
+3. 需要审批时，按提示选择「允许一次」「始终允许」或「拒绝」；需要访问文件时，通过工具栏的目录授权入口添加路径。目录授权与「始终允许」规则随当前会话保存，审核模式写入全局配置。
+
+## 行为
+
+Haloeth 的数据位置如下：
+
+- 配置：Windows 为 `%APPDATA%\Haloeth\config.toml`；其它平台为 `$XDG_CONFIG_HOME/Haloeth/config.toml`，缺省时回退到 `~/.config/haloeth/config.toml`。
+- 会话：Windows 为 `%LOCALAPPDATA%\Haloeth\sessions`；其它平台为系统本地数据目录下的 `Haloeth/sessions`。可在偏好设置中改为自定义目录。
+- 日志：Windows 为 `%APPDATA%\Haloeth\logs\haloeth.log`；其它平台为系统数据目录下的 `Haloeth/logs/haloeth.log`。
+- Skill：默认读取 `~/.agents/skills`；旧版本配置目录下的 `skills` 子目录仍会读取。
+
+需要注意：
+
+- 配置、会话文件与 API 密钥均为明文，项目不提供加密。
+- Shell 与文件操作以当前用户身份运行，项目不提供沙箱；stdio 方式的 MCP 服务器也是本地程序，添加即视为信任。
+- `无审核` 模式会放行全部调用；未声明影响的工具按未知影响处理。非 Windows 平台的可用性尚未验证。
+- 审核模式、审核模型与提供商定义是全局的；会话可以保存自己的模型选择、目录授权、始终允许规则与功能开关。
+- 托盘、全局快捷键与语音播报目前仅在 Windows 上可用。语音识别可选云端模型（跨平台）或系统听写（Windows 与 macOS）。
+- MCP 只支持 tools，不支持 resources、prompts 与 OAuth。
+- 当前版本为 0.2.0，配置与会话格式仍可能调整。
+
+## 开发
+
+需要 Rust 2024 edition（Rust 1.85 及以后）与可用的图形环境。当前以 Windows 为主要目标平台。
 
 ```sh
-cargo run            # 调试运行，保留控制台（首次启用语音会编译 cpal）
-cargo build --release # 发布构建，不附带控制台窗口
 cargo test --workspace
 cargo clippy --workspace --all-targets
+cargo fmt --all --check
+cargo run
 ```
 
-## 配置
+完成一个阶段前，应确保前三条命令全部通过。Release 构建以体积为先：`opt-level = "z"`、fat LTO、单一编译单元、`panic = "abort"` 与符号剥离，并通过 `windows_subsystem = "windows"` 隐藏控制台；Debug 构建保留控制台以便查看日志。
 
-- 配置文件：Windows 为 `%APPDATA%\Haloeth\config.toml`，macOS / Linux 为对应系统配置目录。
-- 会话文件：默认在系统数据目录的 `Haloeth/sessions`；可在「设置 → 会话存储」中修改。
-- 环境变量回退：`HALOETH_API_KEY`、`HALOETH_BASE_URL`。
+真实模型密钥通过 `HALOETH_TEST_KEYS_FILE` 传给被忽略的实网测试，不写入仓库。
 
-```toml
-active_provider = "deepseek"
-active_model = "deepseek-flash"
+## 许可
 
-[ui]
-theme = "system"         # system | light | dark
-send_key = "enter"       # enter | secondary-enter
-# default_model = { provider = "deepseek", model = "deepseek-flash" }
-
-[[providers]]
-name = "deepseek"
-base_url = "https://api.deepseek.com"
-api_key = "sk-…"
-protocol = "openai-chat" # openai-chat | anthropic-messages
-tool_choice = "auto"
-headers = { "X-Org" = "team" }
-[[providers.models]]
-name = "deepseek-flash"
-input = ["text"]
-output = ["text"]
-
-[approval]
-mode = "rules"           # manual | rules | model | off（默认规则自动）
-allow_network = false
-reviewer.use_current = true
-
-[search]
-enabled = true
-max_results = 5
-
-# 思考型提供商（如 DeepSeek）必须使用 auto，否则会拒绝强制工具调用。
-# 可在「偏好设置 → 模型」中按提供商切换：自动 / 必须 / 省略。
-
-[feature_prefs.tools.shell]
-hidden = false
-default_enabled = true
-
-[feature_prefs.skills.pdf]
-hidden = false
-default_enabled = false
-
-[audio.asr]
-backend = "cloud"        # off | cloud | system
-provider = "deepseek"
-model = "whisper-compatible-model"
-
-[audio.tts]
-backend = "system"       # off | cloud | system
-rate = 0
-volume = 100
-
-[media.image]
-provider = "智谱"
-model = "cogview-3-flash"
-
-[[mcp_servers]]
-name = "filesystem"
-enabled = true
-transport = "stdio"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "G:\\work"]
-```
-
-## 审核
-
-| 模式 | 行为 |
-| --- | --- |
-| `manual` | 每次需要审核的调用都询问你 |
-| `rules` | 授权目录内自动放行，其余问你 |
-| `model` | 授权目录内自动放行，其余由审核模型结合对话上下文判断，不打断你 |
-| `off` | 全部放行（高风险） |
-
-授权目录之外不是直接拒绝，而是升级：规则模式问你，模型模式问审核模型。审核模型
-在偏好设置的「审核」一节里选择，可以跟随当前对话模型，也可以单独指定；没有可用审核
-模型时会退回人工确认。
-
-目录授权属于**当前会话**，随会话保存；默认没有授权，因此文件与 Shell 操作都需要审核。
-授权通过底部栏的「目录」按钮管理，审核模式通过相邻的按钮切换，不需要打开设置。
-
-## 安全说明
-
-- `off` 模式与 MCP 的未知工具风险最高，只在你信任任务内容时使用。
-- stdio MCP 服务器是以当前用户身份运行的本地程序，添加即表示信任其命令。
-- 配置文件与会话文件都是本机明文，包含密钥与工具输出。
-
-## 快捷键
-
-- 默认 `Enter` 发送、`Shift+Enter` 换行；`Ctrl+Enter`（macOS `⌘+Enter`）始终可以发送。
-- 在「设置 → 通用 → 按键」切换为 `Ctrl+Enter` 发送后，`Enter` 恢复为换行。
-- 按住说话：在偏好设置里点「录制」，按下想要的组合键即可填入；默认 `Ctrl+V`。
+仓库内的 `LICENSE` 为 MIT；`Cargo.toml` 将包声明为 `MIT OR Apache-2.0`。
