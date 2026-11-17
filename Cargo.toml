@@ -51,7 +51,7 @@ serde_json.workspace = true
 smallvec = "1.16.5"
 smol = "2.0.2"
 tempfile = "3.27.0"
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 toml = "1.2.1"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
