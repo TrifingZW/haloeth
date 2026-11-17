@@ -12,7 +12,7 @@ Haloeth 是一个用 Rust 与 GPUI 编写的轻量桌面智能体。它把对话
 - **内置工具**：默认提供 `current_time`、`fetch_url`、`read_file`、`write_file`、`list_dir`、`shell` 与 `show_image`，代理循环还会注入用于收尾的 `final_answer`；配置搜索接口或生成模型后，还会注册 `web_search`、`generate_image`、`generate_video` 与 `generate_music`；生成类工具默认隐藏且停用，可在工具页启用。
 - **MCP 与 Skill**：MCP 支持 stdio 与 Streamable HTTP；Skill 是包含 `SKILL.md` 的目录包，系统提示只列元数据，模型按需调用 `load_skill`。
 - **语音输入与播报**：支持云端转写或系统听写，以及 Windows SAPI 或云端 TTS；可配置按住说话快捷键。
-- **远程接入**：桌面进程内置 WebSocket 服务，手机、平板等设备按 `docs/remote-protocol.md` 实现客户端即可镜像当前对话、审批与工具活动；默认关闭，配对二维码，设备令牌只存摘要且可随时撤销。
+- **远程接入**：桌面进程内置 WebSocket 服务，手机、平板等设备按 `docs/remote-protocol.md` 实现客户端即可镜像当前对话、审批与工具活动；默认关闭，配对二维码，设备令牌只存摘要且可随时撤销，可选自签 TLS 并由客户端按指纹钉扎。
 - **桌面集成**：托盘、后台运行、多会话管理、图片查看器与会话级功能开关。
 - **偏好与界面**：跨会话配置在独立窗口中即时生效，支持 JSON 导出与导入；支持跟随系统、浅色与深色配色，统一 2px 描边，输入区高度可拖动，用量按模型分列。
 
@@ -52,6 +52,7 @@ Haloeth 的数据位置如下：
 - 配置：Windows 为 `%APPDATA%\Haloeth\config.toml`；其它平台为 `$XDG_CONFIG_HOME/Haloeth/config.toml`，缺省时回退到 `~/.config/haloeth/config.toml`。
 - 会话：Windows 为 `%LOCALAPPDATA%\Haloeth\sessions`；其它平台为系统本地数据目录下的 `Haloeth/sessions`。可在偏好设置中改为自定义目录。
 - 日志：Windows 为 `%APPDATA%\Haloeth\logs\haloeth.log`；其它平台为系统数据目录下的 `Haloeth/logs/haloeth.log`。
+- 远程证书：Windows 为 `%LOCALAPPDATA%\Haloeth\remote-tls`；其它平台为系统本地数据目录下的 `Haloeth/remote-tls`。
 - Skill：默认读取 `~/.agents/skills`；旧版本配置目录下的 `skills` 子目录仍会读取。
 
 需要注意：
@@ -60,8 +61,8 @@ Haloeth 的数据位置如下：
 - Shell 与文件操作以当前用户身份运行，项目不提供沙箱；stdio 方式的 MCP 服务器也是本地程序，添加即视为信任。
 - `无审核` 模式会放行全部调用；未声明影响的工具按未知影响处理。非 Windows 平台的可用性尚未验证。
 - 审核模式、审核模型与提供商定义是全局的；会话可以保存自己的模型选择、目录授权、始终允许规则与功能开关。
-- 远程访问默认关闭；启用后以明文 WebSocket 监听局域网（默认 `0.0.0.0:8737`），跨网络访问建议配合隧道；设备令牌只保存 SHA-256 摘要，可在偏好设置「远程」中撤销。
-- 远程协议 v1 暂不含 TLS 与附件上传；图片资源端点只提供已公布过的路径。
+- 远程访问默认关闭；启用后监听局域网（默认 `0.0.0.0:8737`），默认明文 WebSocket，可启用自签 TLS 并由客户端按指纹钉扎；跨网络访问建议配合隧道；设备令牌只保存 SHA-256 摘要，可在偏好设置「远程」中撤销。
+- 远程协议 v1 暂不含附件上传；图片资源端点只提供已公布过的路径。
 - 托盘、全局快捷键与语音播报目前仅在 Windows 上可用。语音识别可选云端模型（跨平台）或系统听写（Windows 与 macOS）。
 - MCP 只支持 tools，不支持 resources、prompts 与 OAuth。
 - 当前版本为 0.2.0，配置与会话格式仍可能调整。

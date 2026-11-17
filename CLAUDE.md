@@ -50,6 +50,7 @@ haloeth/
 │   │   ├── server.rs          axum 路由、WS 升级、资源白名单与优雅停机
 │   │   ├── conn.rs            每连接状态机：鉴权、分发、扇出、背压
 │   │   ├── auth.rs            令牌生成与哈希校验
+│   │   ├── tls.rs             自签证书生成与指纹计算
 │   │   └── client.rs          参考客户端
 │   └── tests/                 wire（黄金快照）与 e2e（回环连接）
 └── agent/                     代理内核（库）
@@ -197,8 +198,9 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 - 提交单点：`Haloeth::submit_message` 由 composer 回调与远程命令共用；忙碌时返回 `false`，调用方决定把文本放回输入框或回 `busy` 错误。
 - 偏好页（`settings/remote.rs`）渲染期间不读 `Haloeth`：窗口首帧发生在 `open_preferences` 的更新内，读取会触发嵌套借用断言；状态缓存在页面内，用 `window.defer` 与提交后刷新。
 - 图片：仅 `images.appended` 公布过的路径可经 `GET /v1/assets` 拉取（有界白名单）；其余文件访问仍走工具与审核链。
-- 配置在 `[remote]`：`enabled` / `port` / `bind` / `devices`（只存 `token_hash`）；`Haloeth::sync_remote` 是唯一同步入口（设备表 + 启停服务），偏好页每次提交后调用。
-- 未实现：TLS 与附件上传（阶段三 / 五）；`session.resume` 为预留操作。
+- TLS：`[remote].tls` 开启后由 `remote::tls::self_signed` 生成证书（真实配置写 `Haloeth/remote-tls`，测试写临时目录），服务改用 `wss://`，配对串追加证书指纹 `fp`；页面缓存的指纹来自桥。
+- 配置在 `[remote]`：`enabled` / `port` / `bind` / `tls` / `devices`（只存 `token_hash`）；`Haloeth::sync_remote` 是唯一同步入口（设备表 + 启停服务），偏好页每次提交后调用。
+- 未实现：附件上传（阶段五）；`session.resume` 为预留操作。
 
 ## 测试
 
