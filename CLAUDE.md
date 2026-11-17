@@ -203,7 +203,7 @@ Composer 提交 → Conversation 写用户消息 → Session::submit
 - 附件：上传（`POST /v1/attachments`）与桌面拖放（主视图 `on_drop` → `Haloeth::attach_paths`）都复制到 `Haloeth/attachments/<会话>`；目录获得会话级只读授权，消息以 `[附件] <路径>` 行前置，删除会话时清理。服务端持附件标识→路径映射（256 条 FIFO），`message.send` 前解析。
 - TLS：`[remote].tls` 开启后由 `remote::tls::self_signed` 生成证书（真实配置写 `Haloeth/remote-tls`，测试写临时目录），服务改用 `wss://`，配对串追加证书指纹 `fp`；页面缓存的指纹来自桥。
 - 配置在 `[remote]`：`enabled` / `port` / `bind` / `tls` / `devices`（只存 `token_hash`）；`Haloeth::sync_remote` 是唯一同步入口（设备表 + 启停服务），偏好页每次提交后调用。
-- 未实现：`session.resume`（预留的增量续接）；其余阶段已交付。
+- 增量续接：`session.resume` 由 `Haloeth::apply_remote_command` 查询桥的历史环形缓冲（容量 = `BROADCAST_CAPACITY`）；会话不匹配或历史不覆盖游标时回退 `transcript.reset`（快照取实时状态）。回放由连接写任务执行（`biased` 优先），保证与实时通知同序；重复帧由客户端游标丢弃。
 - 参考客户端：`remote::client`（`connect` / `connect_pinned`）、`examples/remote-cli.rs` 与 `remote/web/index.html`（`GET /` 直接托管，内联样式与脚本）；连接与页面投递均在 `remote` 的 e2e 中断言。
 
 ## 测试

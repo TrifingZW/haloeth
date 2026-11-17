@@ -106,7 +106,7 @@ Haloeth 的远程能力：桌面进程作为宿主，手机、平板等任意设
 
 ### 3.4 同步模型：语义推送 + 权威快照
 
-选定：单一写入者（桌面）向所有连接广播细粒度语义通知（`message.delta`、`tool.started`、`approval.requested`…），在离散边界推送权威快照（`transcript.reset`、`state.changed`、`sessions.changed`）；客户端是纯 reducer。断线重连走全量重新同步（hello → welcome → reset）。通知信封携带宿主分配的单调递增 `seq`，客户端以已见最大值为游标；v1 的恢复路径仍为全量重新同步，`session.resume` 作为预留操作为后续版本的增量补齐保留语义（协议规范第 5 节）。
+选定：单一写入者（桌面）向所有连接广播细粒度语义通知（`message.delta`、`tool.started`、`approval.requested`…），在离散边界推送权威快照（`transcript.reset`、`state.changed`、`sessions.changed`）；客户端是纯 reducer。断线重连走全量重新同步（hello → welcome → reset）。通知信封携带宿主分配的单调递增 `seq`，客户端以已见最大值为游标；`session.resume` 从宿主历史环形缓冲（容量等于广播容量）补发缺失通知，不可补齐时回退快照（协议规范第 5 节）。
 
 理由：
 
@@ -217,7 +217,7 @@ TCP/HTTP 建立 → WS 升级 → [鉴权窗口 ≤10s]
 
 - 每连接一个有界转发任务（容量 1024 帧 / 4 MiB 预算），broadcast `Lagged` 或队列满 → close 4429。
 - 客户端收到 4429 / 意外断开后的恢复路径统一为：退避重连 → 全量重新同步。快照模型保证该路径始终可用。
-- 通知信封携带单调递增的 `seq`（协议规范第 4 节），预留操作 `session.resume` 为后续版本的按游标增量补齐保留语义；是否实现以实测重连负载为准。
+- 通知信封携带单调递增的 `seq`（协议规范第 4 节）；`session.resume` 按游标从宿主历史环形缓冲（容量等于广播容量）补发，超出窗口或会话不匹配时回退全量快照。
 - 令牌校验失败计数按来源地址限速（每分钟 5 次），超限直接拒绝升级。
 
 ## 6. 桌面端桥接（haloeth）
@@ -266,6 +266,7 @@ TCP/HTTP 建立 → WS 升级 → [鉴权窗口 ≤10s]
 - 用量投影：`Event::Step` 的步骤用量、`Activity::ToolUsage` 与 `finish` 的校准结果统一发布 `usage.changed`（总量随步骤累计，分模型在运行结束校准，与状态栏胶囊同源）。
 - 快照投影：`Haloeth::activate` 推 `transcript.reset`（启动时的初始状态由连接快照提供）；`refresh_tray` 内顺带发布 `sessions.changed`（`refresh_tray` 的全部调用点与会话列表变化的时机一致：保存、切换、新建、重命名、删除）。
 - 序号分配：通知在发布时由桥分配单调递增的 `seq`（服务进程生命周期内）；连接建立时合成的 `transcript.reset` 携带计数器高水位（不消耗计数器值），会话切换时推送的 `transcript.reset` 按普通通知分配序号。客户端据此重置游标（协议规范第 4 节）。
+- 增量续接：桥同时把每条通知写入历史环形缓冲（容量 = 广播容量）；`session.resume` 由写任务负责回放，保证回放帧与实时通知同序，重复帧由客户端游标丢弃。
 
 transcript.reset 的 entries 取自 `Conversation::snapshot(cx)` 的实时快照而非 `SessionFile`：重连可能发生在运行中，落盘文件滞后于流式中的会话；同时携带 `streaming` 字段（`Conversation` 的 `streaming` 消息与已累积 `source`），客户端可完整接续正在输出的消息。
 
@@ -333,6 +334,7 @@ last_seen = 1730000000
 | 三   | TLS：自签证书（`rcgen` + `rustls`）与二维码指纹钉扎；证书存于应用数据目录；Origin 校验、令牌限速与防火墙说明已落地 | TLS 回环测试通过；明文模式给出警告提示              |
 | 四   | 参考客户端：`remote::client`（含指纹钉扎）、`examples/remote-cli.rs` 与内置 Web 客户端（服务端 `/` 直接托管） | 第三方依据协议规范可独立接通；回环测试覆盖页面投递 |
 | 五   | 附件上传：`POST /v1/attachments`、`message.send` 附件标识解析与 `[附件]` 引用、会话级只读授权；桌面拖放复制到同一目录 | 上传 → 发送 → 引用全链路测试通过；桌面与远程行为一致 |
+| 六   | 增量续接：`session.resume`、宿主历史环形缓冲、写任务有序回放与快照回退               | 补发与回退测试通过                                   |
 
 文档随阶段更新：README「特性 / 行为」与 CLAUDE.md「架构要点」在对应阶段一并修订。
 
