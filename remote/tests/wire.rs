@@ -199,8 +199,23 @@ fn invalid_requests_report_structured_errors() {
     };
 
     let unknown =
-        parse(json!({"v":1,"id":1,"op":"session.resume","params":{}})).expect_err("预留操作");
+        parse(json!({"v":1,"id":1,"op":"session.rewind","params":{}})).expect_err("未知操作");
     assert_eq!(unknown.code, ErrorCode::UnknownOp);
+
+    let missing =
+        parse(json!({"v":1,"id":1,"op":"session.resume","params":{}})).expect_err("缺参数");
+    assert_eq!(missing.code, ErrorCode::InvalidParams);
+
+    let resume = parse(
+        json!({"v":1,"id":1,"op":"session.resume","params":{"session_id":"s1","last_seq":7}}),
+    );
+    assert_eq!(
+        resume,
+        Ok(Command::Resume {
+            session_id: "s1".to_owned(),
+            last_seq: 7,
+        })
+    );
 
     let empty = parse(json!({"v":1,"id":1,"op":"message.send","params":{"text":"   "}}))
         .expect_err("空文本");

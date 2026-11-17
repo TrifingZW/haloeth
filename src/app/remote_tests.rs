@@ -550,3 +550,38 @@ fn dropping_files_attaches_them_to_the_composer(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(crate::remote::attachments_dir(false).join(session_id));
 }
+
+/// 增量续接：游标可覆盖时按原序号补发，否则回退快照。
+#[gpui_kit::test]
+fn remote_resume_replays_recent_notifications(cx: &mut TestAppContext) {
+    let (haloeth, _handle) = open_shell(cx, WINDOW_SIZE);
+    cx.executor().allow_parking();
+    let (session_id, watermark) = cx.update(|cx| {
+        (haloeth.read(cx).active_id().to_owned(), haloeth.read(cx).remote.watermark())
+    });
+    assert!(watermark >= 1, "启动阶段已产生通知");
+
+    let replay = dispatch(
+        cx,
+        &haloeth,
+        remote::Command::Resume {
+            session_id: session_id.clone(),
+            last_seq: watermark - 1,
+        },
+    )
+    .expect("补发应当成功");
+    let frames = replay["notifications"].as_array().expect("返回补发帧");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["seq"], serde_json::json!(watermark));
+
+    let fallback = dispatch(
+        cx,
+        &haloeth,
+        remote::Command::Resume {
+            session_id: "missing".to_owned(),
+            last_seq: 0,
+        },
+    )
+    .expect("回退应当成功");
+    assert!(fallback["snapshot"].is_object(), "会话不匹配回退快照");
+}

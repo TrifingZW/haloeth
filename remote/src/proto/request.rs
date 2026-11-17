@@ -55,6 +55,13 @@ pub enum Command {
     StateGet,
     /// 服务端内部：附件上传的目标目录与隐式授权。
     AttachmentTarget,
+    /// 从游标增量续接。
+    Resume {
+        /// 会话标识符。
+        session_id: String,
+        /// 客户端已收到的最大序号。
+        last_seq: u64,
+    },
     /// 发送一条用户消息。
     MessageSend {
         /// 消息文本。
@@ -128,6 +135,19 @@ impl Command {
         match frame.op.as_str() {
             "ping" => Ok(Self::Ping),
             "state.get" => Ok(Self::StateGet),
+            "session.resume" => {
+                #[derive(Deserialize)]
+                struct Params {
+                    session_id: String,
+                    last_seq: u64,
+                }
+                let parsed: Params = parse_params(params)?;
+                check_id(&parsed.session_id)?;
+                Ok(Self::Resume {
+                    session_id: parsed.session_id,
+                    last_seq: parsed.last_seq,
+                })
+            }
             "message.send" => {
                 #[derive(Deserialize)]
                 struct Params {
@@ -278,6 +298,9 @@ impl Command {
             Self::Ping => "ping",
             Self::StateGet => "state.get",
             Self::AttachmentTarget => "attachment.target",
+            Self::Resume {
+                ..
+            } => "session.resume",
             Self::MessageSend {
                 ..
             } => "message.send",

@@ -3,7 +3,7 @@
 //! 服务线程与界面线程之间只有两条通道：命令经 `mpsc` 交给界面线程执行，
 //! 通知经 `broadcast` 回到服务线程；界面线程是唯一写入者。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -89,6 +89,8 @@ struct Shared {
     devices: Mutex<HashMap<String, String>>,
     /// 设备标识 → 最近在线（Unix 毫秒）。
     last_seen: Mutex<HashMap<String, u64>>,
+    /// 最近通知的环形缓冲；供 `session.resume` 增量补发。
+    history: Mutex<VecDeque<Published>>,
 }
 
 impl Shared {
@@ -100,10 +102,17 @@ impl Shared {
             }
         }
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = self.events.send(Published {
+        let published = Published {
             seq,
             notification,
-        });
+        };
+        if let Ok(mut history) = self.history.lock() {
+            history.push_back(published.clone());
+            while history.len() > remote::BROADCAST_CAPACITY {
+                history.pop_front();
+            }
+        }
+        let _ = self.events.send(published);
     }
 
     /// 当前计数器高水位。
@@ -157,6 +166,7 @@ impl RemoteBridge {
             assets: Arc::new(remote::AssetWhitelist::new(256)),
             devices: Mutex::new(HashMap::new()),
             last_seen: Mutex::new(HashMap::new()),
+            history: Mutex::new(VecDeque::new()),
         });
         (
             Self {
@@ -185,6 +195,33 @@ impl RemoteBridge {
     /// 当前通知计数器高水位。
     pub(crate) fn watermark(&self) -> u64 {
         self.shared.watermark()
+    }
+
+    /// 查询可增量补发的通知。
+    ///
+    /// 会话不匹配或历史已不覆盖游标时返回 [`None`]，调用方应回退到快照。
+    pub(crate) fn replay(
+        &self,
+        session_id: &str,
+        last_seq: u64,
+        active_session_id: &str,
+    ) -> Option<Vec<Published>> {
+        if session_id != active_session_id {
+            return None;
+        }
+        let watermark = self.shared.watermark();
+        if last_seq == watermark {
+            return Some(Vec::new());
+        }
+        if last_seq > watermark {
+            return None;
+        }
+        let history = self.shared.history.lock().ok()?;
+        let front = history.front()?;
+        if front.seq > last_seq + 1 {
+            return None;
+        }
+        Some(history.iter().filter(|published| published.seq > last_seq).cloned().collect())
     }
 
     /// 服务状态。
@@ -691,6 +728,31 @@ fn certificate_hosts() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_covers_recent_history_and_falls_back_on_gaps() {
+        use remote::proto::notify::MessageDelta;
+        let (bridge, _commands) = RemoteBridge::new();
+        let tap = bridge.tap();
+        for index in 0..3 {
+            tap.publish(Notification::MessageDelta(MessageDelta {
+                text: format!("{index}"),
+            }));
+        }
+        let all = bridge.replay("s1", 0, "s1").expect("历史覆盖游标");
+        assert_eq!(all.iter().map(|item| item.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        let tail = bridge.replay("s1", 2, "s1").expect("历史覆盖游标");
+        assert_eq!(tail.iter().map(|item| item.seq).collect::<Vec<_>>(), vec![3]);
+        assert!(bridge.replay("s1", 3, "s1").expect("游标已到最新").is_empty());
+        assert!(bridge.replay("other", 0, "s1").is_none(), "会话不匹配回退");
+
+        for index in 0..remote::BROADCAST_CAPACITY {
+            tap.publish(Notification::MessageDelta(MessageDelta {
+                text: format!("{index}"),
+            }));
+        }
+        assert!(bridge.replay("s1", 0, "s1").is_none(), "历史不覆盖游标时回退");
+    }
 
     #[test]
     fn certificates_persist_and_keep_their_fingerprint() {

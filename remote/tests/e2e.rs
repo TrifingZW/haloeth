@@ -80,6 +80,29 @@ impl RemoteHost for TestHost {
             })
             .expect("snapshot")),
             Command::Ping => Ok(json!({ "t": 1 })),
+            Command::Resume {
+                session_id,
+                last_seq,
+            } => {
+                if session_id == "s1" && last_seq == 7 {
+                    Ok(json!({
+                        "notifications": [
+                            { "v": 1, "seq": 8, "op": "message.delta", "params": { "text": "补" } },
+                            { "v": 1, "seq": 9, "op": "status.changed", "params": { "status": "idle", "activity": null } },
+                        ]
+                    }))
+                } else {
+                    Ok(json!({
+                        "snapshot": serde_json::to_value(SnapshotDto {
+                            session_id: "s1".into(),
+                            entries: Vec::new(),
+                            streaming: None,
+                            watermark: 12,
+                        })
+                        .expect("snapshot"),
+                    }))
+                }
+            }
             Command::AttachmentTarget => Ok(json!({
                 "dir": self.attachment_dir.display().to_string(),
             })),
@@ -164,8 +187,11 @@ async fn commands_reach_the_host_and_errors_stay_structured() {
         }
     )));
 
-    let error = client.request("session.resume", json!({})).await.expect_err("预留操作");
+    let error = client.request("session.rewind", json!({})).await.expect_err("未知操作");
     assert_eq!(error.code, remote::ErrorCode::UnknownOp);
+
+    let error = client.request("session.resume", json!({})).await.expect_err("缺参数");
+    assert_eq!(error.code, remote::ErrorCode::InvalidParams);
 
     let error = client.request("message.send", json!({ "text": " " })).await.expect_err("空文本");
     assert_eq!(error.code, remote::ErrorCode::InvalidParams);
@@ -381,6 +407,40 @@ async fn oversized_frames_are_rejected_with_the_documented_close_code() {
         }
     }
     assert!(closed, "超限帧需要关闭连接");
+}
+
+#[tokio::test]
+async fn resume_replays_missed_notifications_and_falls_back_to_snapshots() {
+    let (_host, handle, _assets) = start(64);
+    let mut client =
+        remote::client::Client::connect(&url(&handle), "good-token").await.expect("握手应当成功");
+    let (seq, notification) =
+        client.next_notification().await.expect("应当读到快照").expect("连接保持打开");
+    assert_eq!(seq, 7);
+    assert!(matches!(notification, Notification::TranscriptReset(_)));
+
+    let result = client
+        .request("session.resume", json!({ "session_id": "s1", "last_seq": 7 }))
+        .await
+        .expect("补齐应当成功");
+    assert_eq!(result, json!({}));
+    let mut replayed = Vec::new();
+    for _ in 0..2 {
+        replayed
+            .push(client.next_notification().await.expect("应当读到补发").expect("连接保持打开"));
+    }
+    assert_eq!(replayed.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(), vec![8, 9]);
+    assert!(matches!(replayed[0].1, Notification::MessageDelta(_)));
+
+    client
+        .request("session.resume", json!({ "session_id": "other", "last_seq": 0 }))
+        .await
+        .expect("回退应当成功");
+    let (seq, notification) =
+        client.next_notification().await.expect("应当读到重置").expect("连接保持打开");
+    assert_eq!(seq, 12, "回退快照使用当前水位");
+    assert!(matches!(notification, Notification::TranscriptReset(_)));
+    handle.stop();
 }
 
 #[tokio::test]

@@ -968,6 +968,21 @@ impl Haloeth {
             }
             Command::Ping => Ok(json!({ "t": crate::remote::now_millis() })),
             Command::StateGet => Ok(json!({ "state": self.remote_state(cx) })),
+            Command::Resume {
+                session_id,
+                last_seq,
+            } => match self.remote.replay(&session_id, last_seq, &self.active.id) {
+                Some(published) => {
+                    let frames: Vec<remote::proto::NotificationFrame> = published
+                        .iter()
+                        .map(|item| {
+                            remote::proto::NotificationFrame::new(item.seq, &item.notification)
+                        })
+                        .collect();
+                    Ok(json!({ "notifications": frames }))
+                }
+                None => Ok(json!({ "snapshot": self.remote_snapshot(cx) })),
+            },
             Command::AttachmentTarget => {
                 let persist = self.session.read(cx).persists_config();
                 let dir = crate::remote::attachments_dir(persist).join(&self.active.id);
